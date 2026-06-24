@@ -1,0 +1,183 @@
+name: Build release binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - master
+
+env:
+  BINARY_NAME: serval-charton
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  WASM_PACK_VERSION: 0.14.0
+
+permissions:
+  contents: read
+
+jobs:
+  build-web-bundle:
+    name: Build embedded WASM bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/wasm-pack
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: ${{ runner.os }}-wasm-cargo-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('web/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-wasm-cargo-${{ env.WASM_PACK_VERSION }}-
+            ${{ runner.os }}-wasm-cargo-
+
+      - name: Install wasm-pack
+        shell: bash
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          if ! command -v wasm-pack >/dev/null 2>&1; then
+            cargo install wasm-pack --version "$WASM_PACK_VERSION" --locked
+          fi
+          wasm-pack --version
+
+      - name: Build web/pkg
+        shell: bash
+        working-directory: web
+        run: wasm-pack build --release --target web --out-dir pkg
+
+      - name: Upload web/pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-pkg
+          path: web/pkg/
+          if-no-files-found: error
+          retention-days: 7
+
+  build-native-binaries:
+    name: Build ${{ matrix.artifact_name }}
+    needs: build-web-bundle
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact_name: serval-charton-linux-x86_64
+            binary_path: target/release/serval-charton
+            archive_ext: tar.gz
+          - os: macos-15-intel
+            artifact_name: serval-charton-macos-x86_64
+            binary_path: target/release/serval-charton
+            archive_ext: tar.gz
+          - os: macos-14
+            artifact_name: serval-charton-macos-aarch64
+            binary_path: target/release/serval-charton
+            archive_ext: tar.gz
+          - os: windows-2022
+            artifact_name: serval-charton-windows-x86_64
+            binary_path: target/release/serval-charton.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: ${{ runner.os }}-native-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-native-cargo-
+
+      - name: Download web/pkg
+        uses: actions/download-artifact@v4
+        with:
+          name: web-pkg
+          path: web/pkg
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          dist_dir="dist/${{ matrix.artifact_name }}"
+          mkdir -p "$dist_dir"
+          cp "${{ matrix.binary_path }}" "$dist_dir/$BINARY_NAME"
+          chmod +x "$dist_dir/$BINARY_NAME"
+          printf 'Run ./%s to start the local web app on http://127.0.0.1:8787/.\n' "$BINARY_NAME" > "$dist_dir/README.txt"
+          tar -czf "dist/${{ matrix.artifact_name }}.tar.gz" -C dist "${{ matrix.artifact_name }}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $distDir = "dist/${{ matrix.artifact_name }}"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          Copy-Item "${{ matrix.binary_path }}" "$distDir\${{ env.BINARY_NAME }}.exe"
+          Set-Content -Encoding ASCII -Path "$distDir\README.txt" -Value "Run .\${{ env.BINARY_NAME }}.exe to start the local web app on http://127.0.0.1:8787/."
+          Set-Content -Encoding ASCII -Path "$distDir\start_serval_charton.bat" -Value "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"serval-charton server`" `"%~dp0${{ env.BINARY_NAME }}.exe`"`r`ntimeout /t 2 /nobreak >nul`r`nstart `"`" http://127.0.0.1:8787/ >nul 2>&1`r`n"
+          Compress-Archive -Path "$distDir\*" -DestinationPath "dist/${{ matrix.artifact_name }}.zip" -Force
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-native-binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: serval-charton-*
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
