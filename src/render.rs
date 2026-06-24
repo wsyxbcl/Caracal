@@ -497,7 +497,7 @@ fn target_detail_day_label_count(web: bool) -> usize {
 
 const HEATMAP_ZERO_FILL_WHITE: &str = "rgba(255,255,255,1.000)";
 const HEATMAP_LOW_POSITIVE_FILL_GN_BU: &str = "rgba(223,242,218,1.000)";
-const PLOT_CLIP_PATH: &str = r#"clip-path="url(#plot-clip-area)""#;
+const PLOT_CLIP_GROUP: &str = r#"<g clip-path="url(#plot-clip-area)">"#;
 const DETAIL_MEDIA_OFFSET_X_PX: f64 = 3.0;
 const DETAIL_MEDIA_OFFSET_Y_PX: f64 = 1.8;
 
@@ -553,7 +553,6 @@ fn strip_svg_background(svg: &str) -> String {
     let end_index = start_index + end_relative + 2;
     format!("{}{}", &svg[..start_index], &svg[end_index..])
 }
-
 
 fn rewrite_detail_minute_axis(svg: &str) -> Result<String> {
     let lines = svg.lines().collect::<Vec<_>>();
@@ -629,6 +628,12 @@ fn parse_plot_clip_rect(svg: &str) -> Option<(f64, f64, f64, f64)> {
     ))
 }
 
+fn plot_mark_range(svg: &str) -> Option<(usize, usize)> {
+    let start = svg.find(PLOT_CLIP_GROUP)? + PLOT_CLIP_GROUP.len();
+    let end = svg[start..].find("</g>")? + start;
+    Some((start, end))
+}
+
 fn extract_svg_attr<'a>(element: &'a str, attr: &str) -> Option<&'a str> {
     let marker = format!(r#"{attr}=""#);
     let start = element.find(&marker)? + marker.len();
@@ -641,7 +646,9 @@ fn is_left_tick_label_line(line: &str, plot_x: f64) -> bool {
     if !trimmed.starts_with("<text ") || trimmed.contains("transform=\"rotate(") {
         return false;
     }
-    if !trimmed.contains("text-anchor=\"end\"") || !trimmed.contains("dominant-baseline=\"central\"") {
+    if !trimmed.contains("text-anchor=\"end\"")
+        || !trimmed.contains("dominant-baseline=\"central\"")
+    {
         return false;
     }
     let Some(x) = extract_svg_attr(trimmed, "x").and_then(|value| value.parse::<f64>().ok()) else {
@@ -655,15 +662,16 @@ fn is_left_tick_line(line: &str, plot_x: f64) -> bool {
     if !trimmed.starts_with("<line ") {
         return false;
     }
-    let Some(x1) = extract_svg_attr(trimmed, "x1").and_then(|value| value.parse::<f64>().ok()) else {
+    let Some(x1) = extract_svg_attr(trimmed, "x1").and_then(|value| value.parse::<f64>().ok())
+    else {
         return false;
     };
-    let Some(x2) = extract_svg_attr(trimmed, "x2").and_then(|value| value.parse::<f64>().ok()) else {
+    let Some(x2) = extract_svg_attr(trimmed, "x2").and_then(|value| value.parse::<f64>().ok())
+    else {
         return false;
     };
     (x1 - plot_x).abs() <= 0.25 && x2 < plot_x
 }
-
 
 fn offset_detail_mark_positions(
     svg: &str,
@@ -676,21 +684,21 @@ fn offset_detail_mark_positions(
         .column("media_family")
         .ok()
         .and_then(|column| column.str().ok());
+    let Some((range_start, range_end)) = plot_mark_range(svg) else {
+        return Ok(svg.to_string());
+    };
 
     let mut output = String::with_capacity(svg.len() + table.height() * 24);
-    let mut cursor = 0usize;
+    let mut cursor = range_start;
     let mut last_copied = 0usize;
     let mut point_index = 0usize;
 
-    while let Some(relative_clip_index) = svg[cursor..].find(PLOT_CLIP_PATH) {
-        let clip_index = cursor + relative_clip_index;
-        let Some(tag_start) = svg[..clip_index].rfind('<') else {
+    while let Some(relative_tag_start) = svg[cursor..range_end].find('<') {
+        let tag_start = cursor + relative_tag_start;
+        let Some(tag_end_relative) = svg[tag_start..range_end].find("/>") else {
             break;
         };
-        let Some(tag_end_relative) = svg[clip_index..].find("/>") else {
-            break;
-        };
-        let tag_end = clip_index + tag_end_relative + 2;
+        let tag_end = tag_start + tag_end_relative + 2;
         let tag = &svg[tag_start..tag_end];
         let tag_name = tag
             .trim_start_matches('<')
@@ -831,20 +839,21 @@ fn annotate_hour_heatmap_svg(svg: &str, table: &DataFrame) -> Result<String> {
 
 fn inject_plot_titles(svg: &str, titles: &[String], allowed_tags: &[&str]) -> String {
     let mut output = String::with_capacity(svg.len() + titles.len() * 72);
-    let mut cursor = 0usize;
     let mut last_copied = 0usize;
     let mut title_index = 0usize;
 
-    while let Some(relative_clip_index) = svg[cursor..].find(PLOT_CLIP_PATH) {
-        let clip_index = cursor + relative_clip_index;
-        let Some(tag_start) = svg[..clip_index].rfind('<') else {
+    let Some((range_start, range_end)) = plot_mark_range(svg) else {
+        return svg.to_string();
+    };
+
+    let mut cursor = range_start;
+    while let Some(relative_tag_start) = svg[cursor..range_end].find('<') {
+        let tag_start = cursor + relative_tag_start;
+        let Some(tag_end_relative) = svg[tag_start..range_end].find("/>") else {
             break;
         };
-        let Some(tag_end_relative) = svg[clip_index..].find("/>") else {
-            break;
-        };
-        let tag_end = clip_index + tag_end_relative;
-        let tag_body = &svg[tag_start + 1..tag_end];
+        let tag_end = tag_start + tag_end_relative + 2;
+        let tag_body = &svg[tag_start + 1..tag_end - 2];
         let tag_name = tag_body
             .split_whitespace()
             .next()
@@ -852,14 +861,14 @@ fn inject_plot_titles(svg: &str, titles: &[String], allowed_tags: &[&str]) -> St
             .trim_matches('/');
 
         if !allowed_tags.contains(&tag_name) {
-            cursor = tag_end + 2;
+            cursor = tag_end;
             continue;
         }
 
         output.push_str(&svg[last_copied..tag_start]);
 
         if let Some(title) = titles.get(title_index) {
-            output.push_str(&svg[tag_start..tag_end]);
+            output.push_str(&svg[tag_start..tag_end - 2]);
             output.push('>');
             output.push_str("<title>");
             output.push_str(&escape_html(title));
@@ -868,11 +877,11 @@ fn inject_plot_titles(svg: &str, titles: &[String], allowed_tags: &[&str]) -> St
             output.push('>');
             title_index += 1;
         } else {
-            output.push_str(&svg[tag_start..tag_end + 2]);
+            output.push_str(&svg[tag_start..tag_end]);
         }
 
-        last_copied = tag_end + 2;
-        cursor = tag_end + 2;
+        last_copied = tag_end;
+        cursor = tag_end;
     }
 
     output.push_str(&svg[last_copied..]);
@@ -910,59 +919,54 @@ fn is_rotated_bottom_tick_label(line: &str) -> bool {
 }
 
 fn force_zero_event_cells_white(svg: &str) -> String {
-    let mut output = String::with_capacity(svg.len());
-    let mut cursor = 0usize;
-
-    while let Some(relative_rect_start) = svg[cursor..].find("<rect") {
-        let rect_start = cursor + relative_rect_start;
-        output.push_str(&svg[cursor..rect_start]);
-
-        let Some(relative_rect_end) = svg[rect_start..].find("</rect>") else {
-            output.push_str(&svg[rect_start..]);
-            return output;
-        };
-        let rect_end = rect_start + relative_rect_end + "</rect>".len();
-        let rect = &svg[rect_start..rect_end];
-
-        if rect.contains("<title>") && rect.contains("\nMedia count: 0</title>") {
-            output.push_str(&replace_rect_fill(rect, HEATMAP_ZERO_FILL_WHITE));
+    rewrite_plot_rects(svg, |rect| {
+        if rect.contains("<title>") && extract_event_count(rect) == Some(0) {
+            replace_rect_fill(rect, HEATMAP_ZERO_FILL_WHITE)
         } else {
-            output.push_str(rect);
+            rect.to_string()
         }
-
-        cursor = rect_end;
-    }
-
-    output.push_str(&svg[cursor..]);
-    output
+    })
 }
 
 fn boost_low_positive_event_cells(svg: &str, threshold: usize, fill: &str) -> String {
+    rewrite_plot_rects(svg, |rect| match extract_event_count(rect) {
+        Some(event_count) if (1..=threshold).contains(&event_count) => {
+            replace_rect_fill(rect, fill)
+        }
+        _ => rect.to_string(),
+    })
+}
+
+fn rewrite_plot_rects(svg: &str, mut rewrite: impl FnMut(&str) -> String) -> String {
+    let Some((range_start, range_end)) = plot_mark_range(svg) else {
+        return svg.to_string();
+    };
+
     let mut output = String::with_capacity(svg.len());
-    let mut cursor = 0usize;
+    let mut cursor = range_start;
+    let mut last_copied = 0usize;
 
-    while let Some(relative_rect_start) = svg[cursor..].find("<rect") {
+    while let Some(relative_rect_start) = svg[cursor..range_end].find("<rect") {
         let rect_start = cursor + relative_rect_start;
-        output.push_str(&svg[cursor..rect_start]);
+        output.push_str(&svg[last_copied..rect_start]);
 
-        let Some(relative_rect_end) = svg[rect_start..].find("</rect>") else {
-            output.push_str(&svg[rect_start..]);
-            return output;
+        let rect_tail = &svg[rect_start..range_end];
+        let self_closing_end = rect_tail.find("/>").map(|index| rect_start + index + 2);
+        let paired_end = rect_tail
+            .find("</rect>")
+            .map(|index| rect_start + index + "</rect>".len());
+        let Some(rect_end) = self_closing_end.into_iter().chain(paired_end).min() else {
+            break;
         };
-        let rect_end = rect_start + relative_rect_end + "</rect>".len();
         let rect = &svg[rect_start..rect_end];
 
-        match extract_event_count(rect) {
-            Some(event_count) if (1..=threshold).contains(&event_count) => {
-                output.push_str(&replace_rect_fill(rect, fill));
-            }
-            _ => output.push_str(rect),
-        }
+        output.push_str(&rewrite(rect));
 
+        last_copied = rect_end;
         cursor = rect_end;
     }
 
-    output.push_str(&svg[cursor..]);
+    output.push_str(&svg[last_copied..]);
     output
 }
 
@@ -984,7 +988,7 @@ fn replace_rect_fill(rect: &str, fill: &str) -> String {
 }
 
 fn extract_event_count(rect: &str) -> Option<usize> {
-    let marker = "\nMedia count: ";
+    let marker = "Media count:";
     let value_start = rect.find(marker)? + marker.len();
     let value_end_relative = rect[value_start..]
         .find('<')
@@ -1026,10 +1030,7 @@ fn force_zero_legend_stop_white(svg: &str) -> String {
 fn relabel_legend_titles(svg: &str, replacements: &[(&str, &str)]) -> String {
     let mut output = svg.to_string();
     for (from, to) in replacements {
-        output = output.replace(
-            &format!(">{from}</text>"),
-            &format!(">{to}</text>"),
-        );
+        output = output.replace(&format!(">{from}</text>"), &format!(">{to}</text>"));
     }
     output
 }
