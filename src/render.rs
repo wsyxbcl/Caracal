@@ -1,10 +1,109 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use charton::alt::{color, shape, x, y};
 use charton::prelude::*;
 use chrono::DateTime;
-use polars::prelude::{DataFrame, DataType};
+use polars::prelude::{DataFrame, DataType, Series};
 
 use crate::data::{DeploymentSummary, OverviewBucket, PreparedData};
 use crate::util::{escape_html, format_count, format_date};
+
+fn chart_from_table(table: &DataFrame) -> Result<Chart> {
+    let mut dataset = Dataset::new();
+    for column in table.get_columns() {
+        add_series_to_dataset(&mut dataset, column.as_materialized_series())?;
+    }
+    Ok(Chart::build(dataset)?)
+}
+
+fn add_series_to_dataset(dataset: &mut Dataset, series: &Series) -> Result<()> {
+    let name = series.name().to_string();
+    match series.dtype() {
+        DataType::Float64 => {
+            let values = series
+                .f64()
+                .with_context(|| format!("failed to read column '{name}' as Float64"))?
+                .into_iter()
+                .collect::<Vec<Option<f64>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::Float32 => {
+            let values = series
+                .f32()
+                .with_context(|| format!("failed to read column '{name}' as Float32"))?
+                .into_iter()
+                .collect::<Vec<Option<f32>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::Int64 => {
+            let values = series
+                .i64()
+                .with_context(|| format!("failed to read column '{name}' as Int64"))?
+                .into_iter()
+                .collect::<Vec<Option<i64>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::Int32 => {
+            let values = series
+                .i32()
+                .with_context(|| format!("failed to read column '{name}' as Int32"))?
+                .into_iter()
+                .collect::<Vec<Option<i32>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::Int16 => {
+            let values = series
+                .i16()
+                .with_context(|| format!("failed to read column '{name}' as Int16"))?
+                .into_iter()
+                .collect::<Vec<Option<i16>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::Int8 => {
+            let values = series
+                .i8()
+                .with_context(|| format!("failed to read column '{name}' as Int8"))?
+                .into_iter()
+                .collect::<Vec<Option<i8>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::UInt64 => {
+            let values = series
+                .u64()
+                .with_context(|| format!("failed to read column '{name}' as UInt64"))?
+                .into_iter()
+                .collect::<Vec<Option<u64>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::UInt32 => {
+            let values = series
+                .u32()
+                .with_context(|| format!("failed to read column '{name}' as UInt32"))?
+                .into_iter()
+                .collect::<Vec<Option<u32>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::String => {
+            let values = series
+                .str()
+                .with_context(|| format!("failed to read column '{name}' as String"))?
+                .into_iter()
+                .map(|value| value.map(ToOwned::to_owned))
+                .collect::<Vec<Option<String>>>();
+            dataset.add_column(name, values)?;
+        }
+        DataType::Boolean => {
+            let values = series
+                .bool()
+                .with_context(|| format!("failed to read column '{name}' as Boolean"))?
+                .into_iter()
+                .collect::<Vec<Option<bool>>>();
+            dataset.add_column(name, values)?;
+        }
+        other => bail!("unsupported chart column '{name}' with dtype {other}"),
+    }
+
+    Ok(())
+}
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn overview_chart(data: &PreparedData, bucket: OverviewBucket) -> Result<LayeredChart> {
@@ -26,7 +125,7 @@ pub fn overview_chart_from_table(
     bucket: OverviewBucket,
     title: &str,
 ) -> Result<LayeredChart> {
-    let chart = Chart::build(table)?
+    let chart = chart_from_table(table)?
         .mark_rect()?
         .encode((x("bucket_label"), y("deployment"), color("event_count")))?
         .configure_rect(|rect| rect.with_stroke("#f7f1e7").with_stroke_width(0.2))
@@ -59,7 +158,7 @@ pub fn overview_web_chart_from_table(
     table: &DataFrame,
     _bucket: OverviewBucket,
 ) -> Result<LayeredChart> {
-    let chart = Chart::build(table)?
+    let chart = chart_from_table(table)?
         .mark_rect()?
         .encode((x("bucket_label"), y("deployment"), color("event_count")))?
         .configure_rect(|rect| rect.with_stroke("#f7f1e7").with_stroke_width(0.2))
@@ -103,7 +202,7 @@ pub fn detail_chart_from_table(
     _deployment: &str,
     summary: &DeploymentSummary,
 ) -> Result<LayeredChart> {
-    let chart = Chart::build(table)?
+    let chart = chart_from_table(table)?
         .mark_point()?
         .encode((
             x("day_label"),
@@ -146,7 +245,7 @@ pub fn detail_web_chart_from_table(
     _deployment: &str,
     _summary: &DeploymentSummary,
 ) -> Result<LayeredChart> {
-    let chart = Chart::build(table)?
+    let chart = chart_from_table(table)?
         .mark_point()?
         .encode((
             x("day_label"),
@@ -193,7 +292,7 @@ pub fn hour_heatmap_web_chart(data: &PreparedData) -> Result<LayeredChart> {
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn hour_heatmap_chart_from_table(table: &DataFrame, title: &str) -> Result<LayeredChart> {
-    let chart = Chart::build(table)?
+    let chart = chart_from_table(table)?
         .mark_rect()?
         .encode((x("hour_label"), y("deployment"), color("event_count")))?
         .configure_rect(|rect| rect.with_stroke("#f7f1e7").with_stroke_width(0.28))
@@ -217,7 +316,7 @@ pub fn hour_heatmap_chart_from_table(table: &DataFrame, title: &str) -> Result<L
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn hour_heatmap_web_chart_from_table(table: &DataFrame) -> Result<LayeredChart> {
-    let chart = Chart::build(table)?
+    let chart = chart_from_table(table)?
         .mark_rect()?
         .encode((x("hour_label"), y("deployment"), color("event_count")))?
         .configure_rect(|rect| rect.with_stroke("#f7f1e7").with_stroke_width(0.28))
