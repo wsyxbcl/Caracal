@@ -9,13 +9,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
 #[cfg(not(target_arch = "wasm32"))]
 use clap::ValueEnum;
-use polars::lazy::dsl::{coalesce, col, lit, when};
 use polars::prelude::*;
 use polars_io::mmap::MmapBytesReader;
-use polars_io::prelude::{CsvParseOptions, CsvReadOptions, SerReader};
+use polars_io::prelude::{CsvReadOptions, SerReader};
 
 const CSV_INFER_SCHEMA_LENGTH: usize = 1_000;
 
@@ -118,13 +117,11 @@ impl PreparedData {
         let frame = CsvReadOptions::default()
             .with_has_header(true)
             .with_infer_schema_length(Some(CSV_INFER_SCHEMA_LENGTH))
-            .with_parse_options(CsvParseOptions::default().with_try_parse_dates(true))
             .with_schema_overwrite(headers.schema_overwrite())
             .into_reader_with_file_handle(reader)
             .finish()
             .context("failed to read CSV with Polars")?;
         let frame = normalize_frame_headers(frame, &headers)?;
-        let frame = prepare_datetime_columns(frame)?;
 
         let indices = ColumnIndices::from_dataframe(&frame)?;
         let mut rows = Vec::with_capacity(frame.height());
@@ -234,9 +231,14 @@ impl EventRow {
     ) -> Result<Self> {
         let row_number = row_index + 2;
 
-        let deployment =
-            required_trimmed_string(frame, indices.deployment, row_index, "deployment", row_number)?;
-        let timestamp = parse_timestamp(frame, indices.effective_datetime, row_index, row_number)?;
+        let deployment = required_trimmed_string(
+            frame,
+            indices.deployment,
+            row_index,
+            "deployment",
+            row_number,
+        )?;
+        let timestamp = parse_effective_timestamp(frame, indices, row_index, row_number)?;
         let path = optional_trimmed_string(frame, indices.path, row_index)?.unwrap_or_default();
         let media_type = indices
             .media_type
@@ -279,9 +281,8 @@ fn summarize_rows(rows: &[EventRow]) -> Vec<DeploymentSummary> {
         })
         .collect::<Vec<_>>();
 
-    deployments.sort_by(|left, right| {
-        compare_deployment_names(&left.deployment, &right.deployment)
-    });
+    deployments
+        .sort_by(|left, right| compare_deployment_names(&left.deployment, &right.deployment));
 
     for (order, deployment) in deployments.iter_mut().enumerate() {
         deployment.order = order;
@@ -294,7 +295,8 @@ fn summarize_rows(rows: &[EventRow]) -> Vec<DeploymentSummary> {
 struct ColumnIndices {
     path: usize,
     deployment: usize,
-    effective_datetime: usize,
+    datetime: usize,
+    xmp_update_datetime: Option<usize>,
     media_type: Option<usize>,
 }
 
@@ -306,15 +308,17 @@ impl ColumnIndices {
         let deployment = frame
             .get_column_index("deployment")
             .context("missing required column 'deployment'")?;
-        let effective_datetime = frame
-            .get_column_index("__effective_datetime")
-            .context("missing effective datetime column '__effective_datetime'")?;
+        let datetime = frame
+            .get_column_index("datetime")
+            .context("missing required column 'datetime'")?;
+        let xmp_update_datetime = frame.get_column_index("xmp_update_datetime");
         let media_type = frame.get_column_index("media_type");
 
         Ok(Self {
             path,
             deployment,
-            effective_datetime,
+            datetime,
+            xmp_update_datetime,
             media_type,
         })
     }
@@ -333,7 +337,7 @@ impl CsvHeaders {
             .iter()
             .zip(self.normalized_headers.iter())
             .filter_map(|(raw, normalized)| match normalized.as_str() {
-                "path" | "deployment" | "media_type" | "xmp_update_datetime" => {
+                "path" | "deployment" | "datetime" | "media_type" | "xmp_update_datetime" => {
                     Some(Field::new(raw.as_str().into(), DataType::String))
                 }
                 _ => None,
@@ -388,7 +392,11 @@ fn normalize_header_name(header: &str) -> String {
 }
 
 fn normalize_frame_headers(mut frame: DataFrame, headers: &CsvHeaders) -> Result<DataFrame> {
-    for (raw, normalized) in headers.raw_headers.iter().zip(headers.normalized_headers.iter()) {
+    for (raw, normalized) in headers
+        .raw_headers
+        .iter()
+        .zip(headers.normalized_headers.iter())
+    {
         if raw != normalized
             && frame.get_column_index(raw).is_some()
             && frame.get_column_index(normalized).is_none()
@@ -400,46 +408,6 @@ fn normalize_frame_headers(mut frame: DataFrame, headers: &CsvHeaders) -> Result
     }
 
     Ok(frame)
-}
-
-fn prepare_datetime_columns(frame: DataFrame) -> Result<DataFrame> {
-    let has_update_column = frame.get_column_index("xmp_update_datetime").is_some();
-
-    let update_options = StrptimeOptions {
-        format: None,
-        strict: false,
-        exact: true,
-        cache: true,
-    };
-
-    let effective_datetime = if has_update_column {
-        let normalized_update_datetime = when(
-            col("xmp_update_datetime")
-                .str()
-                .strip_chars(lit(" \t\r\n"))
-                .eq(lit("")),
-        )
-        .then(Expr::Literal(LiteralValue::Scalar(Scalar::null(
-            DataType::String,
-        ))))
-        .otherwise(col("xmp_update_datetime"))
-        .str()
-        .to_datetime(None, None, update_options, lit("raise"));
-
-        coalesce(&[
-            normalized_update_datetime,
-            col("datetime"),
-        ])
-        .alias("__effective_datetime")
-    } else {
-        col("datetime").alias("__effective_datetime")
-    };
-
-    frame
-        .lazy()
-        .with_column(effective_datetime)
-        .collect()
-        .context("failed to prepare effective datetime column")
 }
 
 fn required_trimmed_string(
@@ -472,77 +440,67 @@ fn optional_trimmed_string(
     }
 }
 
-fn parse_timestamp(
+fn parse_effective_timestamp(
     frame: &DataFrame,
-    column_index: usize,
+    indices: &ColumnIndices,
     row_index: usize,
     row_number: usize,
 ) -> Result<NaiveDateTime> {
-    let column = frame
-        .get_columns()
-        .get(column_index)
-        .ok_or_else(|| anyhow!("column index {column_index} is out of bounds"))?;
-    let value = column
-        .get(row_index)
-        .with_context(|| format!("failed to read datetime at row {row_number}"))?;
-
-    match value {
-        AnyValue::Null => bail!("missing datetime at row {row_number}"),
-        AnyValue::Date(days) => date_days_to_naive_datetime(days, row_number),
-        AnyValue::Datetime(value, unit, _) => timestamp_from_unit(value, unit, row_number),
-        AnyValue::DatetimeOwned(value, unit, _) => timestamp_from_unit(value, unit, row_number),
-        AnyValue::String(raw) => bail!(
-            "datetime column was not inferred as a date/datetime type by Polars; got string '{}' at row {} (column dtype: {})",
-            raw.trim(),
-            row_number,
-            column.dtype()
-        ),
-        AnyValue::StringOwned(raw) => bail!(
-            "datetime column was not inferred as a date/datetime type by Polars; got string '{}' at row {} (column dtype: {})",
-            raw.as_str().trim(),
-            row_number,
-            column.dtype()
-        ),
-        other => bail!(
-            "datetime column was inferred as unsupported dtype {} at row {} (value: {})",
-            column.dtype(),
-            row_number,
-            other.str_value()
-        ),
+    if let Some(update_index) = indices.xmp_update_datetime {
+        if let Some(raw_update) = optional_trimmed_string(frame, update_index, row_index)?
+            .filter(|value| !value.is_empty())
+        {
+            return parse_datetime_text(&raw_update, row_number, "xmp_update_datetime");
+        }
     }
+
+    let raw_datetime =
+        required_trimmed_string(frame, indices.datetime, row_index, "datetime", row_number)?;
+    parse_datetime_text(&raw_datetime, row_number, "datetime")
 }
 
-fn date_days_to_naive_datetime(days: i32, row_number: usize) -> Result<NaiveDateTime> {
-    NaiveDate::from_ymd_opt(1970, 1, 1)
-        .expect("valid unix epoch")
-        .checked_add_signed(Duration::days(days as i64))
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .ok_or_else(|| anyhow!("datetime is out of range at row {row_number}"))
-}
+fn parse_datetime_text(raw: &str, row_number: usize, column_name: &str) -> Result<NaiveDateTime> {
+    let value = raw.trim();
+    if value.is_empty() {
+        bail!("missing {column_name} at row {row_number}");
+    }
 
-fn timestamp_from_unit(value: i64, unit: TimeUnit, row_number: usize) -> Result<NaiveDateTime> {
-    let (seconds, nanoseconds) = match unit {
-        TimeUnit::Nanoseconds => split_timestamp(value, 1_000_000_000),
-        TimeUnit::Microseconds => {
-            let (seconds, micros) = split_timestamp(value, 1_000_000);
-            (seconds, micros * 1_000)
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(parsed.naive_utc());
+    }
+
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y/%m/%d %H:%M:%S%.f",
+        "%Y/%m/%dT%H:%M:%S%.f",
+        "%Y:%m:%d %H:%M:%S%.f",
+    ] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(value, format) {
+            return Ok(parsed);
         }
-        TimeUnit::Milliseconds => {
-            let (seconds, millis) = split_timestamp(value, 1_000);
-            (seconds, millis * 1_000_000)
+    }
+
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f%:z",
+        "%Y-%m-%dT%H:%M:%S%.f%:z",
+        "%Y/%m/%d %H:%M:%S%.f%:z",
+        "%Y/%m/%dT%H:%M:%S%.f%:z",
+    ] {
+        if let Ok(parsed) = DateTime::parse_from_str(value, format) {
+            return Ok(parsed.naive_utc());
         }
-    };
+    }
 
-    chrono::DateTime::from_timestamp(seconds, nanoseconds as u32)
-        .map(|value| value.naive_utc())
-        .ok_or_else(|| anyhow!("datetime is out of range at row {row_number}"))
-}
+    for format in ["%Y-%m-%d", "%Y/%m/%d", "%Y:%m:%d"] {
+        if let Ok(parsed) = NaiveDate::parse_from_str(value, format) {
+            return parsed
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| anyhow!("datetime is out of range at row {row_number}"));
+        }
+    }
 
-fn split_timestamp(value: i64, units_per_second: i64) -> (i64, i64) {
-    (
-        value.div_euclid(units_per_second),
-        value.rem_euclid(units_per_second),
-    )
+    bail!("failed to parse {column_name} value '{value}' at row {row_number}")
 }
 
 fn compare_deployment_names(left: &str, right: &str) -> Ordering {
@@ -558,7 +516,8 @@ fn compare_deployment_names(left: &str, right: &str) -> Ordering {
         if left_digit && right_digit {
             let left_end = advance_ascii_digits(left_bytes, left_index);
             let right_end = advance_ascii_digits(right_bytes, right_index);
-            let ordering = compare_numeric_chunks(&left[left_index..left_end], &right[right_index..right_end]);
+            let ordering =
+                compare_numeric_chunks(&left[left_index..left_end], &right[right_index..right_end]);
             if ordering != Ordering::Equal {
                 return ordering;
             }
@@ -601,8 +560,16 @@ fn advance_ascii_digits(bytes: &[u8], start: usize) -> usize {
 fn compare_numeric_chunks(left: &str, right: &str) -> Ordering {
     let left_trimmed = left.trim_start_matches('0');
     let right_trimmed = right.trim_start_matches('0');
-    let left_normalized = if left_trimmed.is_empty() { "0" } else { left_trimmed };
-    let right_normalized = if right_trimmed.is_empty() { "0" } else { right_trimmed };
+    let left_normalized = if left_trimmed.is_empty() {
+        "0"
+    } else {
+        left_trimmed
+    };
+    let right_normalized = if right_trimmed.is_empty() {
+        "0"
+    } else {
+        right_trimmed
+    };
 
     left_normalized
         .len()
@@ -759,14 +726,10 @@ fn build_event_dataframe(
     media_types: Vec<String>,
     media_families: Vec<String>,
 ) -> Result<DataFrame> {
-    let timestamp_series = Series::new("timestamp".into(), timestamps)
-        .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))
-        .context("failed to cast timestamps into Polars Datetime")?;
-
     DataFrame::new(vec![
         Series::new("deployment".into(), deployments).into(),
         Series::new("deployment_order".into(), deployment_order).into(),
-        timestamp_series.into(),
+        Series::new("timestamp".into(), timestamps).into(),
         Series::new("day_label".into(), day_labels).into(),
         Series::new("hour_of_day".into(), hours).into(),
         Series::new("minute_of_day".into(), minutes).into(),
@@ -814,14 +777,10 @@ fn build_overview_table(
         }
     }
 
-    let bucket_series = Series::new("bucket_start".into(), bucket_ns_col)
-        .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))
-        .context("failed to cast overview bucket timestamps")?;
-
     DataFrame::new(vec![
         Series::new("deployment".into(), deployment_col).into(),
         Series::new("deployment_order".into(), order_col).into(),
-        bucket_series.into(),
+        Series::new("bucket_start".into(), bucket_ns_col).into(),
         Series::new("bucket_label".into(), bucket_label_col).into(),
         Series::new("event_count".into(), count_col).into(),
     ])
@@ -976,12 +935,9 @@ fn hour_of_day(timestamp: NaiveDateTime) -> f64 {
 }
 
 fn minute_of_day(timestamp: NaiveDateTime) -> f64 {
-    timestamp.hour() as f64 * 60.0
-        + timestamp.minute() as f64
-        + timestamp.second() as f64 / 60.0
+    timestamp.hour() as f64 * 60.0 + timestamp.minute() as f64 + timestamp.second() as f64 / 60.0
 }
 
 fn day_label(timestamp: NaiveDateTime) -> String {
     timestamp.format("%Y-%m-%d").to_string()
 }
-
