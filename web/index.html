@@ -859,6 +859,15 @@
             return I18N[currentLang]?.bucket?.[value] ?? I18N.en.bucket[value] ?? value;
         }
 
+        function escapeHtml(value) {
+            return String(value)
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#39;");
+        }
+
         function setStatus(message) {
             lastStatusState = { kind: "text", message };
             statusEl.textContent = message;
@@ -1368,12 +1377,12 @@
             const toolbar = document.createElement("div");
             toolbar.className = `frame-tools${options.fullscreenMode ? " is-fullscreen" : ""}`;
             toolbar.innerHTML = options.fullscreenMode ? `
-                <span class="tool-heading">${options.title || t("chart", "chart")}</span>
+                <span class="tool-heading">${escapeHtml(options.title || t("chart", "chart"))}</span>
                 <button type="button" class="tool-button" data-role="zoom-out">-</button>
                 <button type="button" class="tool-button" data-role="zoom-in">+</button>
                 <button type="button" class="tool-button" data-role="zoom-reset">${t("chart", "reset")}</button>
                 <button type="button" class="tool-button" data-role="close">${t("chart", "close")}</button>
-                <span class="tool-label">${options.subtitle || t("chart", "zoom_workspace")}</span>
+                <span class="tool-label">${escapeHtml(options.subtitle || t("chart", "zoom_workspace"))}</span>
                 <span class="tool-label">${t("chart", "zoom_level")}</span>
             ` : `
                 <button type="button" class="tool-button" data-role="zoom-out">-</button>
