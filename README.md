@@ -13,6 +13,10 @@ It is part of the [Serval](https://github.com/wsyxbcl/Serval) workflow where use
 
 ## Run 
 
+> First-time setup: the binary embeds the browser bundle from `web/pkg/` at
+> compile time, so build it once with `wasm-pack` (see [Build](#build)) before
+> running `cargo run` on a fresh checkout.
+
 Start the local WASM server:
 
 ```bash
