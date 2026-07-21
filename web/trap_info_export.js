@@ -59,6 +59,10 @@ const FIELD_TO_COLUMN = Object.fromEntries(
     TRAP_INFO_HEADERS.map(([, field], index) => [field, index + 1]),
 );
 
+// Default 备注 (deploymentComments) value for deployments whose media metadata
+// carried GPS coordinates.
+const GPS_COMMENT = "元数据含GPS坐标";
+
 const CRC32_TABLE = buildCrc32Table();
 
 export function sortDeploymentOptions(deploymentOptions) {
@@ -75,6 +79,7 @@ export function buildTrapInfoWorkbookBytes(deploymentOptions) {
         deployment: option.deployment || "",
         deploymentStart: option.first_seen || "",
         deploymentEnd: option.last_seen || "",
+        deploymentComments: option.has_gps ? GPS_COMMENT : "",
     }));
 
     const timestamp = new Date().toISOString();
@@ -253,11 +258,19 @@ function buildWorksheetXml(rows) {
     const dataRows = rows
         .map((row, index) => {
             const rowNumber = index + 3;
+            const commentsColumn = columnName(FIELD_TO_COLUMN.deploymentComments);
+            const commentsCell = row.deploymentComments
+                ? inlineStringCell(
+                      `${commentsColumn}${rowNumber}`,
+                      row.deploymentComments,
+                  )
+                : "";
             return (
                 `<row r="${rowNumber}">` +
                 inlineStringCell(`A${rowNumber}`, row.deployment) +
                 inlineStringCell(`G${rowNumber}`, row.deploymentStart) +
                 inlineStringCell(`H${rowNumber}`, row.deploymentEnd) +
+                commentsCell +
                 `</row>`
             );
         })

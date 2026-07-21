@@ -42,6 +42,7 @@ struct DeploymentOption {
     first_seen: String,
     last_seen: String,
     media_breakdown: String,
+    has_gps: bool,
 }
 
 #[wasm_bindgen]
@@ -73,6 +74,7 @@ impl WasmExplorer {
                     first_seen: format_timestamp(summary.first_seen),
                     last_seen: format_timestamp(summary.last_seen),
                     media_breakdown: summary.media_breakdown(),
+                    has_gps: summary.has_gps,
                 })
                 .collect(),
         };

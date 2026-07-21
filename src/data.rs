@@ -68,6 +68,8 @@ pub struct DeploymentSummary {
     pub first_seen: NaiveDateTime,
     pub last_seen: NaiveDateTime,
     pub media_counts: BTreeMap<String, usize>,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub has_gps: bool,
 }
 
 impl DeploymentSummary {
@@ -221,6 +223,7 @@ struct EventRow {
     path: String,
     media_type: String,
     media_family: String,
+    has_gps: bool,
 }
 
 impl EventRow {
@@ -250,14 +253,35 @@ impl EventRow {
             .unwrap_or_else(|| infer_media_type_from_path(&path));
         let media_family = media_family(&media_type, &path).to_string();
 
+        let latitude = read_gps_value(frame, indices.latitude, row_index)?;
+        let longitude = read_gps_value(frame, indices.longitude, row_index)?;
+        let has_gps = latitude.is_some_and(|value| value != 0.0)
+            && longitude.is_some_and(|value| value != 0.0);
+
         Ok(Self {
             deployment,
             timestamp,
             path,
             media_type,
             media_family,
+            has_gps,
         })
     }
+}
+
+/// Reads an optional latitude/longitude cell as a coordinate. Empty or
+/// unparseable cells are treated as absent (`None`), which callers read as
+/// "no GPS" rather than as a zero coordinate.
+fn read_gps_value(
+    frame: &DataFrame,
+    column_index: Option<usize>,
+    row_index: usize,
+) -> Result<Option<f64>> {
+    let Some(column_index) = column_index else {
+        return Ok(None);
+    };
+    Ok(optional_trimmed_string(frame, column_index, row_index)?
+        .and_then(|value| value.parse::<f64>().ok()))
 }
 
 fn summarize_rows(rows: &[EventRow]) -> Vec<DeploymentSummary> {
@@ -266,7 +290,7 @@ fn summarize_rows(rows: &[EventRow]) -> Vec<DeploymentSummary> {
         let entry = stats
             .entry(row.deployment.clone())
             .or_insert_with(|| DeploymentAccumulator::new(row.timestamp));
-        entry.record(row.timestamp, &row.media_family);
+        entry.record(row.timestamp, &row.media_family, row.has_gps);
     }
 
     let mut deployments = stats
@@ -278,6 +302,7 @@ fn summarize_rows(rows: &[EventRow]) -> Vec<DeploymentSummary> {
             first_seen: stat.first_seen,
             last_seen: stat.last_seen,
             media_counts: stat.media_counts,
+            has_gps: stat.has_gps,
         })
         .collect::<Vec<_>>();
 
@@ -298,6 +323,8 @@ struct ColumnIndices {
     datetime: usize,
     xmp_update_datetime: Option<usize>,
     media_type: Option<usize>,
+    latitude: Option<usize>,
+    longitude: Option<usize>,
 }
 
 impl ColumnIndices {
@@ -313,6 +340,8 @@ impl ColumnIndices {
             .context("missing required column 'datetime'")?;
         let xmp_update_datetime = frame.get_column_index("xmp_update_datetime");
         let media_type = frame.get_column_index("media_type");
+        let latitude = frame.get_column_index("latitude");
+        let longitude = frame.get_column_index("longitude");
 
         Ok(Self {
             path,
@@ -320,6 +349,8 @@ impl ColumnIndices {
             datetime,
             xmp_update_datetime,
             media_type,
+            latitude,
+            longitude,
         })
     }
 }
@@ -337,7 +368,8 @@ impl CsvHeaders {
             .iter()
             .zip(self.normalized_headers.iter())
             .filter_map(|(raw, normalized)| match normalized.as_str() {
-                "path" | "deployment" | "datetime" | "media_type" | "xmp_update_datetime" => {
+                "path" | "deployment" | "datetime" | "media_type" | "xmp_update_datetime"
+                | "latitude" | "longitude" => {
                     Some(Field::new(raw.as_str().into(), DataType::String))
                 }
                 _ => None,
@@ -584,6 +616,7 @@ struct DeploymentAccumulator {
     first_seen: NaiveDateTime,
     last_seen: NaiveDateTime,
     media_counts: BTreeMap<String, usize>,
+    has_gps: bool,
 }
 
 impl DeploymentAccumulator {
@@ -593,14 +626,16 @@ impl DeploymentAccumulator {
             first_seen: timestamp,
             last_seen: timestamp,
             media_counts: BTreeMap::new(),
+            has_gps: false,
         }
     }
 
-    fn record(&mut self, timestamp: NaiveDateTime, media_type: &str) {
+    fn record(&mut self, timestamp: NaiveDateTime, media_type: &str, has_gps: bool) {
         self.event_count += 1;
         self.first_seen = self.first_seen.min(timestamp);
         self.last_seen = self.last_seen.max(timestamp);
         *self.media_counts.entry(media_type.to_string()).or_insert(0) += 1;
+        self.has_gps |= has_gps;
     }
 }
 
@@ -940,4 +975,47 @@ fn minute_of_day(timestamp: NaiveDateTime) -> f64 {
 
 fn day_label(timestamp: NaiveDateTime) -> String {
     timestamp.format("%Y-%m-%d").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary<'a>(data: &'a PreparedData, name: &str) -> &'a DeploymentSummary {
+        data.deployments
+            .iter()
+            .find(|deployment| deployment.deployment == name)
+            .expect("deployment present")
+    }
+
+    #[test]
+    fn gps_requires_both_coordinates_nonzero() {
+        let csv = "path,deployment,datetime,latitude,longitude\n\
+            a.jpg,withgps,2025-03-01 06:00:00,31.2,121.4\n\
+            b.jpg,zeros,2025-03-01 06:00:00,0,0\n\
+            c.jpg,partial,2025-03-01 06:00:00,31.2,0\n\
+            d.jpg,empty,2025-03-01 06:00:00,,\n";
+        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        assert!(summary(&data, "withgps").has_gps);
+        assert!(!summary(&data, "zeros").has_gps);
+        assert!(!summary(&data, "partial").has_gps);
+        assert!(!summary(&data, "empty").has_gps);
+    }
+
+    #[test]
+    fn gps_marked_when_any_row_has_coordinates() {
+        let csv = "path,deployment,datetime,latitude,longitude\n\
+            a.jpg,mix,2025-03-01 06:00:00,,\n\
+            b.jpg,mix,2025-03-02 06:00:00,31.2,121.4\n";
+        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        assert!(summary(&data, "mix").has_gps);
+    }
+
+    #[test]
+    fn no_gps_columns_means_no_gps() {
+        let csv = "path,deployment,datetime\n\
+            a.jpg,nogps,2025-03-01 06:00:00\n";
+        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        assert!(!summary(&data, "nogps").has_gps);
+    }
 }
