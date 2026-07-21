@@ -10,7 +10,6 @@ crate-type = ["cdylib"]
 anyhow = "1.0"
 charton = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-clap = { version = "4.5", features = ["derive"] }
 console_error_panic_hook = "0.1"
 polars = { version = "0.49", default-features = false, features = ["dtype-categorical", "dtype-date", "dtype-datetime", "lazy", "strings", "temporal"] }
 polars-io = { version = "0.49", default-features = false, features = ["csv"] }

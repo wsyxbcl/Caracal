@@ -9,8 +9,6 @@ const INDEX_HTML: &[u8] = include_bytes!("../web/index.html");
 const TRAP_INFO_EXPORT_JS: &[u8] = include_bytes!("../web/trap_info_export.js");
 const PKG_WASM: &[u8] = include_bytes!("../web/pkg/serval_charton_web_bg.wasm");
 const PKG_JS: &[u8] = include_bytes!("../web/pkg/serval_charton_web.js");
-const PKG_WASM_D_TS: &[u8] = include_bytes!("../web/pkg/serval_charton_web_bg.wasm.d.ts");
-const PKG_D_TS: &[u8] = include_bytes!("../web/pkg/serval_charton_web.d.ts");
 
 pub fn serve(bind: SocketAddr, open_browser: bool) -> Result<()> {
     let listener = TcpListener::bind(bind)
@@ -92,10 +90,6 @@ fn route(path: &str) -> Response<'_> {
         }
         "/pkg/serval_charton_web_bg.wasm" => Response::ok("application/wasm", PKG_WASM),
         "/pkg/serval_charton_web.js" => Response::ok("text/javascript; charset=utf-8", PKG_JS),
-        "/pkg/serval_charton_web_bg.wasm.d.ts" => {
-            Response::ok("text/plain; charset=utf-8", PKG_WASM_D_TS)
-        }
-        "/pkg/serval_charton_web.d.ts" => Response::ok("text/plain; charset=utf-8", PKG_D_TS),
         _ => Response::not_found(),
     }
 }
