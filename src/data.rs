@@ -1018,4 +1018,14 @@ mod tests {
         let data = PreparedData::from_csv_text(csv).expect("parse csv");
         assert!(!summary(&data, "nogps").has_gps);
     }
+
+    #[test]
+    fn single_coordinate_column_is_optional_and_not_gps() {
+        // Only one of the two coordinate columns present: still parses, and a
+        // single coordinate never counts as GPS.
+        let csv = "path,deployment,datetime,latitude\n\
+            a.jpg,latonly,2025-03-01 06:00:00,31.2\n";
+        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        assert!(!summary(&data, "latonly").has_gps);
+    }
 }

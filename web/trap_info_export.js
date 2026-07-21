@@ -60,8 +60,9 @@ const FIELD_TO_COLUMN = Object.fromEntries(
 );
 
 // Default 备注 (deploymentComments) value for deployments whose media metadata
-// carried GPS coordinates.
-const GPS_COMMENT = "元数据含GPS坐标";
+// carried GPS coordinates. The trailing "; " separates it from any note the
+// reviewer appends afterwards.
+const GPS_COMMENT = "元数据含GPS坐标; ";
 
 const CRC32_TABLE = buildCrc32Table();
 
@@ -318,7 +319,11 @@ function buildHeaderRow(rowNumber, values) {
 }
 
 function inlineStringCell(reference, value) {
-    return `<c r="${reference}" t="inlineStr"><is><t>${escapeXml(value || "")}</t></is></c>`;
+    const text = value || "";
+    // Excel drops leading/trailing whitespace from inline strings unless the
+    // element opts into whitespace preservation (e.g. the GPS comment's "; ").
+    const preserve = text !== text.trim() ? ` xml:space="preserve"` : "";
+    return `<c r="${reference}" t="inlineStr"><is><t${preserve}>${escapeXml(text)}</t></is></c>`;
 }
 
 function columnName(index) {
