@@ -54,6 +54,21 @@ fn handle_connection(mut stream: TcpStream) -> Result<()> {
         reader
             .read_line(&mut request_line)
             .context("failed to read request line")?;
+
+        // Drain the remaining request headers before responding. If we close
+        // the socket while the client is still sending its headers, the OS can
+        // reset the connection and truncate our response body (notably the
+        // multi-megabyte WASM bundle).
+        let mut header_line = String::new();
+        loop {
+            header_line.clear();
+            let read = reader
+                .read_line(&mut header_line)
+                .context("failed to read request headers")?;
+            if read == 0 || header_line == "\r\n" || header_line == "\n" {
+                break;
+            }
+        }
     }
 
     let mut parts = request_line.split_whitespace();
