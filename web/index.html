@@ -15,11 +15,52 @@
             --accent: #b0542b;
             --accent-strong: #97481f;
             --accent-soft: rgba(176, 84, 43, 0.10);
+            --accent-soft2: var(--accent-soft2);
+            --accent-border: rgba(176, 84, 43, 0.30);
+            --on-accent: #ffffff;
+            --chart-bg: transparent;
             --shadow: 0 1px 2px rgba(31, 26, 20, 0.05);
             --radius: 12px;
             --radius-sm: 8px;
             --font-sans: "IBM Plex Sans", "Avenir Next", "Segoe UI Variable", "Segoe UI", "Noto Sans", sans-serif;
             --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+        }
+
+        :root[data-theme="dark"] {
+            --bg: #1a1a1d;
+            --card: #202023;
+            --line: #2c2c30;
+            --line-strong: #3a3a40;
+            --ink: #e8e8ea;
+            --muted: #9a9aa0;
+            --accent: #e0894f;
+            --accent-strong: #f0a06a;
+            --accent-soft: rgba(224, 137, 79, 0.12);
+            --accent-soft2: rgba(224, 137, 79, 0.18);
+            --accent-border: rgba(224, 137, 79, 0.35);
+            --on-accent: #1a1a1d;
+            --chart-bg: #fdfcfa;
+            --shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+        }
+
+        /* Charts are rendered (in WASM) with light-theme colors, so keep the
+           chart canvas light in dark mode — a light chart card on dark chrome.
+           Re-light the tokens inside so the chart toolbar/labels match. */
+        :root[data-theme="dark"] .chart-frame {
+            background: var(--chart-bg);
+            border-radius: var(--radius-sm);
+            padding: 8px;
+            --card: #ffffff;
+            --ink: #1f1a14;
+            --muted: #6d6458;
+            --line: #ece4d7;
+            --line-strong: #ddd2c1;
+        }
+
+        :root[data-theme="dark"] .error {
+            color: #ee6666;
+            border-color: rgba(238, 102, 102, 0.30);
+            background: rgba(238, 102, 102, 0.10);
         }
 
         * {
@@ -125,7 +166,7 @@
             border-radius: var(--radius-sm);
             border: 1px solid var(--accent);
             background: var(--accent);
-            color: #ffffff;
+            color: var(--on-accent);
             transition: background 0.15s ease, border-color 0.15s ease;
         }
 
@@ -170,6 +211,38 @@
         }
 
         .gh-link svg {
+            display: block;
+        }
+
+        .theme-toggle {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px;
+            border: 0;
+            background: transparent;
+            color: var(--muted);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            transition: color 0.15s ease;
+        }
+
+        .theme-toggle:hover {
+            color: var(--ink);
+        }
+
+        .theme-toggle svg {
+            display: block;
+        }
+
+        .theme-toggle .icon-sun {
+            display: none;
+        }
+
+        :root[data-theme="dark"] .theme-toggle .icon-moon {
+            display: none;
+        }
+
+        :root[data-theme="dark"] .theme-toggle .icon-sun {
             display: block;
         }
 
@@ -219,7 +292,7 @@
 
         .tag-accent {
             color: var(--accent);
-            border-color: rgba(176, 84, 43, 0.3);
+            border-color: var(--accent-border);
             background: var(--accent-soft);
             font-weight: 600;
         }
@@ -446,7 +519,7 @@
 
         .filedrop:hover,
         .filedrop.dragover {
-            background: rgba(176, 84, 43, 0.16);
+            background: var(--accent-soft2);
             border-color: var(--accent-strong);
         }
 
@@ -521,7 +594,7 @@
             border-radius: var(--radius-sm);
             padding: 9px 15px;
             background: var(--accent);
-            color: #ffffff;
+            color: var(--on-accent);
             font-weight: 600;
             transition: background 0.15s ease, border-color 0.15s ease;
         }
@@ -549,7 +622,7 @@
         }
 
         .chart-frame {
-            background: transparent;
+            background: var(--chart-bg);
             border: none;
             border-radius: 0;
             padding: 0;
@@ -749,6 +822,18 @@
             min-width: 0;
         }
     </style>
+    <script>
+        // Set the theme before first paint to avoid a flash of the wrong theme.
+        (function () {
+            try {
+                var saved = localStorage.getItem("caracal.theme");
+                var theme = saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+                document.documentElement.setAttribute("data-theme", theme);
+            } catch (e) {
+                document.documentElement.setAttribute("data-theme", "light");
+            }
+        })();
+    </script>
 </head>
 <body>
     <header class="site-header">
@@ -774,6 +859,10 @@
                 <a class="gh-link" href="https://github.com/wsyxbcl/charton_playground" target="_blank" rel="noopener noreferrer" aria-label="GitHub repository">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.37.5 0 5.78 0 12.29c0 5.2 3.44 9.6 8.21 11.16.6.11.82-.26.82-.58 0-.29-.01-1.04-.02-2.05-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.67-.3-5.47-1.34-5.47-5.97 0-1.32.47-2.4 1.24-3.25-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.24.96-.27 1.98-.4 3-.4 1.02 0 2.04.14 3 .4 2.28-1.56 3.29-1.24 3.29-1.24.66 1.66.24 2.88.12 3.18.77.85 1.24 1.93 1.24 3.25 0 4.64-2.81 5.67-5.49 5.97.43.37.81 1.1.81 2.22 0 1.6-.01 2.9-.01 3.29 0 .32.22.7.83.58C20.57 21.88 24 17.48 24 12.29 24 5.78 18.63.5 12 .5z"/></svg>
                 </a>
+                <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle dark mode">
+                    <svg class="icon-moon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+                    <svg class="icon-sun" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M4.6 4.6l1.7 1.7M17.7 17.7l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.6 19.4l1.7-1.7M17.7 6.3l1.7-1.7"/></svg>
+                </button>
             </div>
         </div>
     </header>
@@ -2220,6 +2309,17 @@
                 await loadExplorer(lastCsvText, lastSourceLabel, null, index);
             } catch (error) {
                 reportLoadError(error);
+            }
+        });
+
+        document.getElementById("theme-toggle").addEventListener("click", () => {
+            const next =
+                document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+            document.documentElement.setAttribute("data-theme", next);
+            try {
+                localStorage.setItem("caracal.theme", next);
+            } catch (error) {
+                /* storage may be unavailable; the toggle still works for the session */
             }
         });
 
