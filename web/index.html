@@ -342,6 +342,19 @@
             line-height: 1.5;
         }
 
+        .current-source {
+            margin: 0;
+            max-width: 520px;
+            color: var(--muted);
+            font-size: 0.88rem;
+            line-height: 1.5;
+            word-break: break-all;
+        }
+
+        .current-source .mono {
+            color: var(--ink);
+        }
+
         .filedrop {
             display: flex;
             flex-direction: column;
@@ -718,6 +731,7 @@
                         <button id="open-local-csv" type="button">Open local CSV</button>
                         <button id="reload-source" class="secondary" type="button" disabled>Reload current source</button>
                     </div>
+                    <p class="current-source hidden" id="current-source"><span id="current-source-label"></span> <span class="mono" id="current-source-name"></span></p>
                     <p class="upload-note" id="upload-note"></p>
                 </div>
                 <div class="status" id="status">Initialize WASM runtime, then upload a CSV to render the explorer.</div>
@@ -849,6 +863,9 @@
         const filedropText = document.getElementById("filedrop-text");
         const filedropHint = document.getElementById("filedrop-hint");
         const uploadNote = document.getElementById("upload-note");
+        const currentSource = document.getElementById("current-source");
+        const currentSourceLabel = document.getElementById("current-source-label");
+        const currentSourceName = document.getElementById("current-source-name");
         const openLocalCsvButton = document.getElementById("open-local-csv");
         const reloadSourceButton = document.getElementById("reload-source");
         const controlsTitle = document.getElementById("controls-title");
@@ -920,6 +937,7 @@
                     upload_note: "Tip: edit the datetimes in your CSV and reload the source to update the charts.",
                     open_local_csv: "Open local CSV",
                     reload_source: "Reload current source",
+                    current_source_label: "Current source:",
                     controls_title: "Controls",
                     controls_copy: "",
                     bucket_label: "Overview bucket",
@@ -972,9 +990,7 @@
                     rerender_overview: "Re-rendering overview in WASM...",
                     overview_updated: "Overview updated.",
                     rerender_detail: "Re-rendering deployment detail in WASM...",
-                    detail_updated: "Detail updated.",
-                    focus_deployment: "Focusing deployment {deployment} from chart interaction...",
-                    detail_focused: "Detail focused on {deployment}."
+                    detail_updated: "Detail updated."
                 },
                 error: {
                     no_svg: "Chart rendering returned no SVG.",
@@ -1033,6 +1049,7 @@
                     upload_note: "提示：修改 CSV 中的时间后重新加载数据源，即可更新图表。",
                     open_local_csv: "打开本地 CSV",
                     reload_source: "重新加载当前数据源",
+                    current_source_label: "当前数据源：",
                     controls_title: "控制面板",
                     controls_copy: "",
                     bucket_label: "总览图时间尺度",
@@ -1085,9 +1102,7 @@
                     rerender_overview: "正在 WASM 中重新渲染概览图...",
                     overview_updated: "概览图已更新。",
                     rerender_detail: "正在 WASM 中重新渲染位点明细图...",
-                    detail_updated: "明细图已更新。",
-                    focus_deployment: "正在通过图表交互聚焦位点 {deployment}...",
-                    detail_focused: "明细已聚焦到位点 {deployment}。"
+                    detail_updated: "明细图已更新。"
                 },
                 error: {
                     no_svg: "图表渲染后未返回 SVG。",
@@ -1218,6 +1233,13 @@
             } else {
                 openLocalCsvButton.hidden = true;
                 uploadCopy.textContent = t("static", "upload_copy_basic");
+            }
+            if (lastSourceLabel) {
+                currentSourceLabel.textContent = t("static", "current_source_label");
+                currentSourceName.textContent = lastSourceLabel;
+                currentSource.classList.remove("hidden");
+            } else {
+                currentSource.classList.add("hidden");
             }
         }
 
@@ -1675,9 +1697,7 @@
 
                     deploymentSelect.value = label;
                     try {
-                        setStatusKey("focus_deployment", { deployment: label });
                         await renderDetail();
-                        setStatusKey("detail_focused", { deployment: label });
                     } catch (error) {
                         showError(error && error.message ? error.message : String(error));
                     }
@@ -1698,9 +1718,7 @@
                             toggleDeploymentRowHighlight(frame, deployment);
                             deploymentSelect.value = deployment;
                             try {
-                                setStatusKey("focus_deployment", { deployment });
                                 await renderDetail();
-                                setStatusKey("detail_focused", { deployment });
                             } catch (error) {
                                 showError(error && error.message ? error.message : String(error));
                             }
