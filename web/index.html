@@ -725,7 +725,8 @@
                     no_svg: "Chart rendering returned no SVG.",
                     wasm_not_ready: "WASM runtime is not ready yet.",
                     reload_without_source: "Load a CSV before trying to reload it.",
-                    export_without_data: "Load a CSV before exporting the trap_info template."
+                    export_without_data: "Load a CSV before exporting the trap_info template.",
+                    deploy_from_path_failed: "Could not derive a deployment from the path column for every row (the paths do not share a consistent directory structure). Please add a 'deployment' column to the CSV and reload."
                 },
                 chart: {
                     chart: "Chart",
@@ -825,7 +826,8 @@
                     no_svg: "图表渲染后未返回 SVG。",
                     wasm_not_ready: "WASM 运行时尚未就绪。",
                     reload_without_source: "请先加载 CSV，再执行重新加载。",
-                    export_without_data: "请先加载 CSV，再导出 trap_info 模板。"
+                    export_without_data: "请先加载 CSV，再导出 trap_info 模板。",
+                    deploy_from_path_failed: "无法从 path 列为每一行推断出位点（路径的目录层级不一致）。请在 CSV 中添加 deployment 列后重新加载。"
                 },
                 chart: {
                     chart: "图表",
@@ -913,6 +915,17 @@
             lastErrorState = { kind: "key", key, params };
             errorEl.style.display = "block";
             errorEl.textContent = t("error", key, params);
+        }
+
+        // Show a localized hint for the deployment-from-path failure, otherwise
+        // the raw error message.
+        function reportLoadError(error) {
+            const message = error && error.message ? error.message : String(error);
+            if (message.includes("deploy-path-error")) {
+                showErrorKey("deploy_from_path_failed");
+            } else {
+                showError(message);
+            }
         }
 
         function refreshStatusAndError() {
@@ -1810,7 +1823,7 @@
                     label: file.name,
                 });
             } catch (error) {
-                showError(error && error.message ? error.message : String(error));
+                reportLoadError(error);
                 setStatusKey("upload_failed");
             } finally {
                 event.target.value = "";
@@ -1825,7 +1838,7 @@
                     setStatusKey("local_cancelled");
                     return;
                 }
-                showError(error && error.message ? error.message : String(error));
+                reportLoadError(error);
                 setStatusKey("local_failed");
             }
         });
@@ -1834,7 +1847,7 @@
             try {
                 await reloadCurrentSource();
             } catch (error) {
-                showError(error && error.message ? error.message : String(error));
+                reportLoadError(error);
                 setStatusKey("reload_failed");
             }
         });
@@ -1885,7 +1898,7 @@
                 // Re-parse the same CSV, deriving deployments from the chosen level.
                 await loadExplorer(lastCsvText, lastSourceLabel, null, index);
             } catch (error) {
-                showError(error && error.message ? error.message : String(error));
+                reportLoadError(error);
                 setStatusKey("upload_failed");
             }
         });

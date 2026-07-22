@@ -451,11 +451,13 @@ fn resolve_deployments(
     for (row_index, path) in paths.iter().enumerate() {
         let row_number = row_index + 2;
         if path.trim().is_empty() {
-            bail!("missing path at row {row_number}, cannot derive deployment");
+            bail!("deploy-path-error: missing path at row {row_number}");
         }
+        // The `deploy-path-error:` marker lets the web UI show a localized hint
+        // to add a `deployment` column instead of the raw message.
         deployments.push(
             deployment_from_path(path, chosen)
-                .with_context(|| format!("at row {row_number}"))?,
+                .map_err(|error| anyhow!("deploy-path-error: {error} (row {row_number})"))?,
         );
     }
 
@@ -539,14 +541,15 @@ fn deployment_from_path(path: &str, deploy_path_index: i32) -> Result<String> {
     let index: usize = deploy_path_index
         .try_into()
         .with_context(|| format!("invalid deployment path level {deploy_path_index}"))?;
-    normalize_path_separators(path)
-        .split('/')
-        .nth(index)
-        .map(str::to_string)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!("cannot extract deployment from path '{path}' at level {deploy_path_index}")
-        })
+    let normalized = normalize_path_separators(path);
+    let components: Vec<&str> = normalized.split('/').collect();
+    // The level must be a real directory: not the root (index 0) and not the
+    // file name (the last component). Otherwise we would silently pass the file
+    // name off as a deployment, so refuse and let the caller surface an error.
+    if index == 0 || index + 1 >= components.len() || components[index].is_empty() {
+        bail!("path '{path}' has no directory level {deploy_path_index}");
+    }
+    Ok(components[index].to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -1259,6 +1262,30 @@ mod tests {
             detect_deployment_path_index(["p/c/dep1/a.jpg", "p/c/dep2/100MEDIA/b.jpg"]),
             None
         );
+    }
+
+    #[test]
+    fn deployment_from_path_rejects_root_and_file_name() {
+        assert_eq!(deployment_from_path("a/b/file.jpg", 1).unwrap(), "b");
+        // Index 2 lands on the file name, not a directory -> error, not "file.jpg".
+        assert!(deployment_from_path("a/b/file.jpg", 2).is_err());
+        // Root and out-of-range are rejected.
+        assert!(deployment_from_path("a/b/file.jpg", 0).is_err());
+        assert!(deployment_from_path("a/b/file.jpg", 9).is_err());
+    }
+
+    #[test]
+    fn mixed_depth_paths_error_instead_of_silent_drop() {
+        // The shorter path has no directory at the chosen level: refuse the whole
+        // parse (no graphs) rather than deriving a bogus/filename deployment.
+        let csv = "path,datetime\n\
+            a/b/c/IMG_0001.jpg,2025-03-01 06:00:00\n\
+            a/b/IMG_0002.jpg,2025-03-02 06:00:00\n";
+        let error = PreparedData::from_csv_text(csv, None)
+            .map(|_| ())
+            .expect_err("mixed-depth paths must error")
+            .to_string();
+        assert!(error.contains("deploy-path-error"), "got: {error}");
     }
 
     #[test]
