@@ -116,6 +116,46 @@
             gap: 12px;
         }
 
+        .header-btn {
+            font: inherit;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            padding: 6px 13px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--accent);
+            background: var(--accent);
+            color: #ffffff;
+            transition: background 0.15s ease, border-color 0.15s ease;
+        }
+
+        .header-btn:hover:not(:disabled) {
+            background: var(--accent-strong);
+            border-color: var(--accent-strong);
+        }
+
+        .header-btn.secondary {
+            background: var(--card);
+            border-color: var(--line-strong);
+            color: var(--ink);
+        }
+
+        .header-btn.secondary:hover:not(:disabled) {
+            background: var(--bg);
+            border-color: var(--muted);
+        }
+
+        .header-btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        @media (max-width: 30rem) {
+            .header-btn {
+                display: none;
+            }
+        }
+
         .gh-link {
             display: inline-flex;
             align-items: center;
@@ -324,28 +364,59 @@
             gap: 18px;
         }
 
-        .upload-side {
-            flex: 1 1 240px;
-            min-width: 0;
-            max-width: 440px;
+        .reload-box {
+            flex: 0 1 360px;
+            min-height: 116px;
             display: flex;
             flex-direction: column;
-            align-items: stretch;
-            gap: 10px;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            text-align: center;
+            padding: 18px 22px;
+            border: 1.5px solid var(--line-strong);
+            border-radius: var(--radius);
+            background: var(--card);
+            color: var(--ink);
+            font: inherit;
+            cursor: pointer;
+            transition: border-color 0.15s ease, background 0.15s ease;
+        }
+
+        .reload-box:hover:not(:disabled) {
+            border-color: var(--accent);
+            background: var(--accent-soft);
+        }
+
+        .filedrop:focus-visible,
+        .reload-box:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        .reload-box:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+
+        .reload-box-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--accent);
         }
 
         .upload-note {
-            margin: 4px 0 0;
+            margin: 0;
             color: var(--muted);
-            font-size: 0.85rem;
-            line-height: 1.5;
+            font-size: 0.82rem;
+            line-height: 1.45;
         }
 
         .current-source {
             margin: 0;
             color: var(--muted);
-            font-size: 0.88rem;
-            line-height: 1.5;
+            font-size: 0.86rem;
+            line-height: 1.45;
             word-break: break-all;
         }
 
@@ -694,6 +765,8 @@
                 <a href="#section-inventory" id="nav-inventory">Deployments table</a>
             </nav>
             <div class="header-controls">
+                <button class="header-btn" id="header-upload" type="button">Upload</button>
+                <button class="header-btn secondary" id="header-reload" type="button" disabled>Reload</button>
                 <select id="lang-select" aria-label="Language">
                     <option value="en">English</option>
                     <option value="zh">中文</option>
@@ -720,17 +793,16 @@
                     <span class="help-bubble" id="upload-copy" role="tooltip"></span>
                 </span></h2>
                 <div class="upload-controls">
-                    <label class="filedrop" id="filedrop">
+                    <div class="filedrop" id="filedrop" role="button" tabindex="0" aria-label="Upload CSV">
                         <input type="file" id="csv-upload" accept=".csv,text/csv" class="sr-only" />
                         <span class="filedrop-text" id="filedrop-text">Upload CSV</span>
                         <span class="filedrop-hint" id="filedrop-hint">or drop a file here</span>
-                    </label>
-                    <div class="upload-side">
-                        <button id="open-local-csv" type="button">Open local CSV</button>
-                        <button id="reload-source" class="secondary" type="button" disabled>Reload current source</button>
-                        <p class="current-source hidden" id="current-source"><span id="current-source-label"></span> <span class="mono" id="current-source-name"></span></p>
-                        <p class="upload-note" id="upload-note"></p>
                     </div>
+                    <button class="reload-box" id="reload-source" type="button" disabled>
+                        <span class="reload-box-title" id="reload-title">Reload current source</span>
+                        <span class="current-source hidden" id="current-source"><span id="current-source-label"></span> <span class="mono" id="current-source-name"></span></span>
+                        <span class="upload-note" id="upload-note"></span>
+                    </button>
                 </div>
                 <div class="error" id="error"></div>
                 <div class="metrics" id="metrics">
@@ -861,8 +933,10 @@
         const currentSource = document.getElementById("current-source");
         const currentSourceLabel = document.getElementById("current-source-label");
         const currentSourceName = document.getElementById("current-source-name");
-        const openLocalCsvButton = document.getElementById("open-local-csv");
         const reloadSourceButton = document.getElementById("reload-source");
+        const reloadTitle = document.getElementById("reload-title");
+        const headerUpload = document.getElementById("header-upload");
+        const headerReload = document.getElementById("header-reload");
         const controlsTitle = document.getElementById("controls-title");
         const controlsCopy = document.getElementById("controls-copy");
         const bucketSelectLabel = document.getElementById("bucket-select-label");
@@ -929,9 +1003,10 @@
                     upload_label_fallback: "CSV file (fallback)",
                     filedrop_text: "Upload CSV",
                     filedrop_hint: "or drop a file here",
-                    upload_note: "Tip: edit the datetimes in your CSV and reload the source to update the charts.",
-                    open_local_csv: "Open local CSV",
+                    upload_note: "Edit the datetimes and reload to update the charts.",
                     reload_source: "Reload current source",
+                    header_upload: "Upload",
+                    header_reload: "Reload",
                     current_source_label: "Current source:",
                     controls_title: "Controls",
                     controls_copy: "",
@@ -959,8 +1034,8 @@
                     inventory_header_first_seen: "First seen",
                     inventory_header_last_seen: "Last seen",
                     inventory_header_media_types: "Media types",
-                    upload_copy_picker: "The CSV should include `deployment`, `path`, `media_type`, and `datetime`. It is usually generated during `serval xmp init`. `Open local CSV` is recommended because it supports one-click reload after local edits.",
-                    upload_copy_basic: "The CSV should include `deployment`, `path`, `media_type`, and `datetime`. It is usually generated during `serval xmp init`. This browser does not support direct local file handles, so use the standard upload flow."
+                    upload_copy_picker: "The CSV should include `deployment`, `path`, `media_type`, and `datetime` — usually generated during `serval xmp init`. On this browser, edits reload with one click.",
+                    upload_copy_basic: "The CSV should include `deployment`, `path`, `media_type`, and `datetime` — usually generated during `serval xmp init`. On this browser, Reload re-opens the file picker."
                 },
                 bucket: {
                     day: "day",
@@ -1021,9 +1096,10 @@
                     upload_label_fallback: "CSV 文件（备用）",
                     filedrop_text: "上传 CSV",
                     filedrop_hint: "或将文件拖入此处",
-                    upload_note: "提示：修改 CSV 中的时间后重新加载数据源，即可更新图表。",
-                    open_local_csv: "打开本地 CSV",
+                    upload_note: "修改时间后重新加载即可更新图表。",
                     reload_source: "重新加载当前数据源",
+                    header_upload: "上传",
+                    header_reload: "重新加载",
                     current_source_label: "当前数据源：",
                     controls_title: "控制面板",
                     controls_copy: "",
@@ -1051,8 +1127,8 @@
                     inventory_header_first_seen: "开始时间",
                     inventory_header_last_seen: "结束时间",
                     inventory_header_media_types: "媒体类型",
-                    upload_copy_picker: "CSV 一般包含 `deployment`、`path`、`media_type` 和 `datetime` 列，通常由 `serval xmp init` 时生成。推荐使用“打开本地 CSV”，这样在本地编辑文件后可以一键重新加载。",
-                    upload_copy_basic: "CSV 一般包含 `deployment`、`path`、`media_type` 和 `datetime` 列，通常由 `serval xmp init` 时生成。当前浏览器不支持直接持有本地文件句柄，请使用普通上传方式。"
+                    upload_copy_picker: "CSV 一般包含 `deployment`、`path`、`media_type` 和 `datetime` 列，通常由 `serval xmp init` 时生成。本浏览器支持编辑后一键重新加载。",
+                    upload_copy_basic: "CSV 一般包含 `deployment`、`path`、`media_type` 和 `datetime` 列，通常由 `serval xmp init` 时生成。本浏览器点击“重新加载”会再次打开文件选择框。"
                 },
                 bucket: {
                     day: "天",
@@ -1167,14 +1243,11 @@
 
         function updateSourceControls() {
             reloadSourceButton.disabled = !lastSource;
-            if (supportsFilePicker) {
-                openLocalCsvButton.classList.remove("secondary");
-                openLocalCsvButton.hidden = false;
-                uploadCopy.textContent = t("static", "upload_copy_picker");
-            } else {
-                openLocalCsvButton.hidden = true;
-                uploadCopy.textContent = t("static", "upload_copy_basic");
-            }
+            headerReload.disabled = !lastSource;
+            uploadCopy.textContent = t(
+                "static",
+                supportsFilePicker ? "upload_copy_picker" : "upload_copy_basic",
+            );
             if (lastSourceLabel) {
                 currentSourceLabel.textContent = t("static", "current_source_label");
                 currentSourceName.textContent = lastSourceLabel;
@@ -1242,8 +1315,9 @@
             filedropText.textContent = t("static", "filedrop_text");
             filedropHint.textContent = t("static", "filedrop_hint");
             uploadNote.textContent = t("static", "upload_note");
-            openLocalCsvButton.textContent = t("static", "open_local_csv");
-            reloadSourceButton.textContent = t("static", "reload_source");
+            reloadTitle.textContent = t("static", "reload_source");
+            headerUpload.textContent = t("static", "header_upload");
+            headerReload.textContent = t("static", "header_reload");
             controlsTitle.textContent = t("static", "controls_title");
             controlsCopy.textContent = t("static", "controls_copy");
             controlsCopy.hidden = !controlsCopy.textContent.trim();
@@ -2052,6 +2126,34 @@
             event.target.value = "";
         });
 
+        // Pick a CSV: uses the native file picker (with a reusable handle where
+        // supported) so an uploaded source can be reloaded from disk.
+        async function chooseCsv() {
+            try {
+                await openLocalCsvFromDisk();
+            } catch (error) {
+                if (error && error.name === "AbortError") {
+                    return;
+                }
+                reportLoadError(error);
+            }
+        }
+
+        async function reloadSource() {
+            try {
+                await reloadCurrentSource();
+            } catch (error) {
+                reportLoadError(error);
+            }
+        }
+
+        filedrop.addEventListener("click", chooseCsv);
+        filedrop.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                chooseCsv();
+            }
+        });
         for (const type of ["dragenter", "dragover"]) {
             filedrop.addEventListener(type, (event) => {
                 event.preventDefault();
@@ -2072,24 +2174,9 @@
         window.addEventListener("dragover", (event) => event.preventDefault());
         window.addEventListener("drop", (event) => event.preventDefault());
 
-        openLocalCsvButton.addEventListener("click", async () => {
-            try {
-                await openLocalCsvFromDisk();
-            } catch (error) {
-                if (error && error.name === "AbortError") {
-                    return;
-                }
-                reportLoadError(error);
-            }
-        });
-
-        reloadSourceButton.addEventListener("click", async () => {
-            try {
-                await reloadCurrentSource();
-            } catch (error) {
-                reportLoadError(error);
-            }
-        });
+        reloadSourceButton.addEventListener("click", reloadSource);
+        headerUpload.addEventListener("click", chooseCsv);
+        headerReload.addEventListener("click", reloadSource);
 
         exportInventoryButton.addEventListener("click", () => {
             if (!metadata?.deployment_options?.length) {
