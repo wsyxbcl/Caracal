@@ -317,14 +317,32 @@
             color: var(--ink);
         }
 
+        .upload-controls {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 14px;
+        }
+
+        .upload-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
         .filedrop {
-            display: inline-flex;
-            align-items: baseline;
-            gap: 9px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            text-align: center;
+            width: min(100%, 460px);
+            min-height: 104px;
             cursor: pointer;
-            padding: 10px 15px;
-            border: 1px solid var(--accent);
-            border-radius: var(--radius-sm);
+            padding: 22px 24px;
+            border: 1.5px dashed var(--accent);
+            border-radius: var(--radius);
             background: var(--accent-soft);
             color: var(--accent);
             text-transform: none;
@@ -339,14 +357,68 @@
         }
 
         .filedrop-text {
-            font-size: 0.95rem;
+            font-size: 1.1rem;
             font-weight: 600;
         }
 
         .filedrop-hint {
-            font-size: 0.82rem;
+            font-size: 0.86rem;
             font-weight: 400;
             color: var(--muted);
+        }
+
+        .help {
+            position: relative;
+            display: inline-flex;
+            vertical-align: middle;
+            margin-left: 9px;
+        }
+
+        .help-btn {
+            width: 21px;
+            height: 21px;
+            padding: 0;
+            border-radius: 50%;
+            border: 1px solid var(--line-strong);
+            background: var(--card);
+            color: var(--muted);
+            font-family: var(--font-sans);
+            font-size: 0.74rem;
+            font-weight: 700;
+            line-height: 1;
+            cursor: pointer;
+            transition: color 0.15s ease, border-color 0.15s ease;
+        }
+
+        .help-btn:hover {
+            color: var(--ink);
+            border-color: var(--muted);
+        }
+
+        .help-bubble {
+            position: absolute;
+            top: calc(100% + 8px);
+            left: 0;
+            z-index: 20;
+            display: none;
+            width: min(340px, 72vw);
+            padding: 11px 13px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius-sm);
+            background: var(--card);
+            box-shadow: 0 6px 20px rgba(31, 26, 20, 0.10);
+            color: var(--muted);
+            font-family: var(--font-sans);
+            font-size: 0.88rem;
+            font-weight: 400;
+            line-height: 1.5;
+            text-transform: none;
+            letter-spacing: normal;
+        }
+
+        .help:hover .help-bubble,
+        .help:focus-within .help-bubble {
+            display: block;
         }
 
         button {
@@ -620,19 +692,20 @@
         </section>
         <div class="stack">
             <section class="panel" id="section-upload">
-                <h2 id="upload-title">Upload CSV</h2>
-                <p id="upload-copy">The CSV must include `deployment` and `datetime` columns. On Chromium-based browsers, `Open local CSV` is the preferred workflow because it enables true one-click reloads from disk after you edit the file.</p>
-                <div class="toolbar">
-                    <div class="control" style="min-width: 320px;">
-                        <label class="field-label" id="csv-upload-label">CSV file</label>
-                        <label class="filedrop" id="filedrop">
-                            <input type="file" id="csv-upload" accept=".csv,text/csv" class="sr-only" />
-                            <span class="filedrop-text" id="filedrop-text">Upload CSV</span>
-                            <span class="filedrop-hint" id="filedrop-hint">or drop a file here</span>
-                        </label>
+                <h2><span id="upload-title">Upload CSV</span><span class="help">
+                    <button class="help-btn" type="button" aria-label="CSV format help">?</button>
+                    <span class="help-bubble" id="upload-copy" role="tooltip"></span>
+                </span></h2>
+                <div class="upload-controls">
+                    <label class="filedrop" id="filedrop">
+                        <input type="file" id="csv-upload" accept=".csv,text/csv" class="sr-only" />
+                        <span class="filedrop-text" id="filedrop-text">Upload CSV</span>
+                        <span class="filedrop-hint" id="filedrop-hint">or drop a file here</span>
+                    </label>
+                    <div class="upload-buttons">
+                        <button id="open-local-csv" type="button">Open local CSV</button>
+                        <button id="reload-source" class="secondary" type="button" disabled>Reload current source</button>
                     </div>
-                    <button id="open-local-csv" type="button">Open local CSV</button>
-                    <button id="reload-source" class="secondary" type="button" disabled>Reload current source</button>
                 </div>
                 <div class="status" id="status">Initialize WASM runtime, then upload a CSV to render the explorer.</div>
                 <div class="error" id="error"></div>
@@ -758,7 +831,6 @@
         const uploadTitle = document.getElementById("upload-title");
         const controlsPanel = document.getElementById("controls-panel");
         const uploadCopy = document.getElementById("upload-copy");
-        const csvUploadLabel = document.getElementById("csv-upload-label");
         const csvUploadInput = document.getElementById("csv-upload");
         const filedrop = document.getElementById("filedrop");
         const filedropText = document.getElementById("filedrop-text");
@@ -874,7 +946,7 @@
                     init_failed: "WASM initialization failed.",
                     parsing: "Parsing {sourceLabel} and building prepared tables...",
                     loaded: "Loaded {rows} rows from {sourceLabel}. Rendering charts...",
-                    rendered: "Rendered overview, detail, and hour heatmap from {sourceLabel}.",
+                    rendered: "Charts ready.",
                     reload_disk: "Reloading {label} from disk...",
                     reselect: "Re-select {label} to load the updated CSV. Plain file uploads cannot be re-read from disk automatically.",
                     upload_failed: "Upload failed.",
@@ -986,7 +1058,7 @@
                     init_failed: "WASM 初始化失败。",
                     parsing: "正在解析 {sourceLabel} 并构建预处理数据表...",
                     loaded: "已从 {sourceLabel} 读取 {rows} 行，正在渲染图表...",
-                    rendered: "已完成 {sourceLabel} 的概览图、明细图和小时热力图渲染。",
+                    rendered: "图表已就绪。",
                     reload_disk: "正在从磁盘重新加载 {label}...",
                     reselect: "请重新选择 {label} 以加载更新后的 CSV。普通上传方式无法自动重新读取磁盘上的文件。",
                     upload_failed: "上传失败。",
@@ -1126,11 +1198,9 @@
             if (supportsFilePicker) {
                 openLocalCsvButton.classList.remove("secondary");
                 openLocalCsvButton.hidden = false;
-                csvUploadLabel.textContent = t("static", "upload_label_fallback");
                 uploadCopy.textContent = t("static", "upload_copy_picker");
             } else {
                 openLocalCsvButton.hidden = true;
-                csvUploadLabel.textContent = t("static", "upload_label");
                 uploadCopy.textContent = t("static", "upload_copy_basic");
             }
         }
