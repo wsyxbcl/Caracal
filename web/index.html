@@ -146,9 +146,17 @@
             border-bottom: 1px solid var(--line);
         }
 
+        .intro-title {
+            font-family: var(--font-display);
+            font-size: clamp(1.7rem, 2.6vw, 2.4rem);
+            line-height: 1.08;
+            letter-spacing: -0.01em;
+            margin: 4px 0 12px;
+        }
+
         .intro-lede {
             max-width: 70ch;
-            margin: 0 0 12px;
+            margin: 0 0 14px;
             color: var(--muted);
             line-height: 1.55;
         }
@@ -538,11 +546,12 @@
 <body>
     <header class="site-header">
         <div class="header-inner">
-            <a class="brand" href="#top" aria-label="Deployment Timeline">
+            <a class="brand" href="#top" aria-label="Caracal">
                 <svg class="brand-mark" width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="11" width="3.4" height="7" rx="1.2"/><rect x="8.3" y="6" width="3.4" height="12" rx="1.2"/><rect x="14.6" y="8.5" width="3.4" height="9.5" rx="1.2"/></svg>
-                <span class="brand-word">Deployment Timeline</span>
+                <span class="brand-word">Caracal</span>
             </a>
             <nav class="site-nav" aria-label="Sections">
+                <a href="#section-upload" id="nav-upload">Upload</a>
                 <a href="#controls-panel" id="nav-controls">Controls</a>
                 <a href="#section-overview" id="nav-overview">Overview</a>
                 <a href="#section-detail" id="nav-detail">Detail</a>
@@ -560,8 +569,8 @@
         </div>
     </header>
     <main id="top">
-        <h1 class="sr-only" id="hero-title">Deployment Timestamp Visualizer</h1>
         <section class="intro">
+            <h1 class="intro-title" id="hero-title">Camtrap datetime visualizer</h1>
             <p class="intro-lede" id="intro-lede"></p>
             <div class="intro-tags">
                 <span class="tag tag-accent" id="intro-offline"></span>
@@ -569,7 +578,7 @@
             </div>
         </section>
         <div class="stack">
-            <section class="panel">
+            <section class="panel" id="section-upload">
                 <h2 id="upload-title">Upload CSV</h2>
                 <p id="upload-copy">The CSV must include `deployment` and `datetime` columns. On Chromium-based browsers, `Open local CSV` is the preferred workflow because it enables true one-click reloads from disk after you edit the file.</p>
                 <div class="toolbar">
@@ -692,6 +701,7 @@
         const introOffline = document.getElementById("intro-offline");
         const introTech = document.getElementById("intro-tech");
         const navLinks = {
+            upload: document.getElementById("nav-upload"),
             controls: document.getElementById("nav-controls"),
             overview: document.getElementById("nav-overview"),
             detail: document.getElementById("nav-detail"),
@@ -749,14 +759,15 @@
         const I18N = {
             en: {
                 static: {
-                    page_title: "Deployment Timestamp Visualizer",
+                    page_title: "Caracal · Camtrap datetime visualizer",
                     eyebrow: "Charton + Polars + WASM",
                     lang_label: "Language",
-                    hero_title: "Deployment Timestamp Visualizer",
+                    hero_title: "Camtrap datetime visualizer",
                     hero_copy: "",
                     intro_lede: "Explore media-timestamp distributions by deployment: activity over time, time-of-day patterns, and a downloadable trap_info template. Parsing, aggregation, and rendering all run in your browser.",
                     intro_offline: "100% offline — your CSV never leaves your device",
                     intro_tech: "Rust · WASM · Charton · Polars",
+                    nav_upload: "Upload",
                     nav_controls: "Controls",
                     nav_overview: "Overview",
                     nav_detail: "Detail",
@@ -858,14 +869,15 @@
             },
             zh: {
                 static: {
-                    page_title: "Deployment Timestamp Visualizer",
+                    page_title: "Caracal · 红外相机时间可视化",
                     eyebrow: "Charton + Polars + WASM",
                     lang_label: "语言",
-                    hero_title: "Deployment Timestamp Visualizer",
+                    hero_title: "红外相机时间可视化",
                     hero_copy: "",
                     intro_lede: "按位点浏览相机媒体的时间分布：随时间的活跃度、时段规律，并可导出 trap_info 模板。解析、聚合与渲染全部在浏览器本地完成。",
                     intro_offline: "100% 离线 · 数据不出浏览器",
                     intro_tech: "Rust · WASM · Charton · Polars",
+                    nav_upload: "上传",
                     nav_controls: "控制",
                     nav_overview: "总览",
                     nav_detail: "明细",
@@ -1117,6 +1129,7 @@
             introLede.textContent = t("static", "intro_lede");
             introOffline.textContent = t("static", "intro_offline");
             introTech.textContent = t("static", "intro_tech");
+            navLinks.upload.textContent = t("static", "nav_upload");
             navLinks.controls.textContent = t("static", "nav_controls");
             navLinks.overview.textContent = t("static", "nav_overview");
             navLinks.detail.textContent = t("static", "nav_detail");
