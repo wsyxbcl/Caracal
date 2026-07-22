@@ -326,8 +326,20 @@
 
         .upload-buttons {
             display: flex;
-            flex-wrap: wrap;
             gap: 10px;
+            width: min(100%, 460px);
+        }
+
+        .upload-buttons button {
+            flex: 1 1 0;
+        }
+
+        .upload-note {
+            margin: 0;
+            max-width: 460px;
+            color: var(--muted);
+            font-size: 0.85rem;
+            line-height: 1.5;
         }
 
         .filedrop {
@@ -706,6 +718,7 @@
                         <button id="open-local-csv" type="button">Open local CSV</button>
                         <button id="reload-source" class="secondary" type="button" disabled>Reload current source</button>
                     </div>
+                    <p class="upload-note" id="upload-note"></p>
                 </div>
                 <div class="status" id="status">Initialize WASM runtime, then upload a CSV to render the explorer.</div>
                 <div class="error" id="error"></div>
@@ -835,6 +848,7 @@
         const filedrop = document.getElementById("filedrop");
         const filedropText = document.getElementById("filedrop-text");
         const filedropHint = document.getElementById("filedrop-hint");
+        const uploadNote = document.getElementById("upload-note");
         const openLocalCsvButton = document.getElementById("open-local-csv");
         const reloadSourceButton = document.getElementById("reload-source");
         const controlsTitle = document.getElementById("controls-title");
@@ -903,6 +917,7 @@
                     upload_label_fallback: "CSV file (fallback)",
                     filedrop_text: "Upload CSV",
                     filedrop_hint: "or drop a file here",
+                    upload_note: "Tip: edit the datetimes in your CSV and reload the source to update the charts.",
                     open_local_csv: "Open local CSV",
                     reload_source: "Reload current source",
                     controls_title: "Controls",
@@ -1015,6 +1030,7 @@
                     upload_label_fallback: "CSV 文件（备用）",
                     filedrop_text: "上传 CSV",
                     filedrop_hint: "或将文件拖入此处",
+                    upload_note: "提示：修改 CSV 中的时间后重新加载数据源，即可更新图表。",
                     open_local_csv: "打开本地 CSV",
                     reload_source: "重新加载当前数据源",
                     controls_title: "控制面板",
@@ -1262,6 +1278,7 @@
             uploadTitle.textContent = t("static", "upload_title");
             filedropText.textContent = t("static", "filedrop_text");
             filedropHint.textContent = t("static", "filedrop_hint");
+            uploadNote.textContent = t("static", "upload_note");
             openLocalCsvButton.textContent = t("static", "open_local_csv");
             reloadSourceButton.textContent = t("static", "reload_source");
             controlsTitle.textContent = t("static", "controls_title");
