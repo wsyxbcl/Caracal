@@ -305,7 +305,6 @@
         }
 
         select,
-        input[type="file"],
         button {
             font: inherit;
         }
@@ -318,26 +317,36 @@
             color: var(--ink);
         }
 
-        input[type="file"] {
-            border: 0;
-            background: transparent;
-            padding: 0;
-            color: var(--muted);
-            font-size: 0.92rem;
-            max-width: 100%;
-        }
-
-        input[type="file"]::file-selector-button {
-            font: inherit;
-            font-weight: 600;
+        .filedrop {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 9px;
             cursor: pointer;
-            color: #ffffff;
-            background: var(--accent);
+            padding: 10px 15px;
             border: 1px solid var(--accent);
             border-radius: var(--radius-sm);
-            padding: 9px 15px;
-            margin-right: 12px;
+            background: var(--accent-soft);
+            color: var(--accent);
+            text-transform: none;
+            letter-spacing: normal;
             transition: background 0.15s ease, border-color 0.15s ease;
+        }
+
+        .filedrop:hover,
+        .filedrop.dragover {
+            background: rgba(176, 84, 43, 0.16);
+            border-color: var(--accent-strong);
+        }
+
+        .filedrop-text {
+            font-size: 0.95rem;
+            font-weight: 600;
+        }
+
+        .filedrop-hint {
+            font-size: 0.82rem;
+            font-weight: 400;
+            color: var(--muted);
         }
 
         button {
@@ -362,8 +371,7 @@
             cursor: not-allowed;
         }
 
-        button:hover:not(:disabled),
-        input[type="file"]::file-selector-button:hover {
+        button:hover:not(:disabled) {
             background: var(--accent-strong);
             border-color: var(--accent-strong);
         }
@@ -616,8 +624,12 @@
                 <p id="upload-copy">The CSV must include `deployment` and `datetime` columns. On Chromium-based browsers, `Open local CSV` is the preferred workflow because it enables true one-click reloads from disk after you edit the file.</p>
                 <div class="toolbar">
                     <div class="control" style="min-width: 320px;">
-                        <label for="csv-upload" id="csv-upload-label">CSV file</label>
-                        <input type="file" id="csv-upload" accept=".csv,text/csv" />
+                        <label class="field-label" id="csv-upload-label">CSV file</label>
+                        <label class="filedrop" id="filedrop">
+                            <input type="file" id="csv-upload" accept=".csv,text/csv" class="sr-only" />
+                            <span class="filedrop-text" id="filedrop-text">Upload CSV</span>
+                            <span class="filedrop-hint" id="filedrop-hint">or drop a file here</span>
+                        </label>
                     </div>
                     <button id="open-local-csv" type="button">Open local CSV</button>
                     <button id="reload-source" class="secondary" type="button" disabled>Reload current source</button>
@@ -748,6 +760,9 @@
         const uploadCopy = document.getElementById("upload-copy");
         const csvUploadLabel = document.getElementById("csv-upload-label");
         const csvUploadInput = document.getElementById("csv-upload");
+        const filedrop = document.getElementById("filedrop");
+        const filedropText = document.getElementById("filedrop-text");
+        const filedropHint = document.getElementById("filedrop-hint");
         const openLocalCsvButton = document.getElementById("open-local-csv");
         const reloadSourceButton = document.getElementById("reload-source");
         const controlsTitle = document.getElementById("controls-title");
@@ -814,6 +829,8 @@
                     upload_title: "Upload CSV",
                     upload_label: "CSV file",
                     upload_label_fallback: "CSV file (fallback)",
+                    filedrop_text: "Upload CSV",
+                    filedrop_hint: "or drop a file here",
                     open_local_csv: "Open local CSV",
                     reload_source: "Reload current source",
                     controls_title: "Controls",
@@ -924,6 +941,8 @@
                     upload_title: "上传 CSV",
                     upload_label: "CSV 文件",
                     upload_label_fallback: "CSV 文件（备用）",
+                    filedrop_text: "上传 CSV",
+                    filedrop_hint: "或将文件拖入此处",
                     open_local_csv: "打开本地 CSV",
                     reload_source: "重新加载当前数据源",
                     controls_title: "控制面板",
@@ -1171,6 +1190,8 @@
             metricLabelDeployments.textContent = t("static", "metric_deployments");
             metricLabelRange.textContent = t("static", "metric_range");
             uploadTitle.textContent = t("static", "upload_title");
+            filedropText.textContent = t("static", "filedrop_text");
+            filedropHint.textContent = t("static", "filedrop_hint");
             openLocalCsvButton.textContent = t("static", "open_local_csv");
             reloadSourceButton.textContent = t("static", "reload_source");
             controlsTitle.textContent = t("static", "controls_title");
@@ -1973,12 +1994,10 @@
             csvUploadInput.click();
         }
 
-        csvUploadInput.addEventListener("change", async (event) => {
-            const file = event.target.files?.[0];
+        async function loadFromFile(file) {
             if (!file) {
                 return;
             }
-
             try {
                 const csvText = await file.text();
                 await loadExplorer(csvText, file.name, {
@@ -1988,10 +2007,33 @@
             } catch (error) {
                 reportLoadError(error);
                 setStatusKey("upload_failed");
-            } finally {
-                event.target.value = "";
             }
+        }
+
+        csvUploadInput.addEventListener("change", async (event) => {
+            await loadFromFile(event.target.files?.[0]);
+            event.target.value = "";
         });
+
+        for (const type of ["dragenter", "dragover"]) {
+            filedrop.addEventListener(type, (event) => {
+                event.preventDefault();
+                filedrop.classList.add("dragover");
+            });
+        }
+        for (const type of ["dragleave", "dragend"]) {
+            filedrop.addEventListener(type, () => filedrop.classList.remove("dragover"));
+        }
+        filedrop.addEventListener("drop", async (event) => {
+            event.preventDefault();
+            filedrop.classList.remove("dragover");
+            await loadFromFile(event.dataTransfer?.files?.[0]);
+        });
+
+        // A file dropped outside the zone would otherwise navigate the browser
+        // away from the app; swallow those drops.
+        window.addEventListener("dragover", (event) => event.preventDefault());
+        window.addEventListener("drop", (event) => event.preventDefault());
 
         openLocalCsvButton.addEventListener("click", async () => {
             try {
