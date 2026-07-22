@@ -507,6 +507,10 @@
                 <h2 id="controls-title">Controls</h2>
                 <p id="controls-copy">These controls rerun the Rust aggregation and Charton rendering inside the WASM module, then swap in fresh SVG output.</p>
                 <div class="toolbar">
+                    <div class="control hidden" id="path-level-control" style="min-width: 260px;">
+                        <label for="path-level-select" id="path-level-label">Deployment path level</label>
+                        <select id="path-level-select"></select>
+                    </div>
                     <div class="control">
                         <label for="bucket-select" id="bucket-select-label">Overview bucket</label>
                         <select id="bucket-select">
@@ -520,6 +524,7 @@
                         <select id="deployment-select"></select>
                     </div>
                 </div>
+                <p class="footnote hidden" id="path-level-hint"></p>
             </section>
 
             <section class="panel">
@@ -609,6 +614,10 @@
         const bucketSelect = document.getElementById("bucket-select");
         const deploymentSelectLabel = document.getElementById("deployment-select-label");
         const deploymentSelect = document.getElementById("deployment-select");
+        const pathLevelControl = document.getElementById("path-level-control");
+        const pathLevelLabel = document.getElementById("path-level-label");
+        const pathLevelSelect = document.getElementById("path-level-select");
+        const pathLevelHint = document.getElementById("path-level-hint");
         const overviewTitle = document.getElementById("overview-title");
         const overviewCopy = document.getElementById("overview-copy");
         const overviewFrame = document.getElementById("overview-frame");
@@ -634,6 +643,10 @@
         const MAX_ZOOM = 8;
         let svgNamespaceCounter = 0;
         let lastSource = null;
+        let lastCsvText = null;
+        let lastSourceLabel = "";
+        // -1 means "auto-detect the deployment path level"; >=1 forces a level.
+        let lastPathIndex = -1;
         const I18N = {
             en: {
                 static: {
@@ -656,6 +669,9 @@
                     controls_copy: "",
                     bucket_label: "Overview bucket",
                     deployment_label: "Detail deployment",
+                    path_level_label: "Deployment path level",
+                    path_level_detected: "(auto-detected)",
+                    path_level_hint: "No deployment column found. Deployments were derived from the path (e.g. {sample}). Pick the level that names the deployment.",
                     overview_title: "Overview heatmap",
                     overview_copy: "Compare deployments over time. Click a row to focus that deployment in the detail chart.",
                     overview_placeholder: "Upload a CSV to render the Overview heatmap.",
@@ -753,6 +769,9 @@
                     controls_copy: "",
                     bucket_label: "总览图时间尺度",
                     deployment_label: "明细图位点",
+                    path_level_label: "位点路径层级",
+                    path_level_detected: "（自动识别）",
+                    path_level_hint: "未找到 deployment 列，已从路径推断位点（例如 {sample}）。请选择代表位点的层级。",
                     overview_title: "位点时间总览",
                     overview_copy: "用于比较不同位点在时间上的分布。点击某一行可聚焦到下方明细图。",
                     overview_placeholder: "上传 CSV 后显示位点时间总览。",
@@ -983,6 +1002,7 @@
             controlsCopy.hidden = !controlsCopy.textContent.trim();
             bucketSelectLabel.textContent = t("static", "bucket_label");
             deploymentSelectLabel.textContent = t("static", "deployment_label");
+            pathLevelLabel.textContent = t("static", "path_level_label");
             overviewTitle.textContent = t("static", "overview_title");
             overviewCopy.textContent = t("static", "overview_copy");
             if (overviewPlaceholder) {
@@ -1022,6 +1042,7 @@
             updateDetailText();
             if (metadata) {
                 renderInventory();
+                populatePathLevelControl();
             }
         }
 
@@ -1098,7 +1119,39 @@
 
             bucketSelect.value = metadata.default_bucket;
             deploymentSelect.value = metadata.default_deployment;
+            populatePathLevelControl();
             controlsPanel.classList.remove("hidden");
+        }
+
+        function populatePathLevelControl() {
+            if (!metadata?.deployment_from_path) {
+                pathLevelControl.classList.add("hidden");
+                pathLevelHint.classList.add("hidden");
+                pathLevelSelect.innerHTML = "";
+                return;
+            }
+
+            pathLevelSelect.innerHTML = "";
+            for (const level of metadata.path_levels || []) {
+                const node = document.createElement("option");
+                node.value = String(level.index);
+                const suffix =
+                    level.index === metadata.detected_path_index
+                        ? ` ${t("static", "path_level_detected")}`
+                        : "";
+                node.textContent = `${level.index}: ${level.name}${suffix}`;
+                pathLevelSelect.appendChild(node);
+            }
+            if (metadata.deploy_path_index != null) {
+                pathLevelSelect.value = String(metadata.deploy_path_index);
+            }
+            pathLevelControl.classList.remove("hidden");
+
+            const sample = (metadata.path_levels || [])
+                .map((level) => level.name)
+                .join("/");
+            pathLevelHint.textContent = t("static", "path_level_hint", { sample });
+            pathLevelHint.classList.remove("hidden");
         }
 
         function svgBaseWidth(svg) {
@@ -1654,7 +1707,7 @@
             renderInventory();
         }
 
-        async function loadExplorer(csvText, sourceLabel, source = null) {
+        async function loadExplorer(csvText, sourceLabel, source = null, pathIndex = -1) {
             if (!wasmReady) {
                 throw new Error(t("error", "wasm_not_ready"));
             }
@@ -1662,11 +1715,14 @@
             clearError();
             setStatusKey("parsing", { sourceLabel });
 
-            const nextExplorer = new WasmExplorer(csvText);
+            const nextExplorer = new WasmExplorer(csvText, pathIndex);
             const nextMetadata = JSON.parse(nextExplorer.metadata_json());
 
             explorer = nextExplorer;
             metadata = nextMetadata;
+            lastCsvText = csvText;
+            lastSourceLabel = sourceLabel;
+            lastPathIndex = pathIndex;
             if (source) {
                 lastSource = source;
                 updateSourceControls();
@@ -1733,7 +1789,7 @@
                     kind: "file-handle",
                     label: file.name,
                     handle: lastSource.handle,
-                });
+                }, lastPathIndex);
                 return;
             }
 
@@ -1817,6 +1873,20 @@
                 setStatusKey("detail_updated");
             } catch (error) {
                 showError(error && error.message ? error.message : String(error));
+            }
+        });
+
+        pathLevelSelect.addEventListener("change", async () => {
+            if (!lastCsvText) {
+                return;
+            }
+            const index = Number(pathLevelSelect.value);
+            try {
+                // Re-parse the same CSV, deriving deployments from the chosen level.
+                await loadExplorer(lastCsvText, lastSourceLabel, null, index);
+            } catch (error) {
+                showError(error && error.message ? error.message : String(error));
+                setStatusKey("upload_failed");
             }
         });
 

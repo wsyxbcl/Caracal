@@ -93,6 +93,46 @@ pub struct PreparedData {
     pub detail_tables: BTreeMap<String, DataFrame>,
     pub overview_tables: BTreeMap<OverviewBucket, DataFrame>,
     pub hour_heatmap: DataFrame,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub deployment_source: DeploymentSource,
+}
+
+/// How the deployment for each row was determined. When the CSV has no
+/// `deployment` column (e.g. a Serval `tags.csv`), the deployment is derived
+/// from a directory level of the `path` column; this records which level was
+/// used so the UI can let the user pick a different one.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub struct DeploymentSource {
+    /// True when the deployment was derived from `path` rather than a column.
+    pub from_path: bool,
+    /// The path split index actually used (1-based, only when `from_path`).
+    pub path_index: Option<i32>,
+    /// The auto-detected guess, if any (only when `from_path`).
+    pub detected_path_index: Option<i32>,
+    /// Selectable directory levels of a sample path, in split-index order
+    /// starting at index 1 (only when `from_path`).
+    pub path_levels: Vec<String>,
+}
+
+impl DeploymentSource {
+    fn from_column() -> Self {
+        Self {
+            from_path: false,
+            path_index: None,
+            detected_path_index: None,
+            path_levels: Vec::new(),
+        }
+    }
+
+    fn from_path(chosen: i32, detected: Option<i32>, path_levels: Vec<String>) -> Self {
+        Self {
+            from_path: true,
+            path_index: Some(chosen),
+            detected_path_index: detected,
+            path_levels,
+        }
+    }
 }
 
 impl PreparedData {
@@ -100,18 +140,25 @@ impl PreparedData {
     pub fn load(csv_path: &Path) -> Result<Self> {
         let file = File::open(csv_path)
             .with_context(|| format!("failed to open CSV at {}", csv_path.display()))?;
-        Self::from_reader(file, csv_path.to_path_buf())
+        Self::from_reader(file, csv_path.to_path_buf(), None)
     }
 
+    /// Parse CSV text. `deploy_path_index` overrides the deployment path level
+    /// when the CSV has no `deployment` column; pass `None` to auto-detect.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub fn from_csv_text(csv_content: &str) -> Result<Self> {
+    pub fn from_csv_text(csv_content: &str, deploy_path_index: Option<i32>) -> Result<Self> {
         Self::from_reader(
             Cursor::new(csv_content.as_bytes()),
             PathBuf::from("uploaded.csv"),
+            deploy_path_index,
         )
     }
 
-    fn from_reader<R>(mut reader: R, csv_path: PathBuf) -> Result<Self>
+    fn from_reader<R>(
+        mut reader: R,
+        csv_path: PathBuf,
+        deploy_path_index: Option<i32>,
+    ) -> Result<Self>
     where
         R: Read + Seek + Send + Sync + MmapBytesReader,
     {
@@ -126,10 +173,14 @@ impl PreparedData {
         let frame = normalize_frame_headers(frame, &headers)?;
 
         let indices = ColumnIndices::from_dataframe(&frame)?;
+        let (row_deployments, deployment_source) =
+            resolve_deployments(&frame, &indices, deploy_path_index)?;
         let mut rows = Vec::with_capacity(frame.height());
 
-        for row_index in 0..frame.height() {
-            rows.push(EventRow::from_dataframe_row(&frame, &indices, row_index)?);
+        for (row_index, deployment) in row_deployments.into_iter().enumerate() {
+            rows.push(EventRow::from_dataframe_row(
+                &frame, &indices, deployment, row_index,
+            )?);
         }
 
         if rows.is_empty() {
@@ -189,6 +240,7 @@ impl PreparedData {
             detail_tables,
             overview_tables,
             hour_heatmap,
+            deployment_source,
         })
     }
 
@@ -230,17 +282,11 @@ impl EventRow {
     fn from_dataframe_row(
         frame: &DataFrame,
         indices: &ColumnIndices,
+        deployment: String,
         row_index: usize,
     ) -> Result<Self> {
         let row_number = row_index + 2;
 
-        let deployment = required_trimmed_string(
-            frame,
-            indices.deployment,
-            row_index,
-            "deployment",
-            row_number,
-        )?;
         let timestamp = parse_effective_timestamp(frame, indices, row_index, row_number)?;
         let path = optional_trimmed_string(frame, indices.path, row_index)?.unwrap_or_default();
         let media_type = indices
@@ -319,7 +365,7 @@ fn summarize_rows(rows: &[EventRow]) -> Vec<DeploymentSummary> {
 #[derive(Clone, Copy, Debug)]
 struct ColumnIndices {
     path: usize,
-    deployment: usize,
+    deployment: Option<usize>,
     datetime: usize,
     xmp_update_datetime: Option<usize>,
     media_type: Option<usize>,
@@ -332,9 +378,7 @@ impl ColumnIndices {
         let path = frame
             .get_column_index("path")
             .context("missing required column 'path'")?;
-        let deployment = frame
-            .get_column_index("deployment")
-            .context("missing required column 'deployment'")?;
+        let deployment = frame.get_column_index("deployment");
         let datetime = frame
             .get_column_index("datetime")
             .context("missing required column 'datetime'")?;
@@ -353,6 +397,156 @@ impl ColumnIndices {
             longitude,
         })
     }
+}
+
+/// Determine each row's deployment. When the CSV has a `deployment` column it
+/// is used directly; otherwise the deployment is derived from a directory level
+/// of the `path` column (Serval `tags.csv` style). `override_index` forces a
+/// specific 1-based path level; `None` auto-detects with a sensible fallback.
+fn resolve_deployments(
+    frame: &DataFrame,
+    indices: &ColumnIndices,
+    override_index: Option<i32>,
+) -> Result<(Vec<String>, DeploymentSource)> {
+    if let Some(deployment_index) = indices.deployment {
+        let mut deployments = Vec::with_capacity(frame.height());
+        for row_index in 0..frame.height() {
+            let row_number = row_index + 2;
+            deployments.push(required_trimmed_string(
+                frame,
+                deployment_index,
+                row_index,
+                "deployment",
+                row_number,
+            )?);
+        }
+        return Ok((deployments, DeploymentSource::from_column()));
+    }
+
+    let paths = column_string_values(frame, indices.path)?;
+    let sample = paths
+        .iter()
+        .find(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("cannot derive deployment: no 'deployment' column and the 'path' column is empty")
+        })?;
+    let path_levels = get_path_levels(sample.clone());
+    if path_levels.is_empty() {
+        bail!(
+            "cannot derive deployment from path '{sample}': expected at least one directory level before the file name"
+        );
+    }
+
+    let max = path_levels.len() as i32;
+    let detected = detect_deployment_path_index(paths.iter().filter(|value| !value.trim().is_empty()));
+    // Prefer the caller's choice, then the auto guess, then the directory just
+    // above the file name as a last resort.
+    let chosen = override_index
+        .filter(|index| (1..=max).contains(index))
+        .or_else(|| detected.filter(|index| (1..=max).contains(index)))
+        .unwrap_or(max);
+
+    let mut deployments = Vec::with_capacity(paths.len());
+    for (row_index, path) in paths.iter().enumerate() {
+        let row_number = row_index + 2;
+        if path.trim().is_empty() {
+            bail!("missing path at row {row_number}, cannot derive deployment");
+        }
+        deployments.push(
+            deployment_from_path(path, chosen)
+                .with_context(|| format!("at row {row_number}"))?,
+        );
+    }
+
+    Ok((
+        deployments,
+        DeploymentSource::from_path(chosen, detected, path_levels),
+    ))
+}
+
+fn column_string_values(frame: &DataFrame, column_index: usize) -> Result<Vec<String>> {
+    (0..frame.height())
+        .map(|row_index| {
+            Ok(optional_trimmed_string(frame, column_index, row_index)?.unwrap_or_default())
+        })
+        .collect()
+}
+
+fn normalize_path_separators(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// The directory levels of a path that can serve as the deployment, in
+/// split-index order starting at 1. The root/prefix (index 0) and the file name
+/// (last component) are excluded, mirroring `deployment_from_path`.
+fn get_path_levels(path: String) -> Vec<String> {
+    let normalized_path = normalize_path_separators(&path);
+    let levels: Vec<String> = normalized_path.split('/').map(|comp| comp.to_string()).collect();
+    if levels.len() < 2 {
+        return Vec::new();
+    }
+    levels[1..levels.len() - 1].to_vec()
+}
+
+/// Guess which path level is the deployment, top-down: skip the levels shared by
+/// all paths (the common prefix), then assume the first diverging level is the
+/// collection or the deployment, and that deployments outnumber collections.
+/// Returns the 1-based split index, or `None` when it cannot be inferred.
+fn detect_deployment_path_index<I, S>(paths: I) -> Option<i32>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut level_names: Vec<std::collections::HashSet<String>> = Vec::new();
+    let mut depth = None;
+    for path in paths {
+        let normalized = normalize_path_separators(path.as_ref());
+        let components: Vec<&str> = normalized.split('/').collect();
+        // Same exclusions as get_path_levels: root/prefix and file name.
+        if components.len() < 3 {
+            return None;
+        }
+        match depth {
+            None => {
+                depth = Some(components.len());
+                level_names = vec![std::collections::HashSet::new(); components.len() - 2];
+            }
+            // Mixed depths make a single global index ill-defined; let the user decide.
+            Some(depth) if depth != components.len() => return None,
+            Some(_) => {}
+        }
+        for (level, name) in components[1..components.len() - 1].iter().enumerate() {
+            if !level_names[level].contains(*name) {
+                level_names[level].insert((*name).to_string());
+            }
+        }
+    }
+    // All levels shared by every path (e.g. a single deployment): nothing to infer.
+    let diverge_level = level_names.iter().position(|names| names.len() > 1)?;
+    let deploy_level = if diverge_level + 1 < level_names.len()
+        && level_names[diverge_level + 1].len() > level_names[diverge_level].len()
+    {
+        diverge_level + 1
+    } else {
+        diverge_level
+    };
+    // +1 converts back to the split index (level_names[0] is split component 1).
+    (deploy_level + 1).try_into().ok()
+}
+
+fn deployment_from_path(path: &str, deploy_path_index: i32) -> Result<String> {
+    let index: usize = deploy_path_index
+        .try_into()
+        .with_context(|| format!("invalid deployment path level {deploy_path_index}"))?;
+    normalize_path_separators(path)
+        .split('/')
+        .nth(index)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!("cannot extract deployment from path '{path}' at level {deploy_path_index}")
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -995,7 +1189,7 @@ mod tests {
             b.jpg,zeros,2025-03-01 06:00:00,0,0\n\
             c.jpg,partial,2025-03-01 06:00:00,31.2,0\n\
             d.jpg,empty,2025-03-01 06:00:00,,\n";
-        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        let data = PreparedData::from_csv_text(csv, None).expect("parse csv");
         assert!(summary(&data, "withgps").has_gps);
         assert!(!summary(&data, "zeros").has_gps);
         assert!(!summary(&data, "partial").has_gps);
@@ -1007,7 +1201,7 @@ mod tests {
         let csv = "path,deployment,datetime,latitude,longitude\n\
             a.jpg,mix,2025-03-01 06:00:00,,\n\
             b.jpg,mix,2025-03-02 06:00:00,31.2,121.4\n";
-        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        let data = PreparedData::from_csv_text(csv, None).expect("parse csv");
         assert!(summary(&data, "mix").has_gps);
     }
 
@@ -1015,7 +1209,7 @@ mod tests {
     fn no_gps_columns_means_no_gps() {
         let csv = "path,deployment,datetime\n\
             a.jpg,nogps,2025-03-01 06:00:00\n";
-        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        let data = PreparedData::from_csv_text(csv, None).expect("parse csv");
         assert!(!summary(&data, "nogps").has_gps);
     }
 
@@ -1025,7 +1219,84 @@ mod tests {
         // single coordinate never counts as GPS.
         let csv = "path,deployment,datetime,latitude\n\
             a.jpg,latonly,2025-03-01 06:00:00,31.2\n";
-        let data = PreparedData::from_csv_text(csv).expect("parse csv");
+        let data = PreparedData::from_csv_text(csv, None).expect("parse csv");
         assert!(!summary(&data, "latonly").has_gps);
+    }
+
+    #[test]
+    fn get_path_levels_excludes_root_and_file() {
+        assert_eq!(
+            get_path_levels("project/col_a/dep1/IMG_0001.jpg".to_string()),
+            vec!["col_a".to_string(), "dep1".to_string()]
+        );
+        assert_eq!(
+            get_path_levels(r"project\col_a\dep1\IMG.jpg".to_string()),
+            vec!["col_a".to_string(), "dep1".to_string()]
+        );
+        assert!(get_path_levels("IMG_0001.jpg".to_string()).is_empty());
+    }
+
+    #[test]
+    fn detect_and_extract_match_serval_semantics() {
+        // Collection diverges first; deployments outnumber collections -> level 2.
+        let paths = [
+            "project/col_a/dep1/IMG_0001.jpg",
+            "project/col_a/dep2/IMG_0001.jpg",
+            "project/col_b/dep3/IMG_0002.jpg",
+        ];
+        assert_eq!(detect_deployment_path_index(paths), Some(2));
+        assert_eq!(
+            deployment_from_path("project/col_a/dep1/IMG_0001.jpg", 2).unwrap(),
+            "dep1"
+        );
+        // Single deployment: nothing to infer.
+        assert_eq!(
+            detect_deployment_path_index(["p/c/dep1/a.jpg", "p/c/dep1/b.jpg"]),
+            None
+        );
+        // Mixed depth: ill-defined.
+        assert_eq!(
+            detect_deployment_path_index(["p/c/dep1/a.jpg", "p/c/dep2/100MEDIA/b.jpg"]),
+            None
+        );
+    }
+
+    #[test]
+    fn derives_deployment_from_path_when_column_absent() {
+        // No deployment column; two deployments under one collection -> level 2.
+        let csv = "path,datetime\n\
+            project/col_a/dep1/IMG_0001.jpg,2025-03-01 06:00:00\n\
+            project/col_a/dep1/IMG_0002.jpg,2025-03-02 06:00:00\n\
+            project/col_a/dep2/IMG_0003.jpg,2025-03-03 06:00:00\n";
+        let data = PreparedData::from_csv_text(csv, None).expect("parse csv");
+        assert!(data.deployment_source.from_path);
+        assert_eq!(data.deployment_source.detected_path_index, Some(2));
+        assert_eq!(data.deployment_source.path_index, Some(2));
+        let mut names: Vec<_> = data.deployments.iter().map(|d| d.deployment.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["dep1".to_string(), "dep2".to_string()]);
+    }
+
+    #[test]
+    fn path_index_override_selects_a_different_level() {
+        let csv = "path,datetime\n\
+            project/col_a/dep1/IMG_0001.jpg,2025-03-01 06:00:00\n\
+            project/col_a/dep2/IMG_0002.jpg,2025-03-02 06:00:00\n";
+        // Level 1 is the collection instead of the deployment.
+        let data = PreparedData::from_csv_text(csv, Some(1)).expect("parse csv");
+        assert_eq!(data.deployment_source.path_index, Some(1));
+        assert_eq!(
+            data.deployments.iter().map(|d| d.deployment.clone()).collect::<Vec<_>>(),
+            vec!["col_a".to_string()]
+        );
+    }
+
+    #[test]
+    fn deployment_column_takes_precedence_over_path() {
+        let csv = "path,deployment,datetime\n\
+            project/col_a/dep1/IMG_0001.jpg,explicit,2025-03-01 06:00:00\n";
+        let data = PreparedData::from_csv_text(csv, None).expect("parse csv");
+        assert!(!data.deployment_source.from_path);
+        assert_eq!(data.default_deployment(), "explicit");
     }
 }

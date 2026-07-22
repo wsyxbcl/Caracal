@@ -32,6 +32,16 @@ struct ExplorerMetadata {
     default_bucket: &'static str,
     default_deployment: String,
     deployment_options: Vec<DeploymentOption>,
+    deployment_from_path: bool,
+    deploy_path_index: Option<i32>,
+    detected_path_index: Option<i32>,
+    path_levels: Vec<PathLevelOption>,
+}
+
+#[derive(Serialize)]
+struct PathLevelOption {
+    index: i32,
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -47,9 +57,13 @@ struct DeploymentOption {
 
 #[wasm_bindgen]
 impl WasmExplorer {
+    /// Build an explorer from CSV text. `deploy_path_index` chooses the
+    /// deployment path level for CSVs without a `deployment` column; pass any
+    /// value below 1 (e.g. -1) to auto-detect.
     #[wasm_bindgen(constructor)]
-    pub fn new(csv_content: String) -> Result<WasmExplorer, JsValue> {
-        let data = PreparedData::from_csv_text(&csv_content).map_err(to_js_error)?;
+    pub fn new(csv_content: String, deploy_path_index: i32) -> Result<WasmExplorer, JsValue> {
+        let override_index = (deploy_path_index >= 1).then_some(deploy_path_index);
+        let data = PreparedData::from_csv_text(&csv_content, override_index).map_err(to_js_error)?;
         Ok(Self { data })
     }
 
@@ -75,6 +89,20 @@ impl WasmExplorer {
                     last_seen: format_timestamp(summary.last_seen),
                     media_breakdown: summary.media_breakdown(),
                     has_gps: summary.has_gps,
+                })
+                .collect(),
+            deployment_from_path: self.data.deployment_source.from_path,
+            deploy_path_index: self.data.deployment_source.path_index,
+            detected_path_index: self.data.deployment_source.detected_path_index,
+            path_levels: self
+                .data
+                .deployment_source
+                .path_levels
+                .iter()
+                .enumerate()
+                .map(|(offset, name)| PathLevelOption {
+                    index: offset as i32 + 1,
+                    name: name.clone(),
                 })
                 .collect(),
         };
