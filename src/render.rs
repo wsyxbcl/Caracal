@@ -548,9 +548,13 @@ impl WebPalette {
                 text: "#c9c9cd",
                 rect_stroke: "#202023",
                 point_stroke: "#202023",
+                // Empty cells match the panel grey (#202023); the colormaps below
+                // must therefore have low ends *brighter* than that grey, or a
+                // near-zero cell would look darker than an empty one. Inferno/Magma
+                // bottom out near black and break this — Plasma/Viridis do not.
                 blank_fill: "rgba(32,32,35,1.000)",
                 axis_ink: "rgba(201,201,205,1.000)",
-                overview_map: ColorMap::Inferno,
+                overview_map: ColorMap::Plasma,
                 hour_map: ColorMap::Viridis,
                 low_positive_fill: None,
             },
