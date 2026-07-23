@@ -115,8 +115,12 @@ pub fn overview_chart(data: &PreparedData, bucket: OverviewBucket) -> Result<Lay
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn overview_web_chart(data: &PreparedData, bucket: OverviewBucket) -> Result<LayeredChart> {
-    overview_web_chart_from_table(data.overview_table(bucket)?, bucket)
+pub fn overview_web_chart(
+    data: &PreparedData,
+    bucket: OverviewBucket,
+    palette: &WebPalette,
+) -> Result<LayeredChart> {
+    overview_web_chart_from_table(data.overview_table(bucket)?, bucket, palette)
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -157,16 +161,17 @@ pub fn overview_chart_from_table(
 pub fn overview_web_chart_from_table(
     table: &DataFrame,
     _bucket: OverviewBucket,
+    palette: &WebPalette,
 ) -> Result<LayeredChart> {
     let chart = chart_from_table(table)?
         .mark_rect()?
         .encode((x("bucket_label"), y("deployment"), color("event_count")))?
-        .configure_rect(|rect| rect.with_stroke("#f7f1e7").with_stroke_width(0.2))
+        .configure_rect(|rect| rect.with_stroke(palette.rect_stroke).with_stroke_width(0.2))
         .with_size(1320, 760)
         .with_x_label("")
         .with_y_label("")
         .configure_theme(|_| {
-            web_theme()
+            web_theme(palette)
                 .with_color_map(ColorMap::YlOrRd)
                 .with_tick_label_size(11.0)
                 .with_x_tick_label_angle(-42.0)
@@ -188,11 +193,16 @@ pub fn detail_chart(data: &PreparedData, deployment: &str) -> Result<LayeredChar
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn detail_web_chart(data: &PreparedData, deployment: &str) -> Result<LayeredChart> {
+pub fn detail_web_chart(
+    data: &PreparedData,
+    deployment: &str,
+    palette: &WebPalette,
+) -> Result<LayeredChart> {
     detail_web_chart_from_table(
         data.detail_table(deployment)?,
         deployment,
         data.deployment_summary(deployment)?,
+        palette,
     )
 }
 
@@ -244,6 +254,7 @@ pub fn detail_web_chart_from_table(
     table: &DataFrame,
     _deployment: &str,
     _summary: &DeploymentSummary,
+    palette: &WebPalette,
 ) -> Result<LayeredChart> {
     let chart = chart_from_table(table)?
         .mark_point()?
@@ -257,7 +268,7 @@ pub fn detail_web_chart_from_table(
             point
                 .with_size(2.8)
                 .with_opacity(0.84)
-                .with_stroke("#fffaf2")
+                .with_stroke(palette.point_stroke)
                 .with_stroke_width(0.30)
         })
         .with_size(1280, 420)
@@ -265,7 +276,7 @@ pub fn detail_web_chart_from_table(
         .with_y_label("")
         .with_y_domain(0.0, 1440.0)
         .configure_theme(|_| {
-            web_theme()
+            web_theme(palette)
                 .with_palette(ColorPalette::Dark2)
                 .with_x_tick_label_angle(-40.0)
                 .with_tick_label_size(11.0)
@@ -274,7 +285,7 @@ pub fn detail_web_chart_from_table(
                 .with_left_margin(0.04)
                 .with_bottom_margin(0.11)
                 .with_top_margin(0.02)
-                .with_grid_color("#e3d7c7")
+                .with_grid_color(palette.detail_grid)
         });
 
     Ok(chart)
@@ -286,8 +297,8 @@ pub fn hour_heatmap_chart(data: &PreparedData) -> Result<LayeredChart> {
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn hour_heatmap_web_chart(data: &PreparedData) -> Result<LayeredChart> {
-    hour_heatmap_web_chart_from_table(&data.hour_heatmap)
+pub fn hour_heatmap_web_chart(data: &PreparedData, palette: &WebPalette) -> Result<LayeredChart> {
+    hour_heatmap_web_chart_from_table(&data.hour_heatmap, palette)
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -315,16 +326,19 @@ pub fn hour_heatmap_chart_from_table(table: &DataFrame, title: &str) -> Result<L
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn hour_heatmap_web_chart_from_table(table: &DataFrame) -> Result<LayeredChart> {
+pub fn hour_heatmap_web_chart_from_table(
+    table: &DataFrame,
+    palette: &WebPalette,
+) -> Result<LayeredChart> {
     let chart = chart_from_table(table)?
         .mark_rect()?
         .encode((x("hour_label"), y("deployment"), color("event_count")))?
-        .configure_rect(|rect| rect.with_stroke("#f7f1e7").with_stroke_width(0.28))
+        .configure_rect(|rect| rect.with_stroke(palette.rect_stroke).with_stroke_width(0.28))
         .with_size(980, 760)
         .with_x_label("")
         .with_y_label("")
         .configure_theme(|_| {
-            web_theme()
+            web_theme(palette)
                 .with_color_map(ColorMap::GnBu)
                 .with_tick_label_size(11.0)
                 .with_tick_min_spacing(40.0)
@@ -340,19 +354,24 @@ pub fn overview_svg(data: &PreparedData, bucket: OverviewBucket) -> Result<Strin
     let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
     let svg = thin_rotated_bottom_axis_labels(&svg, target_overview_label_count(bucket));
     let svg = annotate_overview_svg(&svg, data.overview_table(bucket)?)?;
-    let svg = force_zero_event_cells_white(&svg);
-    Ok(force_zero_legend_stop_white(&svg))
+    let svg = force_zero_event_cells(&svg, HEATMAP_ZERO_FILL_WHITE);
+    Ok(force_zero_legend_stop(&svg, HEATMAP_ZERO_FILL_WHITE))
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn overview_web_svg(data: &PreparedData, bucket: OverviewBucket) -> Result<String> {
-    let svg = overview_web_chart(data, bucket)?.to_svg()?;
+pub fn overview_web_svg(
+    data: &PreparedData,
+    bucket: OverviewBucket,
+    theme: ChartTheme,
+) -> Result<String> {
+    let palette = WebPalette::from_theme(theme);
+    let svg = overview_web_chart(data, bucket, &palette)?.to_svg()?;
     let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
     let svg = thin_rotated_bottom_axis_labels(&svg, target_overview_label_count(bucket));
     let svg = strip_svg_background(&svg);
     let svg = annotate_overview_svg(&svg, data.overview_table(bucket)?)?;
-    let svg = force_zero_event_cells_white(&svg);
-    Ok(force_zero_legend_stop_white(&svg))
+    let svg = force_zero_event_cells(&svg, palette.blank_fill);
+    Ok(force_zero_legend_stop(&svg, palette.blank_fill))
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -361,7 +380,7 @@ pub fn detail_svg(data: &PreparedData, deployment: &str) -> Result<String> {
     let svg = detail_chart(data, deployment)?.to_svg()?;
     let svg = relabel_legend_titles(&svg, &[("media_family", "media")]);
     let svg = thin_rotated_bottom_axis_labels(&svg, target_detail_day_label_count(false));
-    let svg = rewrite_detail_minute_axis(&svg)?;
+    let svg = rewrite_detail_minute_axis(&svg, "rgba(38,64,61,1.000)")?;
     let svg = offset_detail_mark_positions(
         &svg,
         table,
@@ -372,12 +391,17 @@ pub fn detail_svg(data: &PreparedData, deployment: &str) -> Result<String> {
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn detail_web_svg(data: &PreparedData, deployment: &str) -> Result<String> {
+pub fn detail_web_svg(
+    data: &PreparedData,
+    deployment: &str,
+    theme: ChartTheme,
+) -> Result<String> {
+    let palette = WebPalette::from_theme(theme);
     let table = data.detail_table(deployment)?;
-    let svg = detail_web_chart(data, deployment)?.to_svg()?;
+    let svg = detail_web_chart(data, deployment, &palette)?.to_svg()?;
     let svg = relabel_legend_titles(&svg, &[("media_family", "media")]);
     let svg = thin_rotated_bottom_axis_labels(&svg, target_detail_day_label_count(true));
-    let svg = rewrite_detail_minute_axis(&svg)?;
+    let svg = rewrite_detail_minute_axis(&svg, palette.axis_ink)?;
     let svg = offset_detail_mark_positions(
         &svg,
         table,
@@ -394,19 +418,20 @@ pub fn hour_heatmap_svg(data: &PreparedData) -> Result<String> {
     let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
     let svg = annotate_hour_heatmap_svg(&svg, &data.hour_heatmap)?;
     let svg = boost_low_positive_event_cells(&svg, 3, HEATMAP_LOW_POSITIVE_FILL_GN_BU);
-    let svg = force_zero_event_cells_white(&svg);
-    Ok(force_zero_legend_stop_white(&svg))
+    let svg = force_zero_event_cells(&svg, HEATMAP_ZERO_FILL_WHITE);
+    Ok(force_zero_legend_stop(&svg, HEATMAP_ZERO_FILL_WHITE))
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn hour_heatmap_web_svg(data: &PreparedData) -> Result<String> {
-    let svg = hour_heatmap_web_chart(data)?.to_svg()?;
+pub fn hour_heatmap_web_svg(data: &PreparedData, theme: ChartTheme) -> Result<String> {
+    let palette = WebPalette::from_theme(theme);
+    let svg = hour_heatmap_web_chart(data, &palette)?.to_svg()?;
     let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
     let svg = strip_svg_background(&svg);
     let svg = annotate_hour_heatmap_svg(&svg, &data.hour_heatmap)?;
-    let svg = boost_low_positive_event_cells(&svg, 3, HEATMAP_LOW_POSITIVE_FILL_GN_BU);
-    let svg = force_zero_event_cells_white(&svg);
-    Ok(force_zero_legend_stop_white(&svg))
+    let svg = boost_low_positive_event_cells(&svg, 3, palette.low_positive_fill);
+    let svg = force_zero_event_cells(&svg, palette.blank_fill);
+    Ok(force_zero_legend_stop(&svg, palette.blank_fill))
 }
 
 pub fn detail_caption(data: &PreparedData, deployment: &str) -> Result<String> {
@@ -460,20 +485,77 @@ fn base_theme() -> Theme {
         .with_title_size(20.0)
 }
 
+/// Light or dark rendering for the browser charts. Native/CLI export is
+/// always light.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn web_theme() -> Theme {
+#[derive(Clone, Copy)]
+pub enum ChartTheme {
+    Light,
+    Dark,
+}
+
+/// Theme-dependent colors for the web charts. The chart background stays
+/// transparent in both themes so the surrounding panel shows through.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub struct WebPalette {
+    grid: &'static str,
+    detail_grid: &'static str,
+    title: &'static str,
+    text: &'static str,
+    rect_stroke: &'static str,
+    point_stroke: &'static str,
+    /// Zero heatmap cells and the legend's zero stop — matches the panel so
+    /// blanks blend in.
+    blank_fill: &'static str,
+    /// Injected minute-axis line/label color.
+    axis_ink: &'static str,
+    low_positive_fill: &'static str,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+impl WebPalette {
+    fn from_theme(theme: ChartTheme) -> Self {
+        match theme {
+            ChartTheme::Light => Self {
+                grid: "#e7dccd",
+                detail_grid: "#e3d7c7",
+                title: "#12211f",
+                text: "#26403d",
+                rect_stroke: "#f7f1e7",
+                point_stroke: "#fffaf2",
+                blank_fill: "rgba(255,255,255,1.000)",
+                axis_ink: "rgba(38,64,61,1.000)",
+                low_positive_fill: HEATMAP_LOW_POSITIVE_FILL_GN_BU,
+            },
+            ChartTheme::Dark => Self {
+                grid: "#34343a",
+                detail_grid: "#34343a",
+                title: "#e8e8ea",
+                text: "#c9c9cd",
+                rect_stroke: "#202023",
+                point_stroke: "#202023",
+                blank_fill: "rgba(32,32,35,1.000)",
+                axis_ink: "rgba(201,201,205,1.000)",
+                low_positive_fill: HEATMAP_LOW_POSITIVE_FILL_GN_BU,
+            },
+        }
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn web_theme(palette: &WebPalette) -> Theme {
     Theme::default()
         .with_background_color("rgba(255,255,255,0)")
-        .with_grid_color("#e7dccd")
+        .with_grid_color(palette.grid)
         .with_grid_width(0.8)
         .with_title_family(display_font())
         .with_label_family(sans_font())
         .with_tick_label_family(sans_font())
         .with_legend_label_family(sans_font())
-        .with_title_color("#12211f")
-        .with_label_color("#26403d")
-        .with_tick_label_color("#26403d")
-        .with_legend_label_color("#26403d")
+        .with_title_color(palette.title)
+        .with_label_color(palette.text)
+        .with_tick_label_color(palette.text)
+        .with_legend_label_color(palette.text)
         .with_palette(ColorPalette::Dark2)
         .with_show_axes(true)
         .with_axis_width(1.0)
@@ -554,7 +636,7 @@ fn strip_svg_background(svg: &str) -> String {
     format!("{}{}", &svg[..start_index], &svg[end_index..])
 }
 
-fn rewrite_detail_minute_axis(svg: &str) -> Result<String> {
+fn rewrite_detail_minute_axis(svg: &str, ink: &str) -> Result<String> {
     let lines = svg.lines().collect::<Vec<_>>();
     let Some((plot_x, plot_y, _plot_width, plot_height)) = parse_plot_clip_rect(svg) else {
         return Ok(svg.to_string());
@@ -576,13 +658,13 @@ fn rewrite_detail_minute_axis(svg: &str) -> Result<String> {
         let y = plot_y + plot_height - (tick / 1440.0) * plot_height;
         let label = format_minute_tick_label(tick);
         injected.push_str(&format!(
-            r#"<line x1="{x1:.2}" y1="{y:.2}" x2="{x2:.2}" y2="{y:.2}" stroke="rgba(38,64,61,1.000)" stroke-width="1.0"/>"#,
+            r#"<line x1="{x1:.2}" y1="{y:.2}" x2="{x2:.2}" y2="{y:.2}" stroke="{ink}" stroke-width="1.0"/>"#,
             x1 = plot_x,
             x2 = plot_x - 6.0,
         ));
         injected.push('\n');
         injected.push_str(&format!(
-            r#"<text x="{x:.2}" y="{y:.2}" font-size="11" font-family="{font}" fill="rgba(38,64,61,1.000)" text-anchor="end" dominant-baseline="central">{label}</text>"#,
+            r#"<text x="{x:.2}" y="{y:.2}" font-size="11" font-family="{font}" fill="{ink}" text-anchor="end" dominant-baseline="central">{label}</text>"#,
             x = plot_x - 10.0,
             font = sans_font(),
             label = escape_html(&label),
@@ -918,10 +1000,10 @@ fn is_rotated_bottom_tick_label(line: &str) -> bool {
         && trimmed.contains("transform=\"rotate(")
 }
 
-fn force_zero_event_cells_white(svg: &str) -> String {
+fn force_zero_event_cells(svg: &str, fill: &str) -> String {
     rewrite_plot_rects(svg, |rect| {
         if rect.contains("<title>") && extract_event_count(rect) == Some(0) {
-            replace_rect_fill(rect, HEATMAP_ZERO_FILL_WHITE)
+            replace_rect_fill(rect, fill)
         } else {
             rect.to_string()
         }
@@ -1000,7 +1082,7 @@ fn extract_event_count(rect: &str) -> Option<usize> {
     raw.parse().ok()
 }
 
-fn force_zero_legend_stop_white(svg: &str) -> String {
+fn force_zero_legend_stop(svg: &str, fill: &str) -> String {
     let gradient_marker = "<linearGradient id=\"grad_event_count\"";
     let zero_stop_marker = "offset=\"100.0%\" stop-color=\"";
     let Some(gradient_start) = svg.find(gradient_marker) else {
@@ -1022,7 +1104,7 @@ fn force_zero_legend_stop_white(svg: &str) -> String {
 
     let mut output = String::with_capacity(svg.len());
     output.push_str(&svg[..stop_start]);
-    output.push_str(HEATMAP_ZERO_FILL_WHITE);
+    output.push_str(fill);
     output.push_str(&svg[stop_end..]);
     output
 }

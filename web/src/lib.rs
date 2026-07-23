@@ -110,23 +110,30 @@ impl WasmExplorer {
         serde_json::to_string(&metadata).map_err(to_js_error)
     }
 
-    pub fn render_overview(&self, bucket: String) -> Result<String, JsValue> {
+    pub fn render_overview(&self, bucket: String, theme: String) -> Result<String, JsValue> {
         let bucket = parse_bucket(&bucket)?;
-        render::overview_web_svg(&self.data, bucket).map_err(to_js_error)
+        render::overview_web_svg(&self.data, bucket, parse_theme(&theme)).map_err(to_js_error)
     }
 
-    pub fn render_detail(&self, deployment: String) -> Result<String, JsValue> {
+    pub fn render_detail(&self, deployment: String, theme: String) -> Result<String, JsValue> {
         let deployment = normalize_deployment(&self.data, &deployment)?;
-        render::detail_web_svg(&self.data, &deployment).map_err(to_js_error)
+        render::detail_web_svg(&self.data, &deployment, parse_theme(&theme)).map_err(to_js_error)
     }
 
-    pub fn render_hour_heatmap(&self) -> Result<String, JsValue> {
-        render::hour_heatmap_web_svg(&self.data).map_err(to_js_error)
+    pub fn render_hour_heatmap(&self, theme: String) -> Result<String, JsValue> {
+        render::hour_heatmap_web_svg(&self.data, parse_theme(&theme)).map_err(to_js_error)
     }
 
     pub fn detail_caption(&self, deployment: String) -> Result<String, JsValue> {
         let deployment = normalize_deployment(&self.data, &deployment)?;
         render::detail_caption(&self.data, &deployment).map_err(to_js_error)
+    }
+}
+
+fn parse_theme(value: &str) -> render::ChartTheme {
+    match value {
+        "dark" => render::ChartTheme::Dark,
+        _ => render::ChartTheme::Light,
     }
 }
 
