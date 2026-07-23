@@ -554,7 +554,7 @@ impl WebPalette {
                 // bottom out near black and break this — Plasma/Viridis do not.
                 blank_fill: "rgba(32,32,35,1.000)",
                 axis_ink: "rgba(201,201,205,1.000)",
-                overview_map: ColorMap::Plasma,
+                overview_map: ColorMap::Cividis,
                 hour_map: ColorMap::Viridis,
                 low_positive_fill: None,
             },
