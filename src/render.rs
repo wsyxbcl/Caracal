@@ -172,7 +172,7 @@ pub fn overview_web_chart_from_table(
         .with_y_label("")
         .configure_theme(|_| {
             web_theme(palette)
-                .with_color_map(ColorMap::YlOrRd)
+                .with_color_map(palette.overview_map)
                 .with_tick_label_size(11.0)
                 .with_x_tick_label_angle(-42.0)
                 .with_axis_reserve_buffer(3.0)
@@ -339,7 +339,7 @@ pub fn hour_heatmap_web_chart_from_table(
         .with_y_label("")
         .configure_theme(|_| {
             web_theme(palette)
-                .with_color_map(ColorMap::GnBu)
+                .with_color_map(palette.hour_map)
                 .with_tick_label_size(11.0)
                 .with_tick_min_spacing(40.0)
         })
@@ -429,7 +429,10 @@ pub fn hour_heatmap_web_svg(data: &PreparedData, theme: ChartTheme) -> Result<St
     let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
     let svg = strip_svg_background(&svg);
     let svg = annotate_hour_heatmap_svg(&svg, &data.hour_heatmap)?;
-    let svg = boost_low_positive_event_cells(&svg, 3, palette.low_positive_fill);
+    let svg = match palette.low_positive_fill {
+        Some(fill) => boost_low_positive_event_cells(&svg, 3, fill),
+        None => svg,
+    };
     let svg = force_zero_event_cells(&svg, palette.blank_fill);
     Ok(force_zero_legend_stop(&svg, palette.blank_fill))
 }
@@ -509,7 +512,14 @@ pub struct WebPalette {
     blank_fill: &'static str,
     /// Injected minute-axis line/label color.
     axis_ink: &'static str,
-    low_positive_fill: &'static str,
+    /// Heatmap colormaps. Light-mode maps run pale (low) -> dark (high); dark
+    /// mode uses perceptual maps that run near-black (low) -> bright (high) so
+    /// contrast still grows with value against the dark panel.
+    overview_map: ColorMap,
+    hour_map: ColorMap,
+    /// Fill for boosting barely-positive hour cells so they lift off a light
+    /// background; `None` in dark mode, where low values should stay dark.
+    low_positive_fill: Option<&'static str>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -525,7 +535,9 @@ impl WebPalette {
                 point_stroke: "#fffaf2",
                 blank_fill: "rgba(255,255,255,1.000)",
                 axis_ink: "rgba(38,64,61,1.000)",
-                low_positive_fill: HEATMAP_LOW_POSITIVE_FILL_GN_BU,
+                overview_map: ColorMap::YlOrRd,
+                hour_map: ColorMap::GnBu,
+                low_positive_fill: Some(HEATMAP_LOW_POSITIVE_FILL_GN_BU),
             },
             ChartTheme::Dark => Self {
                 grid: "#34343a",
@@ -536,7 +548,9 @@ impl WebPalette {
                 point_stroke: "#202023",
                 blank_fill: "rgba(32,32,35,1.000)",
                 axis_ink: "rgba(201,201,205,1.000)",
-                low_positive_fill: HEATMAP_LOW_POSITIVE_FILL_GN_BU,
+                overview_map: ColorMap::Inferno,
+                hour_map: ColorMap::Viridis,
+                low_positive_fill: None,
             },
         }
     }
