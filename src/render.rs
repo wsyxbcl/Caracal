@@ -416,6 +416,7 @@ pub fn detail_web_svg(
 pub fn hour_heatmap_svg(data: &PreparedData) -> Result<String> {
     let svg = hour_heatmap_chart(data)?.to_svg()?;
     let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
+    let svg = shorten_hour_axis_labels(&svg);
     let svg = annotate_hour_heatmap_svg(&svg, &data.hour_heatmap)?;
     let svg = boost_low_positive_event_cells(&svg, 3, HEATMAP_LOW_POSITIVE_FILL_GN_BU);
     let svg = force_zero_event_cells(&svg, HEATMAP_ZERO_FILL_WHITE);
@@ -427,6 +428,7 @@ pub fn hour_heatmap_web_svg(data: &PreparedData, theme: ChartTheme) -> Result<St
     let palette = WebPalette::from_theme(theme);
     let svg = hour_heatmap_web_chart(data, &palette)?.to_svg()?;
     let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
+    let svg = shorten_hour_axis_labels(&svg);
     let svg = strip_svg_background(&svg);
     let svg = annotate_hour_heatmap_svg(&svg, &data.hour_heatmap)?;
     let svg = match palette.low_positive_fill {
@@ -652,13 +654,22 @@ fn strip_svg_background(svg: &str) -> String {
 
 fn rewrite_detail_minute_axis(svg: &str, ink: &str) -> Result<String> {
     let lines = svg.lines().collect::<Vec<_>>();
-    let Some((plot_x, plot_y, _plot_width, plot_height)) = parse_plot_clip_rect(svg) else {
+    let Some((plot_x, _plot_y, _plot_width, _plot_height)) = parse_plot_clip_rect(svg) else {
         return Ok(svg.to_string());
     };
 
+    // Drop charton's raw minute tick labels, capturing their (value, y) so we can
+    // reuse the exact minute->y scale charton chose (it may auto-extend the domain).
     let mut skip = vec![false; lines.len()];
+    let mut raw_ticks: Vec<(f64, f64)> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if is_left_tick_label_line(line, plot_x) {
+            if let (Some(value), Some(y)) = (
+                parse_svg_text_content(line).and_then(|content| content.trim().parse::<f64>().ok()),
+                extract_svg_attr(line, "y").and_then(|value| value.parse::<f64>().ok()),
+            ) {
+                raw_ticks.push((value, y));
+            }
             skip[index] = true;
             if index > 0 && is_left_tick_line(lines[index - 1], plot_x) {
                 skip[index - 1] = true;
@@ -666,10 +677,25 @@ fn rewrite_detail_minute_axis(svg: &str, ink: &str) -> Result<String> {
         }
     }
 
+    // Fit y = slope*minute + intercept from the first and last raw tick.
+    let Some((slope, intercept)) =
+        raw_ticks
+            .first()
+            .zip(raw_ticks.last())
+            .and_then(|(&(v0, y0), &(v1, y1))| {
+                ((v1 - v0).abs() > f64::EPSILON).then(|| {
+                    let slope = (y1 - y0) / (v1 - v0);
+                    (slope, y0 - slope * v0)
+                })
+            })
+    else {
+        return Ok(svg.to_string());
+    };
+
     let ticks = [0.0_f64, 360.0, 720.0, 1080.0, 1440.0];
     let mut injected = String::new();
     for tick in ticks {
-        let y = plot_y + plot_height - (tick / 1440.0) * plot_height;
+        let y = slope * tick + intercept;
         let label = format_minute_tick_label(tick);
         injected.push_str(&format!(
             r#"<line x1="{x1:.2}" y1="{y:.2}" x2="{x2:.2}" y2="{y:.2}" stroke="{ink}" stroke-width="1.0"/>"#,
@@ -739,7 +765,7 @@ fn extract_svg_attr<'a>(element: &'a str, attr: &str) -> Option<&'a str> {
 
 fn is_left_tick_label_line(line: &str, plot_x: f64) -> bool {
     let trimmed = line.trim_start();
-    if !trimmed.starts_with("<text ") || trimmed.contains("transform=\"rotate(") {
+    if !trimmed.starts_with("<text ") {
         return false;
     }
     if !trimmed.contains("text-anchor=\"end\"")
@@ -747,10 +773,22 @@ fn is_left_tick_label_line(line: &str, plot_x: f64) -> bool {
     {
         return false;
     }
+    // charton wraps every tick label in transform="rotate(<angle> ...)"; the left
+    // (minute) axis is unrotated (angle 0). Reject genuinely rotated labels only.
+    if trimmed.contains("transform=\"rotate(") && !trimmed.contains("transform=\"rotate(0 ") {
+        return false;
+    }
     let Some(x) = extract_svg_attr(trimmed, "x").and_then(|value| value.parse::<f64>().ok()) else {
         return false;
     };
     x < plot_x
+}
+
+/// The text between a single element's `>` and `</text>`.
+fn parse_svg_text_content(line: &str) -> Option<&str> {
+    let close = line.find("</text>")?;
+    let open_end = line[..close].rfind('>')? + 1;
+    Some(&line[open_end..close])
 }
 
 fn is_left_tick_line(line: &str, plot_x: f64) -> bool {
@@ -892,7 +930,6 @@ fn annotate_overview_svg(svg: &str, table: &DataFrame) -> Result<String> {
 fn annotate_detail_svg(svg: &str, table: &DataFrame) -> Result<String> {
     let timestamps = table.column("timestamp")?.cast(&DataType::Int64)?;
     let timestamp_values = timestamps.i64()?;
-    let hours = table.column("hour_of_day")?.f64()?;
     let paths = table.column("path")?.str()?;
     let media_types = table.column("media_type")?.str()?;
     let media_families = table.column("media_family")?.str()?;
@@ -900,14 +937,13 @@ fn annotate_detail_svg(svg: &str, table: &DataFrame) -> Result<String> {
 
     for index in 0..table.height() {
         let timestamp_ns = timestamp_values.get(index).unwrap_or_default();
-        let hour_of_day = hours.get(index).unwrap_or_default();
         let path = paths.get(index).unwrap_or("");
         let media_type = media_types.get(index).unwrap_or("unknown");
         let media_family = media_families.get(index).unwrap_or("image");
+        // Timestamp already carries the time of day, so no separate "Hour" line.
         titles.push(format!(
-            "Timestamp: {}\nHour: {}\nMedia: {media_family}\nMedia type: {media_type}\nPath: {path}",
+            "Timestamp: {}\nMedia: {media_family}\nMedia type: {media_type}\nPath: {path}",
             format_timestamp_ns(timestamp_ns),
-            format_hour_label(hour_of_day)
         ));
     }
 
@@ -993,13 +1029,6 @@ fn format_timestamp_ns(timestamp_ns: i64) -> String {
         .unwrap_or_else(|| timestamp_ns.to_string())
 }
 
-fn format_hour_label(hour_of_day: f64) -> String {
-    let total_minutes = (hour_of_day * 60.0).round() as i64;
-    let hours = total_minutes.div_euclid(60);
-    let minutes = total_minutes.rem_euclid(60);
-    format!("{hours:02}:{minutes:02}")
-}
-
 fn format_minute_tick_label(minute_of_day: f64) -> String {
     let total_minutes = minute_of_day.round() as i64;
     let hours = total_minutes.div_euclid(60);
@@ -1012,6 +1041,43 @@ fn is_rotated_bottom_tick_label(line: &str) -> bool {
     trimmed.starts_with("<text ")
         && trimmed.contains("dominant-baseline=\"hanging\"")
         && trimmed.contains("transform=\"rotate(")
+}
+
+/// charton renders all 24 hour ticks as "HH:00", which collide; keep just the
+/// hour number ("HH") on the axis (the hover still shows the full label).
+fn shorten_hour_axis_labels(svg: &str) -> String {
+    let ends_with_newline = svg.ends_with('\n');
+    let mut out = String::with_capacity(svg.len());
+    let mut first = true;
+    for line in svg.lines() {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+
+        let trimmed = line.trim_start();
+        let hour = (trimmed.starts_with("<text ")
+            && trimmed.contains("dominant-baseline=\"hanging\""))
+        .then(|| parse_svg_text_content(line))
+        .flatten()
+        .filter(|content| {
+            content.len() == 5
+                && content.ends_with(":00")
+                && content[..2].chars().all(|c| c.is_ascii_digit())
+        });
+        match hour {
+            Some(content) => out.push_str(&line.replacen(
+                &format!(">{content}</text>"),
+                &format!(">{}</text>", &content[..2]),
+                1,
+            )),
+            None => out.push_str(line),
+        }
+    }
+    if ends_with_newline {
+        out.push('\n');
+    }
+    out
 }
 
 fn force_zero_event_cells(svg: &str, fill: &str) -> String {
