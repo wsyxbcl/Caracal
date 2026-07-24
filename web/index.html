@@ -141,6 +141,22 @@
             gap: 12px;
         }
 
+        /* Order the settings cluster: upload / reload, then theme toggle, then
+           the language select, then the GitHub link. */
+        .header-controls #theme-toggle {
+            order: 1;
+        }
+
+        #lang-select {
+            order: 2;
+            font-size: 0.85rem;
+            padding: 5px 8px;
+        }
+
+        .header-controls .gh-link {
+            order: 3;
+        }
+
         .header-btn {
             font: inherit;
             font-size: 0.85rem;
@@ -255,6 +271,7 @@
             margin: 0 0 14px;
             color: var(--muted);
             line-height: 1.55;
+            white-space: pre-line;
         }
 
         .intro-tags {
@@ -580,6 +597,27 @@
         .help:hover .help-bubble,
         .help:focus-within .help-bubble {
             display: block;
+        }
+
+        /* Transparent bridge across the 8px gap so the pointer can move from the
+           trigger onto the bubble (and its link) without dropping :hover. */
+        .help-bubble::before {
+            content: "";
+            position: absolute;
+            top: -8px;
+            left: 0;
+            right: 0;
+            height: 8px;
+        }
+
+        .help-bubble a {
+            color: var(--accent);
+            font-weight: 500;
+        }
+
+        .help-bubble code {
+            font-family: monospace;
+            font-size: 0.85em;
         }
 
         button {
@@ -1061,6 +1099,12 @@
         let lastSourceLabel = "";
         // -1 means "auto-detect the deployment path level"; >=1 forces a level.
         let lastPathIndex = -1;
+        // The CSV context of the most recent load attempt, so a failed
+        // path-derivation can be retried at a different level.
+        let lastAttempt = null;
+        // Set while offering manual path-level selection after a failed
+        // auto-derivation (no explorer loaded yet); cleared on any success.
+        let pendingPathSelection = null;
         const I18N = {
             en: {
                 static: {
@@ -1132,7 +1176,8 @@
                     wasm_not_ready: "WASM runtime is not ready yet.",
                     reload_without_source: "Load a CSV before trying to reload it.",
                     export_without_data: "Load a CSV before exporting the trap_info template.",
-                    deploy_from_path_failed: "Could not derive a deployment from the path column for every row (the paths do not share a consistent directory structure). Please add a 'deployment' column to the CSV and reload."
+                    deploy_from_path_failed: "Could not derive a deployment from the path column for every row (the paths do not share a consistent directory structure). Please add a 'deployment' column to the CSV and reload.",
+                    deploy_path_level_invalid: "This path level doesn't name a deployment for every row. Pick a different level below, or add a 'deployment' column to the CSV and reload."
                 },
                 chart: {
                     chart: "Chart",
@@ -1157,12 +1202,12 @@
             },
             zh: {
                 static: {
-                    page_title: "Caracal · 红外相机时间可视化",
+                    page_title: "Caracal · 红外相机数据时间可视化",
                     eyebrow: "Charton + Polars + WASM",
                     lang_label: "语言",
                     hero_title: "红外相机时间可视化",
                     hero_copy: "",
-                    intro_lede: "按位点浏览相机媒体的时间分布：随时间的活跃度、时段规律，并可导出 trap_info 模板。解析、聚合与渲染全部在浏览器本地完成。",
+                    intro_lede: "各位点时间分布可视化，编辑表单实时修改时间，trap_info 模板导出。\n表单解析、数据分析与渲染全部在浏览器本地完成。",
                     intro_offline: "100% 离线 · 数据不出浏览器",
                     intro_tech: "Rust · WASM · Charton · Polars",
                     nav_upload: "上传",
@@ -1184,7 +1229,7 @@
                     upload_note: "修改时间后重新加载即可更新图表。",
                     reload_source: "重新加载当前数据源",
                     header_upload: "上传",
-                    header_reload: "重新加载",
+                    header_reload: "重新加载数据",
                     current_source_label: "当前数据源：",
                     controls_title: "控制面板",
                     controls_copy: "",
@@ -1192,12 +1237,12 @@
                     deployment_label: "明细图位点",
                     path_level_label: "位点路径层级",
                     path_level_detected: "（自动识别）",
-                    path_level_hint: "未找到 deployment 列，已从路径推断位点（例如 {sample}）。请选择代表位点的层级。",
+                    path_level_hint: "未找到 deployment 列，已从路径推断位点。可通过“位点路径层级”修改。",
                     overview_title: "位点时间总览",
                     overview_copy: "用于比较不同位点在时间上的分布。点击某一行可聚焦到下方明细图。",
                     overview_placeholder: "上传 CSV 后显示位点时间总览。",
                     detail_title: "位点媒体明细图",
-                    detail_copy_base: "每个点代表一个媒体。图片会略微向左上偏移，视频会略微向右下偏移。",
+                    detail_copy_base: "每个点代表一个媒体（图片会向左上偏移，视频会向右下偏移）",
                     detail_placeholder: "上传 CSV 后显示位点媒体明细图。",
                     hour_title: "时段热力图",
                     hour_copy: "用于比较不同位点的活跃时段。点击某一行可聚焦到左侧明细图。",
@@ -1212,7 +1257,7 @@
                     inventory_header_first_seen: "开始时间",
                     inventory_header_last_seen: "结束时间",
                     inventory_header_media_types: "媒体类型",
-                    upload_copy: "CSV 一般包含 `deployment`、`path`、`media_type` 和 `datetime` 列，通常由 `serval xmp init` 时生成。",
+                    upload_copy: "目前仅支持 [serval tags.csv](https://github.com/wsyxbcl/Serval/blob/master/docs/tags_csv_schema.md)，通常由 `serval observe -x` 或 `serval xmp init --info` 初始化 xmp 时生成。",
                     reload_unsupported: "本浏览器点击“重新加载”会再次打开文件选择框（不支持从磁盘一键重新加载）。"
                 },
                 bucket: {
@@ -1225,7 +1270,8 @@
                     wasm_not_ready: "WASM 运行时尚未就绪。",
                     reload_without_source: "请先加载 CSV，再执行重新加载。",
                     export_without_data: "请先加载 CSV，再导出 trap_info 模板。",
-                    deploy_from_path_failed: "无法从 path 列为每一行推断出位点（路径的目录层级不一致）。请在 CSV 中添加 deployment 列后重新加载。"
+                    deploy_from_path_failed: "无法从 path 列为每一行推断出位点（路径的目录层级不一致）。请在 CSV 中添加 deployment 列后重新加载。",
+                    deploy_path_level_invalid: "该路径层级无法为每一行确定位点。请在下方改选其他层级，或在 CSV 中添加 deployment 列后重新加载。"
                 },
                 chart: {
                     chart: "图表",
@@ -1234,7 +1280,7 @@
                     close: "关闭",
                     zoom_workspace: "可在更大的视图中缩放和平移。",
                     zoom_level: "缩放 <strong data-role=\"zoom-label\">100%</strong>。",
-                    zoom_hint: "缩放 <strong data-role=\"zoom-label\">100%</strong>。使用 Shift + 滚轮缩放，再用 Shift + 拖拽或中键拖拽平移。",
+                    zoom_hint: "缩放 <strong data-role=\"zoom-label\">100%</strong>。使用 Shift + 滚轮缩放，再用中键拖拽或 Shift + 拖拽进行平移。",
                     overview_title: "概览热力图",
                     overview_subtitle: "用于比较不同位点在时间上的分布。点击某一行可聚焦到该位点。",
                     detail_title: "位点媒体明细图：{deployment}",
@@ -1287,6 +1333,18 @@
                 .replaceAll("'", "&#39;");
         }
 
+        // Render a small, developer-authored subset of Markdown (links and inline
+        // code) for help copy. The input is HTML-escaped first, so only these two
+        // constructs become markup.
+        function renderInlineMarkdown(value) {
+            return escapeHtml(value)
+                .replace(
+                    /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+                    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+                )
+                .replace(/`([^`]+)`/g, "<code>$1</code>");
+        }
+
         function clearError() {
             lastErrorState = null;
             errorEl.style.display = "none";
@@ -1310,10 +1368,56 @@
         function reportLoadError(error) {
             const message = error && error.message ? error.message : String(error);
             if (message.includes("deploy-path-error")) {
-                showErrorKey("deploy_from_path_failed");
+                offerPathLevelSelection();
             } else {
                 showError(message);
             }
+        }
+
+        // Auto-derivation picked a path level that doesn't name a deployment for
+        // every row. Rather than dead-ending, offer the level chooser so the user
+        // can pick one that works; fall back to the "add a deployment column"
+        // hint only when the path column can't yield any levels at all.
+        function offerPathLevelSelection() {
+            let probe = null;
+            try {
+                probe = JSON.parse(WasmExplorer.probe_path_levels(lastAttempt?.csvText ?? ""));
+            } catch (probeError) {
+                probe = null;
+            }
+            if (!probe || !(probe.path_levels || []).length) {
+                showErrorKey("deploy_from_path_failed");
+                return;
+            }
+            pendingPathSelection = lastAttempt ? { ...lastAttempt } : null;
+            populatePathLevelChooser(probe);
+            showErrorKey("deploy_path_level_invalid");
+        }
+
+        // Populate the path-level selector from a probe result (no explorer yet).
+        // Only the path-level control is shown; the other controls need a
+        // successful load.
+        function populatePathLevelChooser(probe) {
+            pathLevelLabel.textContent = t("static", "path_level_label");
+            pathLevelSelect.innerHTML = "";
+            for (const level of probe.path_levels || []) {
+                const node = document.createElement("option");
+                node.value = String(level.index);
+                const suffix =
+                    level.index === probe.detected_path_index
+                        ? ` ${t("static", "path_level_detected")}`
+                        : "";
+                node.textContent = `${level.index}: ${level.name}${suffix}`;
+                pathLevelSelect.appendChild(node);
+            }
+            if (probe.detected_path_index != null) {
+                pathLevelSelect.value = String(probe.detected_path_index);
+            }
+            pathLevelControl.classList.remove("hidden");
+            pathLevelHint.classList.add("hidden");
+            bucketSelect.closest(".control").classList.add("hidden");
+            deploymentSelect.closest(".control").classList.add("hidden");
+            controlsPanel.classList.remove("hidden");
         }
 
         function refreshErrorText() {
@@ -1329,7 +1433,7 @@
         function updateSourceControls() {
             reloadSourceButton.disabled = !lastSource;
             headerReload.disabled = !lastSource;
-            uploadCopy.textContent = t("static", "upload_copy");
+            uploadCopy.innerHTML = renderInlineMarkdown(t("static", "upload_copy"));
             if (supportsFilePicker) {
                 reloadNote.classList.add("hidden");
             } else {
@@ -1528,6 +1632,9 @@
 
             bucketSelect.value = metadata.default_bucket;
             deploymentSelect.value = metadata.default_deployment;
+            // Restore controls that the path-level fallback may have hidden.
+            bucketSelect.closest(".control").classList.remove("hidden");
+            deploymentSelect.closest(".control").classList.remove("hidden");
             populatePathLevelControl();
             controlsPanel.classList.remove("hidden");
         }
@@ -2122,12 +2229,14 @@
             }
 
             clearError();
+            lastAttempt = { csvText, sourceLabel, source };
 
             const nextExplorer = new WasmExplorer(csvText, pathIndex);
             const nextMetadata = JSON.parse(nextExplorer.metadata_json());
 
             explorer = nextExplorer;
             metadata = nextMetadata;
+            pendingPathSelection = null;
             lastCsvText = csvText;
             lastSourceLabel = sourceLabel;
             lastPathIndex = pathIndex;
@@ -2303,15 +2412,26 @@
         });
 
         pathLevelSelect.addEventListener("change", async () => {
-            if (!lastCsvText) {
+            const context = pendingPathSelection
+                ? pendingPathSelection
+                : lastCsvText
+                    ? { csvText: lastCsvText, sourceLabel: lastSourceLabel, source: null }
+                    : null;
+            if (!context) {
                 return;
             }
             const index = Number(pathLevelSelect.value);
             try {
                 // Re-parse the same CSV, deriving deployments from the chosen level.
-                await loadExplorer(lastCsvText, lastSourceLabel, null, index);
+                await loadExplorer(context.csvText, context.sourceLabel, context.source ?? null, index);
             } catch (error) {
-                reportLoadError(error);
+                const message = error && error.message ? error.message : String(error);
+                if (message.includes("deploy-path-error")) {
+                    // Keep the chooser and the user's selection; flag this level.
+                    showErrorKey("deploy_path_level_invalid");
+                } else {
+                    reportLoadError(error);
+                }
             }
         });
 
