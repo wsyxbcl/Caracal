@@ -24,7 +24,7 @@ It is built in Rust with [`polars`](https://pola.rs) and
 
 - **Online** — a static site at <https://caracal.hinature.cn>. Nothing to
   install.
-- **Offline** — the `serval-charton` binary serves the identical bundle from a
+- **Offline** — the `caracal` binary serves the identical bundle from a
   local server.
 
 In both cases the CSV never leaves the browser: the server only ever ships the

@@ -219,6 +219,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "caracal"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "charton",
+ "chrono",
+ "clap",
+ "polars",
+ "polars-io",
+ "winresource",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1486,19 +1499,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "serval-charton"
-version = "1.1.0"
-dependencies = [
- "anyhow",
- "charton",
- "chrono",
- "clap",
- "polars",
- "polars-io",
- "winresource",
 ]
 
 [[package]]

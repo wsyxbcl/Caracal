@@ -12,7 +12,7 @@ on:
       - master
 
 env:
-  BINARY_NAME: serval-charton
+  BINARY_NAME: caracal
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   WASM_PACK_VERSION: 0.14.0
@@ -80,20 +80,20 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            artifact_name: serval-charton-linux-x86_64
-            binary_path: target/release/serval-charton
+            artifact_name: caracal-linux-x86_64
+            binary_path: target/release/caracal
             archive_ext: tar.gz
           - os: macos-15-intel
-            artifact_name: serval-charton-macos-x86_64
-            binary_path: target/release/serval-charton
+            artifact_name: caracal-macos-x86_64
+            binary_path: target/release/caracal
             archive_ext: tar.gz
           - os: macos-14
-            artifact_name: serval-charton-macos-aarch64
-            binary_path: target/release/serval-charton
+            artifact_name: caracal-macos-aarch64
+            binary_path: target/release/caracal
             archive_ext: tar.gz
           - os: windows-2022
-            artifact_name: serval-charton-windows-x86_64
-            binary_path: target/release/serval-charton.exe
+            artifact_name: caracal-windows-x86_64
+            binary_path: target/release/caracal.exe
             archive_ext: zip
 
     steps:
@@ -146,7 +146,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $distDir | Out-Null
           Copy-Item "${{ matrix.binary_path }}" "$distDir\${{ env.BINARY_NAME }}.exe"
           Set-Content -Encoding ASCII -Path "$distDir\README.txt" -Value "Run .\${{ env.BINARY_NAME }}.exe to start the local web app on http://127.0.0.1:8787/."
-          Set-Content -Encoding ASCII -Path "$distDir\start_serval_charton.bat" -Value "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"serval-charton server`" `"%~dp0${{ env.BINARY_NAME }}.exe`"`r`ntimeout /t 2 /nobreak >nul`r`nstart `"`" http://127.0.0.1:8787/ >nul 2>&1`r`n"
+          Set-Content -Encoding ASCII -Path "$distDir\start_caracal.bat" -Value "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"caracal server`" `"%~dp0${{ env.BINARY_NAME }}.exe`"`r`ntimeout /t 2 /nobreak >nul`r`nstart `"`" http://127.0.0.1:8787/ >nul 2>&1`r`n"
           Compress-Archive -Path "$distDir\*" -DestinationPath "dist/${{ matrix.artifact_name }}.zip" -Force
 
       - name: Upload binary archive
@@ -168,7 +168,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: serval-charton-*
+          pattern: caracal-*
           merge-multiple: true
 
       - name: Publish release assets
