@@ -33,7 +33,12 @@ pub fn serve(bind: SocketAddr, open_browser: bool) -> Result<()> {
         match stream {
             Ok(stream) => {
                 if let Err(error) = handle_connection(stream) {
-                    eprintln!("request handling error: {error:#}");
+                    // Browsers open several parallel/speculative connections and
+                    // close the ones they don't use; writing to those fails with
+                    // a broken pipe / reset. That is expected, not an error.
+                    if !is_benign_disconnect(&error) {
+                        eprintln!("request handling error: {error:#}");
+                    }
                 }
             }
             Err(error) => {
@@ -43,6 +48,20 @@ pub fn serve(bind: SocketAddr, open_browser: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// A client closing its connection before we finish writing is normal browser
+/// behaviour (parallel/speculative sockets), not a server error worth logging.
+fn is_benign_disconnect(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+            )
+        })
+    })
 }
 
 fn handle_connection(mut stream: TcpStream) -> Result<()> {
