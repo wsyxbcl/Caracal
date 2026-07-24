@@ -45,6 +45,13 @@ struct PathLevelOption {
 }
 
 #[derive(Serialize)]
+struct PathLevelProbe {
+    has_deployment_column: bool,
+    detected_path_index: Option<i32>,
+    path_levels: Vec<PathLevelOption>,
+}
+
+#[derive(Serialize)]
 struct DeploymentOption {
     deployment: String,
     event_count: usize,
@@ -108,6 +115,29 @@ impl WasmExplorer {
         };
 
         serde_json::to_string(&metadata).map_err(to_js_error)
+    }
+
+    /// Probe a CSV's `path` column so the UI can offer manual level selection
+    /// when automatic path derivation fails. Returns JSON with
+    /// `has_deployment_column`, `detected_path_index`, and
+    /// `path_levels: [{ index, name }]`. Errors when there is no usable `path`
+    /// column (then the UI should ask for a `deployment` column instead).
+    pub fn probe_path_levels(csv_content: String) -> Result<String, JsValue> {
+        let probe = PreparedData::probe_deploy_path(&csv_content).map_err(to_js_error)?;
+        let payload = PathLevelProbe {
+            has_deployment_column: probe.has_deployment_column,
+            detected_path_index: probe.detected_path_index,
+            path_levels: probe
+                .path_levels
+                .iter()
+                .enumerate()
+                .map(|(offset, name)| PathLevelOption {
+                    index: offset as i32 + 1,
+                    name: name.clone(),
+                })
+                .collect(),
+        };
+        serde_json::to_string(&payload).map_err(to_js_error)
     }
 
     pub fn render_overview(&self, bucket: String, theme: String) -> Result<String, JsValue> {

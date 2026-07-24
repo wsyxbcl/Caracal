@@ -154,25 +154,53 @@ impl PreparedData {
         )
     }
 
+    /// Inspect a CSV's `path` column so the UI can offer manual
+    /// deployment-path-level selection when automatic derivation fails. Errors
+    /// only when there is no usable `path` column at all (then the caller should
+    /// ask the user to add a `deployment` column instead).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn probe_deploy_path(csv_content: &str) -> Result<DeployPathProbe> {
+        let (frame, indices) = parse_frame(Cursor::new(csv_content.as_bytes()))?;
+        if indices.deployment.is_some() {
+            return Ok(DeployPathProbe {
+                has_deployment_column: true,
+                path_levels: Vec::new(),
+                detected_path_index: None,
+            });
+        }
+
+        let paths = column_string_values(&frame, indices.path)?;
+        let sample = paths
+            .iter()
+            .find(|value| !value.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("cannot derive deployment: no 'deployment' column and the 'path' column is empty")
+            })?;
+        let path_levels = get_path_levels(sample.clone());
+        if path_levels.is_empty() {
+            bail!(
+                "cannot derive deployment from path '{sample}': expected at least one directory level before the file name"
+            );
+        }
+        let detected =
+            detect_deployment_path_index(paths.iter().filter(|value| !value.trim().is_empty()));
+        Ok(DeployPathProbe {
+            has_deployment_column: false,
+            path_levels,
+            detected_path_index: detected,
+        })
+    }
+
     fn from_reader<R>(
-        mut reader: R,
+        reader: R,
         csv_path: PathBuf,
         deploy_path_index: Option<i32>,
     ) -> Result<Self>
     where
         R: Read + Seek + Send + Sync + MmapBytesReader,
     {
-        let headers = inspect_csv_headers(&mut reader)?;
-        let frame = CsvReadOptions::default()
-            .with_has_header(true)
-            .with_infer_schema_length(Some(CSV_INFER_SCHEMA_LENGTH))
-            .with_schema_overwrite(headers.schema_overwrite())
-            .into_reader_with_file_handle(reader)
-            .finish()
-            .context("failed to read CSV with Polars")?;
-        let frame = normalize_frame_headers(frame, &headers)?;
-
-        let indices = ColumnIndices::from_dataframe(&frame)?;
+        let (frame, indices) = parse_frame(reader)?;
         let (row_deployments, deployment_source) =
             resolve_deployments(&frame, &indices, deploy_path_index)?;
         let mut rows = Vec::with_capacity(frame.height());
@@ -397,6 +425,36 @@ impl ColumnIndices {
             longitude,
         })
     }
+}
+
+/// Available deployment path levels for a CSV, used to offer manual selection
+/// when automatic derivation fails.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub struct DeployPathProbe {
+    /// The CSV already has a `deployment` column, so no path level is needed.
+    pub has_deployment_column: bool,
+    /// Directory levels of a sample path, 1-based when presented to the user.
+    pub path_levels: Vec<String>,
+    /// The auto-detected best guess, if any.
+    pub detected_path_index: Option<i32>,
+}
+
+/// Read a CSV into a normalized frame plus its resolved column indices.
+fn parse_frame<R>(mut reader: R) -> Result<(DataFrame, ColumnIndices)>
+where
+    R: Read + Seek + Send + Sync + MmapBytesReader,
+{
+    let headers = inspect_csv_headers(&mut reader)?;
+    let frame = CsvReadOptions::default()
+        .with_has_header(true)
+        .with_infer_schema_length(Some(CSV_INFER_SCHEMA_LENGTH))
+        .with_schema_overwrite(headers.schema_overwrite())
+        .into_reader_with_file_handle(reader)
+        .finish()
+        .context("failed to read CSV with Polars")?;
+    let frame = normalize_frame_headers(frame, &headers)?;
+    let indices = ColumnIndices::from_dataframe(&frame)?;
+    Ok((frame, indices))
 }
 
 /// Determine each row's deployment. When the CSV has a `deployment` column it
