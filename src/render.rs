@@ -82,6 +82,21 @@ fn add_series_to_dataset(dataset: &mut Dataset, series: &Series) -> Result<()> {
                 .collect::<Vec<Option<u32>>>();
             dataset.add_column(name, values)?;
         }
+        DataType::String if name == "media_family" => {
+            // Pin image/video to a fixed categorical dictionary so they always
+            // map to the same shape (image=circle, video=square) and color,
+            // regardless of which media type appears first — or at all — in a
+            // deployment. Otherwise charton derives the shape/color domain from
+            // the column's first-seen unique values, which flips per deployment.
+            let keys = series
+                .str()
+                .with_context(|| format!("failed to read column '{name}' as String"))?
+                .into_iter()
+                .map(|value| u32::from(value == Some("video")))
+                .collect::<Vec<u32>>();
+            let dictionary = vec!["image".to_string(), "video".to_string()];
+            dataset.add_column(name, ColumnVector::from_categorical(keys, dictionary, None))?;
+        }
         DataType::String => {
             let values = series
                 .str()
