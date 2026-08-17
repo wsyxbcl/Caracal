@@ -34,6 +34,9 @@
     .group-head .actions { margin-left: auto; display: flex; gap: 8px; }
     button.mini { font: inherit; font-size: 0.82rem; border: 1px solid var(--line); background: #faf6ef; color: var(--ink); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
     button.mini:hover { border-color: var(--muted); }
+    button.mini.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .reviewed-tag { color: var(--keep); font-weight: 600; font-size: 0.85rem; margin-right: 8px; }
+    .group.done { opacity: 0.8; }
 
     .tiles { display: grid; grid-template-columns: repeat(auto-fill, 92px); gap: 8px; }
     .tile { width: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; transition: transform 0.05s; }
@@ -108,6 +111,8 @@
     const previewCanvas = $("preview-canvas");
     const previewMeta = $("preview-meta");
     const TILE = 92;
+    const DECODE_W = 1000;        // decode/downscale cap (px): big camera images decode cheap + tiny transient
+    const DECODE_CONCURRENCY = 6; // parallel decodes cap so a fast scroll doesn't fire hundreds at once
 
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     const worker = new Worker("./rde-worker.js", { type: "module" });
@@ -133,8 +138,7 @@
       fileName: null,
       options: null,
       groups: [],                      // parsed groups; instances carry `decision`
-      fileByImageIndex: new Map(),     // image_index -> picked File
-      bitmapByImageIndex: new Map(),   // image_index -> decoded ImageBitmap (cache)
+      fileByImageIndex: new Map(),     // image_index -> picked File (cheap: a disk reference)
     };
 
     // ---- 1. Load MD json -----------------------------------------------------
@@ -175,7 +179,6 @@
         // Which images are actually referenced by suspicious groups.
         const suspicious = new Set(state.groups.flatMap((g) => g.instances.map((i) => i.det_ref.image_index)));
         state.fileByImageIndex.clear();
-        state.bitmapByImageIndex.clear();
         let matched = 0, missing = 0;
         for (const idx of suspicious) {
           const m = matches[idx];
@@ -192,58 +195,58 @@
       }
     });
 
-    // ---- Review rendering ----------------------------------------------------
-    async function renderReview() {
-      const results = $("results");
-      results.innerHTML = "";
-      if (!state.groups.length) {
-        results.innerHTML = `<div class="card placeholder">No suspicious groups at the current parameters.</div>`;
-        return;
-      }
-      const pending = [];
-      for (const group of state.groups) {
-        const card = document.createElement("div");
-        card.className = "card group";
-        const box = group.rep_bbox.map((v) => v.toFixed(3)).join(", ");
-        card.innerHTML =
-          `<div class="group-head">` +
-            `<h3>${group.camera} · category ${group.category}</h3>` +
-            `<span class="meta">${group.instances.length} instances · box [${box}] · conf ${group.stats.conf_min.toFixed(2)}–${group.stats.conf_max.toFixed(2)}</span>` +
-            `<span class="actions"><button class="mini" data-act="keep">Keep all</button><button class="mini" data-act="remove">Remove all</button></span>` +
-          `</div>`;
-        const grid = document.createElement("div");
-        grid.className = "tiles";
-        card.appendChild(grid);
-
-        for (const instance of group.instances) {
-          const tile = document.createElement("div");
-          tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove");
-          const canvas = document.createElement("canvas");
-          canvas.width = TILE; canvas.height = TILE;
-          tile.appendChild(canvas);
-          tile.insertAdjacentHTML("beforeend",
-            `<span class="badge">${instance.decision === "Keep" ? "keep" : "drop"}</span>` +
-            `<span class="conf">${instance.conf.toFixed(2)}</span>`);
-          tile.addEventListener("click", () => toggleDecision(instance, tile));
-          tile.addEventListener("mouseenter", () => setPreview(instance));
-          grid.appendChild(tile);
-          pending.push(drawTile(canvas, instance));
-        }
-
-        card.querySelector('[data-act="keep"]').addEventListener("click", () => setGroupDecision(group, "Keep"));
-        card.querySelector('[data-act="remove"]').addEventListener("click", () => setGroupDecision(group, "Remove"));
-        results.appendChild(card);
-      }
-      await Promise.all(pending);
+    // ---- On-demand decode (SPEC §5) -----------------------------------------
+    // The browser decodes with its native codec; resizeWidth downscales big
+    // camera images so the decode is cheap and the transient bitmap is small.
+    // We draw only the crop (or one full-frame preview) to a canvas and close()
+    // the bitmap immediately — no full-size pixels are ever retained, and tiles
+    // decode only as they scroll into view.
+    async function decodeScaled(imageIndex) {
+      const file = state.fileByImageIndex.get(imageIndex);
+      if (!file) return null;
+      // imageOrientation:'from-image' => EXIF-upright frame (matches bbox space).
+      return createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: DECODE_W, resizeQuality: "medium" });
     }
 
-    async function drawTile(canvas, instance) {
+    let activeDecodes = 0;
+    const decodeQueue = [];
+    function scheduleDecode(task) {
+      return new Promise((resolve, reject) => {
+        decodeQueue.push({ task, resolve, reject });
+        pumpDecodes();
+      });
+    }
+    function pumpDecodes() {
+      while (activeDecodes < DECODE_CONCURRENCY && decodeQueue.length) {
+        const { task, resolve, reject } = decodeQueue.shift();
+        activeDecodes++;
+        task().then(resolve, reject).finally(() => { activeDecodes--; pumpDecodes(); });
+      }
+    }
+
+    // Decode a tile's crop only when it nears the viewport.
+    const tileObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          tileObserver.unobserve(entry.target);
+          renderTileCrop(entry.target);
+        }
+      }
+    }, { rootMargin: "300px" });
+
+    async function renderTileCrop(tile) {
+      if (tile._drawn) return;
+      const bmp = await scheduleDecode(() => decodeScaled(tile._instance.det_ref.image_index));
+      if (!bmp) return; // unmatched image -> keep placeholder
+      drawCrop(tile.querySelector("canvas"), bmp, tile._instance.bbox);
+      bmp.close();
+      tile._drawn = true;
+    }
+
+    function drawCrop(canvas, bmp, bbox) {
       const ctx = canvas.getContext("2d");
-      const bmp = await decode(instance.det_ref.image_index);
-      if (!bmp) { ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, TILE, TILE); return; }
-      const [x, y, w, h] = instance.bbox;
+      const [x, y, w, h] = bbox;
       const bx = x * bmp.width, by = y * bmp.height, bw = w * bmp.width, bh = h * bmp.height;
-      // Padded crop for context.
       const pad = 0.6;
       const cx = Math.max(0, bx - bw * pad), cy = Math.max(0, by - bh * pad);
       const cw = Math.min(bmp.width - cx, bw * (1 + 2 * pad)), ch = Math.min(bmp.height - cy, bh * (1 + 2 * pad));
@@ -251,45 +254,121 @@
       const dw = cw * scale, dh = ch * scale, dx = (TILE - dw) / 2, dy = (TILE - dh) / 2;
       ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, TILE, TILE);
       ctx.drawImage(bmp, cx, cy, cw, ch, dx, dy, dw, dh);
-      // Outline the actual detection box within the crop.
       ctx.strokeStyle = "#ffcc33"; ctx.lineWidth = 2;
       ctx.strokeRect(dx + (bx - cx) * scale, dy + (by - cy) * scale, bw * scale, bh * scale);
     }
 
-    async function decode(imageIndex) {
-      if (state.bitmapByImageIndex.has(imageIndex)) return state.bitmapByImageIndex.get(imageIndex);
-      const file = state.fileByImageIndex.get(imageIndex);
-      if (!file) return null;
-      // EXIF-upright so bbox and pixels share a frame (SPEC §5).
-      const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
-      state.bitmapByImageIndex.set(imageIndex, bmp);
-      return bmp;
+    // ---- Review rendering ----------------------------------------------------
+    function renderReview() {
+      tileObserver.disconnect();
+      const results = $("results");
+      results.innerHTML = "";
+      if (!state.groups.length) {
+        results.innerHTML = `<div class="card placeholder">No suspicious groups at the current parameters.</div>`;
+        return;
+      }
+      for (const group of state.groups) results.appendChild(renderGroup(group));
     }
 
-    // Full frame with the detection boxed, so the tiny crop is decidable in
-    // context (like the MD RDE mosaic + full-image view).
-    async function setPreview(instance) {
-      const idx = instance.det_ref.image_index;
-      const bmp = await decode(idx);
+    function renderGroup(group) {
+      const card = document.createElement("div");
+      card.className = "card group" + (group.reviewed ? " done" : "");
+      const box = group.rep_bbox.map((v) => v.toFixed(3)).join(", ");
+      const kept = group.instances.filter((i) => i.decision === "Keep").length;
+
+      const head = document.createElement("div");
+      head.className = "group-head";
+      head.innerHTML =
+        `<h3>${group.camera} · category ${group.category}</h3>` +
+        `<span class="meta">${group.instances.length} instances · box [${box}] · conf ${group.stats.conf_min.toFixed(2)}–${group.stats.conf_max.toFixed(2)}</span>`;
+      const actions = document.createElement("span");
+      actions.className = "actions";
+      head.appendChild(actions);
+      card.appendChild(head);
+
+      if (group.reviewed) {
+        // Collapsed: tiles (and their canvases) are freed; only a summary remains.
+        actions.appendChild(tag(`✓ reviewed — ${kept} kept, ${group.instances.length - kept} drop`));
+        actions.appendChild(mini("Reopen", () => replaceGroup(card, group, false)));
+        return card;
+      }
+
+      actions.appendChild(mini("Keep all", () => setGroupDecision(group, "Keep")));
+      actions.appendChild(mini("Remove all", () => setGroupDecision(group, "Remove")));
+      actions.appendChild(mini("Mark reviewed", () => replaceGroup(card, group, true), "primary"));
+
+      const grid = document.createElement("div");
+      grid.className = "tiles";
+      group._grid = grid;
+      for (const instance of group.instances) grid.appendChild(makeTile(instance));
+      card.appendChild(grid);
+      return card;
+    }
+
+    function replaceGroup(oldCard, group, reviewed) {
+      group.reviewed = reviewed;
+      oldCard.replaceWith(renderGroup(group)); // dropping the old grid frees its tile canvases
+    }
+
+    function makeTile(instance) {
+      const tile = document.createElement("div");
+      tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove");
+      tile._instance = instance;
+      const canvas = document.createElement("canvas");
+      canvas.width = TILE; canvas.height = TILE;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, TILE, TILE);
+      tile.appendChild(canvas);
+      tile.insertAdjacentHTML("beforeend",
+        `<span class="badge">${instance.decision === "Keep" ? "keep" : "drop"}</span>` +
+        `<span class="conf">${instance.conf.toFixed(2)}</span>`);
+      tile.addEventListener("click", () => toggleDecision(instance, tile));
+      tile.addEventListener("mouseenter", () => setPreview(instance));
+      tileObserver.observe(tile);
+      return tile;
+    }
+
+    function mini(label, onClick, cls) {
+      const b = document.createElement("button");
+      b.className = "mini" + (cls ? " " + cls : "");
+      b.textContent = label;
+      b.addEventListener("click", onClick);
+      return b;
+    }
+    function tag(text) {
+      const s = document.createElement("span");
+      s.className = "reviewed-tag";
+      s.textContent = text;
+      return s;
+    }
+
+    // ---- Context preview: full frame + red box, decoded on demand ------------
+    let previewToken = 0;
+    let previewTimer = 0;
+    function setPreview(instance) {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(() => drawPreview(instance), 60); // settle before decoding
+    }
+    async function drawPreview(instance) {
+      const token = ++previewToken;
       const ctx = previewCanvas.getContext("2d");
+      const bmp = await decodeScaled(instance.det_ref.image_index);
+      if (token !== previewToken) { if (bmp) bmp.close(); return; } // a newer hover won
       if (!bmp) {
         previewCanvas.width = 400; previewCanvas.height = 220;
         ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, 400, 220);
         previewMeta.textContent = "Image not loaded — load the folder to see the full frame.";
         return;
       }
-      const scale = Math.min(760 / bmp.width, 1) || 1;
-      previewCanvas.width = Math.round(bmp.width * scale);
-      previewCanvas.height = Math.round(bmp.height * scale);
-      ctx.drawImage(bmp, 0, 0, previewCanvas.width, previewCanvas.height);
+      previewCanvas.width = bmp.width; previewCanvas.height = bmp.height;
+      ctx.drawImage(bmp, 0, 0);
       const [x, y, w, h] = instance.bbox;
-      ctx.lineWidth = Math.max(2, previewCanvas.width / 240);
-      ctx.strokeStyle = "#e23b2e";
-      ctx.strokeRect(x * previewCanvas.width, y * previewCanvas.height, w * previewCanvas.width, h * previewCanvas.height);
-      const file = state.fileByImageIndex.get(idx);
+      ctx.lineWidth = Math.max(2, bmp.width / 240); ctx.strokeStyle = "#e23b2e";
+      ctx.strokeRect(x * bmp.width, y * bmp.height, w * bmp.width, h * bmp.height);
+      bmp.close();
+      const file = state.fileByImageIndex.get(instance.det_ref.image_index);
       const name = file ? (file.webkitRelativePath || file.name) : "";
-      const verdict = instance.decision === "Keep" ? "KEEP" : "will drop";
-      previewMeta.innerHTML = `<b>${verdict}</b> · conf ${instance.conf.toFixed(2)}<br>${name}`;
+      previewMeta.innerHTML = `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}<br>${name}`;
     }
 
     // ---- Decisions -----------------------------------------------------------
@@ -307,7 +386,8 @@
     }
     function setGroupDecision(group, decision) {
       group.instances.forEach((i) => (i.decision = decision));
-      renderReview();
+      // Restyle the existing tiles in place — no re-decode.
+      if (group._grid) [...group._grid.children].forEach((tile) => applyTileStyle(tile, decision));
       updateExportBar();
     }
 
@@ -344,7 +424,7 @@
       state.fileName = name;
       state.groups = [];
       state.fileByImageIndex.clear();
-      state.bitmapByImageIndex.clear();
+      tileObserver.disconnect();
       errorEl.textContent = "";
       $("results").innerHTML = "";
     }
