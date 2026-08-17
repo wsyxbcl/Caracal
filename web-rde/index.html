@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Caracal RDE (experimental)</title>
+  <style>
+    :root { --ink: #24201b; --muted: #6b6459; --line: #e7ded1; --accent: #b5502f; --bg: #fbf8f3; --card: #fff; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: var(--ink); background: var(--bg); }
+    main { max-width: 900px; margin: 0 auto; padding: 32px 20px 80px; }
+    h1 { font-size: 1.5rem; margin: 0 0 4px; }
+    .lede { color: var(--muted); margin: 0 0 24px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
+    label.file { display: inline-block; border: 1px dashed var(--accent); color: var(--accent); border-radius: 8px; padding: 12px 18px; cursor: pointer; font-weight: 600; }
+    label.file input { display: none; }
+    .metrics { display: flex; gap: 22px; margin-top: 14px; flex-wrap: wrap; }
+    .metric b { display: block; font-size: 1.3rem; }
+    .metric span { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .group { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-top: 10px; }
+    .group h3 { margin: 0 0 4px; font-size: 1rem; }
+    .group .meta { color: var(--muted); font-size: 0.88rem; }
+    code { background: #f1ece3; padding: 1px 5px; border-radius: 4px; }
+    #error { color: var(--accent); font-weight: 600; }
+    .hint { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Caracal RDE <span style="color:var(--muted);font-weight:400;font-size:1rem">· experimental</span></h1>
+    <p class="lede">Client-side repeat-detection review. Load a MegaDetector results <code>.json</code>; clustering runs in WASM, in your browser.</p>
+
+    <div class="card">
+      <label class="file">Load MegaDetector .json<input id="json-input" type="file" accept=".json,application/json" /></label>
+      <p class="hint" id="status">No file loaded.</p>
+      <div class="metrics" id="metrics" hidden>
+        <div class="metric"><b id="m-images">–</b><span>media</span></div>
+        <div class="metric"><b id="m-dets">–</b><span>detections</span></div>
+        <div class="metric"><b id="m-groups">–</b><span>suspicious groups</span></div>
+        <div class="metric"><b id="m-instances">–</b><span>flagged instances</span></div>
+      </div>
+      <p id="error"></p>
+    </div>
+
+    <div id="results"></div>
+  </main>
+
+  <script type="module">
+    import init, { RdeSession, default_options } from "./pkg/web_rde.js";
+
+    const $ = (id) => document.getElementById(id);
+    const status = $("status");
+    const errorEl = $("error");
+
+    await init();
+
+    $("json-input").addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      errorEl.textContent = "";
+      status.textContent = `Parsing ${file.name}…`;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const session = new RdeSession(bytes);
+        const groups = JSON.parse(session.find(default_options()));
+
+        const flagged = groups.reduce((n, g) => n + g.instances.length, 0);
+        $("m-images").textContent = session.image_count().toLocaleString();
+        $("m-dets").textContent = session.total_detections().toLocaleString();
+        $("m-groups").textContent = groups.length.toLocaleString();
+        $("m-instances").textContent = flagged.toLocaleString();
+        $("metrics").hidden = false;
+        status.textContent = `Loaded ${file.name}.`;
+        renderGroups(groups);
+      } catch (err) {
+        errorEl.textContent = String(err?.message || err);
+        status.textContent = "Failed to load.";
+      }
+    });
+
+    function renderGroups(groups) {
+      const results = $("results");
+      results.innerHTML = "";
+      if (!groups.length) {
+        results.innerHTML = `<div class="card">No suspicious groups at the current parameters.</div>`;
+        return;
+      }
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `<h2 style="margin-top:0">Suspicious groups</h2>`;
+      for (const g of groups) {
+        const box = g.rep_bbox.map((v) => v.toFixed(3)).join(", ");
+        const el = document.createElement("div");
+        el.className = "group";
+        el.innerHTML =
+          `<h3>${g.camera} · category ${g.category} · ${g.instances.length} instances</h3>` +
+          `<div class="meta">box [${box}] · conf ${g.stats.conf_min.toFixed(2)}–${g.stats.conf_max.toFixed(2)} (median ${g.stats.conf_median.toFixed(2)})</div>`;
+        card.appendChild(el);
+      }
+      results.appendChild(card);
+    }
+  </script>
+</body>
+</html>

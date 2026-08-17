@@ -3,6 +3,7 @@
 /.venv/
 /web/target/
 /web/pkg/
+/web-rde/pkg/
 /output/
 /dist/
 /data/*.csv
