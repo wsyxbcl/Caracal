@@ -46,13 +46,31 @@
   </main>
 
   <script type="module">
-    import init, { RdeSession, default_options } from "./pkg/web_rde.js";
-
     const $ = (id) => document.getElementById(id);
     const status = $("status");
     const errorEl = $("error");
 
-    await init();
+    // The RDE/WASM work runs in a Worker (SPEC §5.1); talk to it over a small
+    // id-keyed request/response RPC.
+    const worker = new Worker("./rde-worker.js", { type: "module" });
+    let nextId = 0;
+    const pending = new Map();
+    worker.addEventListener("message", (event) => {
+      const { id, ok, result, error } = event.data;
+      const slot = pending.get(id);
+      if (!slot) return;
+      pending.delete(id);
+      ok ? slot.resolve(result) : slot.reject(new Error(error));
+    });
+    function call(type, payload = {}, transfer = []) {
+      const id = ++nextId;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ id, type, ...payload }, transfer);
+      });
+    }
+
+    let options = null; // current RdeOptions JSON (from the worker's defaults)
 
     $("json-input").addEventListener("change", async (event) => {
       const file = event.target.files?.[0];
@@ -60,13 +78,16 @@
       errorEl.textContent = "";
       status.textContent = `Parsing ${file.name}…`;
       try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const session = new RdeSession(bytes);
-        const groups = JSON.parse(session.find(default_options()));
+        const buffer = await file.arrayBuffer();
+        const loaded = await call("load", { bytes: buffer }, [buffer]);
+        options = loaded.defaultOptions;
+
+        const { groups: groupsJson } = await call("find", { options });
+        const groups = JSON.parse(groupsJson);
 
         const flagged = groups.reduce((n, g) => n + g.instances.length, 0);
-        $("m-images").textContent = session.image_count().toLocaleString();
-        $("m-dets").textContent = session.total_detections().toLocaleString();
+        $("m-images").textContent = loaded.imageCount.toLocaleString();
+        $("m-dets").textContent = loaded.totalDetections.toLocaleString();
         $("m-groups").textContent = groups.length.toLocaleString();
         $("m-instances").textContent = flagged.toLocaleString();
         $("metrics").hidden = false;
