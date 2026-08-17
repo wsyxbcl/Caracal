@@ -3,7 +3,7 @@
 // request/response over structured-clone messages; only bytes and small JSON
 // DTOs cross the boundary (never shared pointers).
 
-import init, { RdeSession, default_options } from "./pkg/web_rde.js";
+import init, { RdeSession, default_options, match_paths } from "./pkg/web_rde.js";
 
 const ready = init();
 let session = null;
@@ -27,6 +27,17 @@ self.onmessage = async (event) => {
         requireSession();
         // find() returns a JSON string; keep it a string across the boundary.
         reply(id, { groups: session.find(event.data.options) });
+        break;
+      }
+      case "match": {
+        requireSession();
+        // Resolve json image paths to the picked files (SPEC §6.2). The json
+        // paths stay inside the worker; only picked paths + results cross.
+        const matches = match_paths(
+          session.image_files(),
+          JSON.stringify(event.data.pickedPaths),
+        );
+        reply(id, { matches });
         break;
       }
       case "export": {

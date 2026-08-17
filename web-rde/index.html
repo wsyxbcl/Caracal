@@ -5,39 +5,70 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Caracal RDE (experimental)</title>
   <style>
-    :root { --ink: #24201b; --muted: #6b6459; --line: #e7ded1; --accent: #b5502f; --bg: #fbf8f3; --card: #fff; }
+    :root {
+      --ink: #24201b; --muted: #6b6459; --line: #e7ded1; --accent: #b5502f;
+      --bg: #fbf8f3; --card: #fff; --keep: #2f9e5b; --remove: #c0563a;
+    }
     * { box-sizing: border-box; }
     body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: var(--ink); background: var(--bg); }
-    main { max-width: 900px; margin: 0 auto; padding: 32px 20px 80px; }
+    main { max-width: 1080px; margin: 0 auto; padding: 28px 20px 120px; }
     h1 { font-size: 1.5rem; margin: 0 0 4px; }
-    .lede { color: var(--muted); margin: 0 0 24px; }
-    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
-    label.file { display: inline-block; border: 1px dashed var(--accent); color: var(--accent); border-radius: 8px; padding: 12px 18px; cursor: pointer; font-weight: 600; }
+    h2 { font-size: 1.05rem; margin: 0 0 10px; }
+    .lede { color: var(--muted); margin: 0 0 22px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+    .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+    label.file { display: inline-block; border: 1px dashed var(--accent); color: var(--accent); border-radius: 8px; padding: 11px 16px; cursor: pointer; font-weight: 600; }
+    label.file.disabled { opacity: 0.4; pointer-events: none; }
     label.file input { display: none; }
     .metrics { display: flex; gap: 22px; margin-top: 14px; flex-wrap: wrap; }
-    .metric b { display: block; font-size: 1.3rem; }
-    .metric span { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
-    .group { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-top: 10px; }
-    .group h3 { margin: 0 0 4px; font-size: 1rem; }
-    .group .meta { color: var(--muted); font-size: 0.88rem; }
-    code { background: #f1ece3; padding: 1px 5px; border-radius: 4px; }
+    .metric b { display: block; font-size: 1.25rem; }
+    .metric span { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .hint { color: var(--muted); font-size: 0.85rem; }
     #error { color: var(--accent); font-weight: 600; }
-    .hint { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
+    code { background: #f1ece3; padding: 1px 5px; border-radius: 4px; }
+
+    .group { margin-bottom: 16px; }
+    .group-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+    .group-head h3 { margin: 0; font-size: 1rem; }
+    .group-head .meta { color: var(--muted); font-size: 0.85rem; }
+    .group-head .actions { margin-left: auto; display: flex; gap: 8px; }
+    button.mini { font: inherit; font-size: 0.82rem; border: 1px solid var(--line); background: #faf6ef; color: var(--ink); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+    button.mini:hover { border-color: var(--muted); }
+
+    .tiles { display: grid; grid-template-columns: repeat(auto-fill, 92px); gap: 8px; }
+    .tile { width: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; transition: transform 0.05s; }
+    .tile canvas { display: block; width: 92px; height: 92px; }
+    .tile.remove { opacity: 0.5; }
+    .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
+    .tile:hover { transform: translateY(-1px); }
+    .tile .badge { position: absolute; top: 3px; right: 3px; font-size: 11px; font-weight: 700; color: #fff; border-radius: 4px; padding: 1px 5px; }
+    .tile.remove .badge { background: var(--remove); }
+    .tile.keep .badge { background: var(--keep); }
+    .tile .conf { position: absolute; bottom: 0; left: 0; right: 0; font-size: 10px; color: #fff; background: rgba(0,0,0,0.5); text-align: center; }
+
+    .exportbar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 16px; align-items: center; justify-content: center; }
+    .exportbar button { font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; }
+    .exportbar button:disabled { opacity: 0.4; cursor: default; }
+    .exportbar .summary { color: var(--muted); font-size: 0.9rem; }
+    .placeholder { color: var(--muted); font-size: 0.85rem; padding: 14px 0; }
   </style>
 </head>
 <body>
   <main>
     <h1>Caracal RDE <span style="color:var(--muted);font-weight:400;font-size:1rem">· experimental</span></h1>
-    <p class="lede">Client-side repeat-detection review. Load a MegaDetector results <code>.json</code>; clustering runs in WASM, in your browser.</p>
+    <p class="lede">Client-side repeat-detection review. Everything runs in your browser — the json and images never leave your device.</p>
 
     <div class="card">
-      <label class="file">Load MegaDetector .json<input id="json-input" type="file" accept=".json,application/json" /></label>
-      <p class="hint" id="status">No file loaded.</p>
+      <div class="row">
+        <label class="file">1 · Load MegaDetector .json<input id="json-input" type="file" accept=".json,application/json" /></label>
+        <label class="file disabled" id="folder-label">2 · Load image folder<input id="folder-input" type="file" webkitdirectory directory multiple /></label>
+      </div>
+      <p class="hint" id="status">Load a MegaDetector results .json to begin.</p>
       <div class="metrics" id="metrics" hidden>
         <div class="metric"><b id="m-images">–</b><span>media</span></div>
         <div class="metric"><b id="m-dets">–</b><span>detections</span></div>
         <div class="metric"><b id="m-groups">–</b><span>suspicious groups</span></div>
-        <div class="metric"><b id="m-instances">–</b><span>flagged instances</span></div>
+        <div class="metric"><b id="m-matched">–</b><span>images matched</span></div>
       </div>
       <p id="error"></p>
     </div>
@@ -45,13 +76,18 @@
     <div id="results"></div>
   </main>
 
+  <div class="exportbar">
+    <span class="summary" id="export-summary">No document loaded.</span>
+    <button id="export-btn" disabled>Export filtered .json</button>
+  </div>
+
   <script type="module">
     const $ = (id) => document.getElementById(id);
     const status = $("status");
     const errorEl = $("error");
+    const TILE = 92;
 
-    // The RDE/WASM work runs in a Worker (SPEC §5.1); talk to it over a small
-    // id-keyed request/response RPC.
+    // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     const worker = new Worker("./rde-worker.js", { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -70,55 +106,201 @@
       });
     }
 
-    let options = null; // current RdeOptions JSON (from the worker's defaults)
+    // ---- State ---------------------------------------------------------------
+    const state = {
+      fileName: null,
+      options: null,
+      groups: [],                      // parsed groups; instances carry `decision`
+      fileByImageIndex: new Map(),     // image_index -> picked File
+      bitmapByImageIndex: new Map(),   // image_index -> decoded ImageBitmap (cache)
+    };
 
+    // ---- 1. Load MD json -----------------------------------------------------
     $("json-input").addEventListener("change", async (event) => {
       const file = event.target.files?.[0];
       if (!file) return;
-      errorEl.textContent = "";
+      resetForNewJson(file.name);
       status.textContent = `Parsing ${file.name}…`;
       try {
         const buffer = await file.arrayBuffer();
         const loaded = await call("load", { bytes: buffer }, [buffer]);
-        options = loaded.defaultOptions;
+        state.options = loaded.defaultOptions;
+        state.groups = JSON.parse((await call("find", { options: state.options })).groups);
 
-        const { groups: groupsJson } = await call("find", { options });
-        const groups = JSON.parse(groupsJson);
-
-        const flagged = groups.reduce((n, g) => n + g.instances.length, 0);
         $("m-images").textContent = loaded.imageCount.toLocaleString();
         $("m-dets").textContent = loaded.totalDetections.toLocaleString();
-        $("m-groups").textContent = groups.length.toLocaleString();
-        $("m-instances").textContent = flagged.toLocaleString();
+        $("m-groups").textContent = state.groups.length.toLocaleString();
+        $("m-matched").textContent = "0";
         $("metrics").hidden = false;
-        status.textContent = `Loaded ${file.name}.`;
-        renderGroups(groups);
+        $("folder-label").classList.remove("disabled");
+        status.textContent = `Loaded ${file.name}. ${state.groups.length} suspicious group(s). Load the image folder to review crops.`;
+        renderReview();
+        updateExportBar();
       } catch (err) {
-        errorEl.textContent = String(err?.message || err);
-        status.textContent = "Failed to load.";
+        showError(err);
       }
     });
 
-    function renderGroups(groups) {
+    // ---- 2. Load image folder + match + decode -------------------------------
+    $("folder-input").addEventListener("change", async (event) => {
+      const files = [...(event.target.files || [])];
+      if (!files.length) return;
+      status.textContent = `Matching ${files.length} files…`;
+      try {
+        const pickedPaths = files.map((f) => f.webkitRelativePath || f.name);
+        const matches = JSON.parse((await call("match", { pickedPaths })).matches);
+
+        // Which images are actually referenced by suspicious groups.
+        const suspicious = new Set(state.groups.flatMap((g) => g.instances.map((i) => i.det_ref.image_index)));
+        state.fileByImageIndex.clear();
+        state.bitmapByImageIndex.clear();
+        let matched = 0, missing = 0;
+        for (const idx of suspicious) {
+          const m = matches[idx];
+          if (m && m.status === "matched") { state.fileByImageIndex.set(idx, files[m.picked_index]); matched++; }
+          else missing++;
+        }
+        $("m-matched").textContent = `${matched}/${suspicious.size}`;
+        status.textContent = missing
+          ? `${matched} of ${suspicious.size} suspicious images matched — ${missing} missing/ambiguous (their tiles stay blank).`
+          : `All ${matched} suspicious images matched. Click tiles to keep the real ones.`;
+        await renderReview(); // now with crops
+      } catch (err) {
+        showError(err);
+      }
+    });
+
+    // ---- Review rendering ----------------------------------------------------
+    async function renderReview() {
       const results = $("results");
       results.innerHTML = "";
-      if (!groups.length) {
-        results.innerHTML = `<div class="card">No suspicious groups at the current parameters.</div>`;
+      if (!state.groups.length) {
+        results.innerHTML = `<div class="card placeholder">No suspicious groups at the current parameters.</div>`;
         return;
       }
-      const card = document.createElement("div");
-      card.className = "card";
-      card.innerHTML = `<h2 style="margin-top:0">Suspicious groups</h2>`;
-      for (const g of groups) {
-        const box = g.rep_bbox.map((v) => v.toFixed(3)).join(", ");
-        const el = document.createElement("div");
-        el.className = "group";
-        el.innerHTML =
-          `<h3>${g.camera} · category ${g.category} · ${g.instances.length} instances</h3>` +
-          `<div class="meta">box [${box}] · conf ${g.stats.conf_min.toFixed(2)}–${g.stats.conf_max.toFixed(2)} (median ${g.stats.conf_median.toFixed(2)})</div>`;
-        card.appendChild(el);
+      const pending = [];
+      for (const group of state.groups) {
+        const card = document.createElement("div");
+        card.className = "card group";
+        const box = group.rep_bbox.map((v) => v.toFixed(3)).join(", ");
+        card.innerHTML =
+          `<div class="group-head">` +
+            `<h3>${group.camera} · category ${group.category}</h3>` +
+            `<span class="meta">${group.instances.length} instances · box [${box}] · conf ${group.stats.conf_min.toFixed(2)}–${group.stats.conf_max.toFixed(2)}</span>` +
+            `<span class="actions"><button class="mini" data-act="keep">Keep all</button><button class="mini" data-act="remove">Remove all</button></span>` +
+          `</div>`;
+        const grid = document.createElement("div");
+        grid.className = "tiles";
+        card.appendChild(grid);
+
+        for (const instance of group.instances) {
+          const tile = document.createElement("div");
+          tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove");
+          const canvas = document.createElement("canvas");
+          canvas.width = TILE; canvas.height = TILE;
+          tile.appendChild(canvas);
+          tile.insertAdjacentHTML("beforeend",
+            `<span class="badge">${instance.decision === "Keep" ? "keep" : "drop"}</span>` +
+            `<span class="conf">${instance.conf.toFixed(2)}</span>`);
+          tile.addEventListener("click", () => toggleDecision(instance, tile));
+          grid.appendChild(tile);
+          pending.push(drawTile(canvas, instance));
+        }
+
+        card.querySelector('[data-act="keep"]').addEventListener("click", () => setGroupDecision(group, "Keep"));
+        card.querySelector('[data-act="remove"]').addEventListener("click", () => setGroupDecision(group, "Remove"));
+        results.appendChild(card);
       }
-      results.appendChild(card);
+      await Promise.all(pending);
+    }
+
+    async function drawTile(canvas, instance) {
+      const ctx = canvas.getContext("2d");
+      const bmp = await decode(instance.det_ref.image_index);
+      if (!bmp) { ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, TILE, TILE); return; }
+      const [x, y, w, h] = instance.bbox;
+      const bx = x * bmp.width, by = y * bmp.height, bw = w * bmp.width, bh = h * bmp.height;
+      // Padded crop for context.
+      const pad = 0.6;
+      const cx = Math.max(0, bx - bw * pad), cy = Math.max(0, by - bh * pad);
+      const cw = Math.min(bmp.width - cx, bw * (1 + 2 * pad)), ch = Math.min(bmp.height - cy, bh * (1 + 2 * pad));
+      const scale = Math.min(TILE / cw, TILE / ch);
+      const dw = cw * scale, dh = ch * scale, dx = (TILE - dw) / 2, dy = (TILE - dh) / 2;
+      ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, TILE, TILE);
+      ctx.drawImage(bmp, cx, cy, cw, ch, dx, dy, dw, dh);
+      // Outline the actual detection box within the crop.
+      ctx.strokeStyle = "#ffcc33"; ctx.lineWidth = 2;
+      ctx.strokeRect(dx + (bx - cx) * scale, dy + (by - cy) * scale, bw * scale, bh * scale);
+    }
+
+    async function decode(imageIndex) {
+      if (state.bitmapByImageIndex.has(imageIndex)) return state.bitmapByImageIndex.get(imageIndex);
+      const file = state.fileByImageIndex.get(imageIndex);
+      if (!file) return null;
+      // EXIF-upright so bbox and pixels share a frame (SPEC §5).
+      const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+      state.bitmapByImageIndex.set(imageIndex, bmp);
+      return bmp;
+    }
+
+    // ---- Decisions -----------------------------------------------------------
+    function applyTileStyle(tile, decision) {
+      const keep = decision === "Keep";
+      tile.classList.toggle("keep", keep);
+      tile.classList.toggle("remove", !keep);
+      tile.querySelector(".badge").textContent = keep ? "keep" : "drop";
+    }
+    function toggleDecision(instance, tile) {
+      instance.decision = instance.decision === "Keep" ? "Remove" : "Keep";
+      applyTileStyle(tile, instance.decision);
+      updateExportBar();
+    }
+    function setGroupDecision(group, decision) {
+      group.instances.forEach((i) => (i.decision = decision));
+      renderReview();
+      updateExportBar();
+    }
+
+    // ---- Export --------------------------------------------------------------
+    function removalRefs() {
+      const refs = [];
+      for (const g of state.groups) for (const i of g.instances) if (i.decision === "Remove") refs.push(i.det_ref);
+      return refs;
+    }
+    function updateExportBar() {
+      const n = removalRefs().length;
+      $("export-summary").textContent = state.fileName
+        ? `Will remove ${n} detection(s) from ${state.fileName}.`
+        : "No document loaded.";
+      $("export-btn").disabled = !state.fileName;
+    }
+    $("export-btn").addEventListener("click", async () => {
+      try {
+        const { bytes } = await call("export", { removeRefs: JSON.stringify(removalRefs()) });
+        const blob = new Blob([bytes], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = (state.fileName?.replace(/\.json$/i, "") || "md") + "_rde.json";
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        showError(err);
+      }
+    });
+
+    // ---- Helpers -------------------------------------------------------------
+    function resetForNewJson(name) {
+      state.fileName = name;
+      state.groups = [];
+      state.fileByImageIndex.clear();
+      state.bitmapByImageIndex.clear();
+      errorEl.textContent = "";
+      $("results").innerHTML = "";
+    }
+    function showError(err) {
+      errorEl.textContent = String(err?.message || err);
+      status.textContent = "Something went wrong.";
     }
   </script>
 </body>
