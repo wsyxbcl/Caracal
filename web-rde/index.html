@@ -11,7 +11,7 @@
     }
     * { box-sizing: border-box; }
     body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: var(--ink); background: var(--bg); }
-    main { max-width: 1080px; margin: 0 auto; padding: 28px 20px 120px; }
+    main { max-width: 1280px; margin: 0 auto; padding: 28px 20px 120px; }
     h1 { font-size: 1.5rem; margin: 0 0 4px; }
     h2 { font-size: 1.05rem; margin: 0 0 10px; }
     .lede { color: var(--muted); margin: 0 0 22px; }
@@ -46,6 +46,19 @@
     .tile.keep .badge { background: var(--keep); }
     .tile .conf { position: absolute; bottom: 0; left: 0; right: 0; font-size: 10px; color: #fff; background: rgba(0,0,0,0.5); text-align: center; }
 
+    .workspace { display: flex; gap: 20px; align-items: flex-start; }
+    .review { flex: 1 1 auto; min-width: 0; }
+    .preview { flex: 0 0 400px; position: sticky; top: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+    .preview h2 { font-size: 0.95rem; margin: 0 0 10px; }
+    .preview canvas { width: 100%; height: auto; max-height: 62vh; object-fit: contain; border-radius: 6px; background: #efe9df; display: block; }
+    .preview-meta { color: var(--muted); font-size: 0.82rem; margin: 10px 0 0; word-break: break-all; }
+    .preview-meta b { color: var(--ink); }
+    @media (max-width: 980px) {
+      .workspace { flex-direction: column; }
+      .preview { position: static; flex-basis: auto; width: 100%; }
+      .preview canvas { max-height: none; }
+    }
+
     .exportbar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 16px; align-items: center; justify-content: center; }
     .exportbar button { font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; }
     .exportbar button:disabled { opacity: 0.4; cursor: default; }
@@ -73,7 +86,14 @@
       <p id="error"></p>
     </div>
 
-    <div id="results"></div>
+    <div class="workspace">
+      <div class="review"><div id="results"></div></div>
+      <aside class="preview">
+        <h2>In context</h2>
+        <canvas id="preview-canvas" width="400" height="220"></canvas>
+        <p class="preview-meta" id="preview-meta">Hover a tile to see it in the full frame, with the detection boxed.</p>
+      </aside>
+    </div>
   </main>
 
   <div class="exportbar">
@@ -85,6 +105,8 @@
     const $ = (id) => document.getElementById(id);
     const status = $("status");
     const errorEl = $("error");
+    const previewCanvas = $("preview-canvas");
+    const previewMeta = $("preview-meta");
     const TILE = 92;
 
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
@@ -203,6 +225,7 @@
             `<span class="badge">${instance.decision === "Keep" ? "keep" : "drop"}</span>` +
             `<span class="conf">${instance.conf.toFixed(2)}</span>`);
           tile.addEventListener("click", () => toggleDecision(instance, tile));
+          tile.addEventListener("mouseenter", () => setPreview(instance));
           grid.appendChild(tile);
           pending.push(drawTile(canvas, instance));
         }
@@ -243,6 +266,32 @@
       return bmp;
     }
 
+    // Full frame with the detection boxed, so the tiny crop is decidable in
+    // context (like the MD RDE mosaic + full-image view).
+    async function setPreview(instance) {
+      const idx = instance.det_ref.image_index;
+      const bmp = await decode(idx);
+      const ctx = previewCanvas.getContext("2d");
+      if (!bmp) {
+        previewCanvas.width = 400; previewCanvas.height = 220;
+        ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, 400, 220);
+        previewMeta.textContent = "Image not loaded — load the folder to see the full frame.";
+        return;
+      }
+      const scale = Math.min(760 / bmp.width, 1) || 1;
+      previewCanvas.width = Math.round(bmp.width * scale);
+      previewCanvas.height = Math.round(bmp.height * scale);
+      ctx.drawImage(bmp, 0, 0, previewCanvas.width, previewCanvas.height);
+      const [x, y, w, h] = instance.bbox;
+      ctx.lineWidth = Math.max(2, previewCanvas.width / 240);
+      ctx.strokeStyle = "#e23b2e";
+      ctx.strokeRect(x * previewCanvas.width, y * previewCanvas.height, w * previewCanvas.width, h * previewCanvas.height);
+      const file = state.fileByImageIndex.get(idx);
+      const name = file ? (file.webkitRelativePath || file.name) : "";
+      const verdict = instance.decision === "Keep" ? "KEEP" : "will drop";
+      previewMeta.innerHTML = `<b>${verdict}</b> · conf ${instance.conf.toFixed(2)}<br>${name}`;
+    }
+
     // ---- Decisions -----------------------------------------------------------
     function applyTileStyle(tile, decision) {
       const keep = decision === "Keep";
@@ -253,6 +302,7 @@
     function toggleDecision(instance, tile) {
       instance.decision = instance.decision === "Keep" ? "Remove" : "Keep";
       applyTileStyle(tile, instance.decision);
+      setPreview(instance);
       updateExportBar();
     }
     function setGroupDecision(group, decision) {
