@@ -86,6 +86,7 @@
         <div class="metric"><b id="m-groups">–</b><span>suspicious groups</span></div>
         <div class="metric"><b id="m-matched">–</b><span>images matched</span></div>
       </div>
+      <p class="hint" id="decode-progress"></p>
       <p id="error"></p>
     </div>
 
@@ -146,12 +147,17 @@
       const file = event.target.files?.[0];
       if (!file) return;
       resetForNewJson(file.name);
-      status.textContent = `Parsing ${file.name}…`;
+      status.textContent = `Parsing ${file.name} (${(file.size / 1e6).toFixed(1)} MB)…`;
       try {
         const buffer = await file.arrayBuffer();
+        const tParse = performance.now();
         const loaded = await call("load", { bytes: buffer }, [buffer]);
+        console.log(`[rde] parse: ${Math.round(performance.now() - tParse)} ms (${loaded.imageCount} media, ${loaded.totalDetections} detections)`);
         state.options = loaded.defaultOptions;
+        status.textContent = `Clustering ${loaded.totalDetections.toLocaleString()} detections…`;
+        const tFind = performance.now();
         state.groups = JSON.parse((await call("find", { options: state.options })).groups);
+        console.log(`[rde] cluster: ${Math.round(performance.now() - tFind)} ms (${state.groups.length} groups)`);
         openGroup = state.groups[0] || null; // open the first group; the rest stay collapsed
 
         $("m-images").textContent = loaded.imageCount.toLocaleString();
@@ -170,12 +176,18 @@
 
     // ---- 2. Load image folder + match + decode -------------------------------
     $("folder-input").addEventListener("change", async (event) => {
+      // NB: the browser has already enumerated the whole folder tree by the time
+      // this fires — for a huge folder on a slow HDD, that enumeration (not our
+      // code) is the long freeze before this point.
       const files = [...(event.target.files || [])];
       if (!files.length) return;
-      status.textContent = `Matching ${files.length} files…`;
+      const t0 = performance.now();
+      status.textContent = `Read ${files.length.toLocaleString()} files. Matching to the json…`;
+      await new Promise((r) => requestAnimationFrame(r)); // let the status paint first
       try {
         const pickedPaths = files.map((f) => f.webkitRelativePath || f.name);
         const matches = JSON.parse((await call("match", { pickedPaths })).matches);
+        console.log(`[rde] folder read+match: ${files.length} files in ${Math.round(performance.now() - t0)} ms`);
 
         // Which images are actually referenced by suspicious groups.
         const suspicious = new Set(state.groups.flatMap((g) => g.instances.map((i) => i.det_ref.image_index)));
@@ -221,8 +233,13 @@
       while (activeDecodes < DECODE_CONCURRENCY && decodeQueue.length) {
         const { task, resolve, reject } = decodeQueue.shift();
         activeDecodes++;
-        task().then(resolve, reject).finally(() => { activeDecodes--; pumpDecodes(); });
+        task().then(resolve, reject).finally(() => { activeDecodes--; updateDecodeProgress(); pumpDecodes(); });
       }
+      updateDecodeProgress();
+    }
+    function updateDecodeProgress() {
+      const pending = activeDecodes + decodeQueue.length;
+      $("decode-progress").textContent = pending ? `Loading crops… ${pending} queued` : "";
     }
 
     // Decode a tile's crop only when it nears the viewport.
@@ -238,7 +255,8 @@
     async function renderTileCrop(tile) {
       if (tile._drawn || tile._decoding) return;
       tile._decoding = true;
-      const bmp = await scheduleDecode(() => decodeScaled(tile._instance.det_ref.image_index));
+      // Skip if the tile was removed (group collapsed) before its turn came up.
+      const bmp = await scheduleDecode(() => (tile.isConnected ? decodeScaled(tile._instance.det_ref.image_index) : null));
       tile._decoding = false;
       if (!bmp) return; // unmatched image -> keep the div's placeholder background
       // Allocate the canvas only now (on scroll-in), not for all 18k tiles up front.

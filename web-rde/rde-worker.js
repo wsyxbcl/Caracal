@@ -15,7 +15,9 @@ self.onmessage = async (event) => {
     switch (type) {
       case "load": {
         // `bytes` arrives as a transferred ArrayBuffer (zero-copy, SPEC §2.1).
+        const t = performance.now();
         session = new RdeSession(new Uint8Array(event.data.bytes));
+        console.log(`[rde/worker] parse: ${Math.round(performance.now() - t)} ms`);
         reply(id, {
           imageCount: session.image_count(),
           totalDetections: session.total_detections(),
@@ -25,18 +27,23 @@ self.onmessage = async (event) => {
       }
       case "find": {
         requireSession();
+        const t = performance.now();
         // find() returns a JSON string; keep it a string across the boundary.
-        reply(id, { groups: session.find(event.data.options) });
+        const groups = session.find(event.data.options);
+        console.log(`[rde/worker] cluster: ${Math.round(performance.now() - t)} ms`);
+        reply(id, { groups });
         break;
       }
       case "match": {
         requireSession();
+        const t = performance.now();
         // Resolve json image paths to the picked files (SPEC §6.2). The json
         // paths stay inside the worker; only picked paths + results cross.
         const matches = match_paths(
           session.image_files(),
           JSON.stringify(event.data.pickedPaths),
         );
+        console.log(`[rde/worker] match: ${Math.round(performance.now() - t)} ms`);
         reply(id, { matches });
         break;
       }
