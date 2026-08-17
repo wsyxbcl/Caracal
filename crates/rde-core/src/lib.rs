@@ -1,0 +1,388 @@
+//! Caracal RDE core — the repeat-detection-elimination algorithm, independent of
+//! browser/media I/O so it runs in WASM or natively (and is tested natively).
+//!
+//! It reproduces the reference `find` step in
+//! `MegaDetector/rde-lab/demo/verify_rde.py` (SPEC §3): per camera, cluster
+//! candidate detections by IoU and flag any location group that recurs across at
+//! least `occurrence_threshold` distinct images.
+//!
+//! The original MegaDetector document is held complete and immutable (SPEC §6.1);
+//! export applies a removal mask to *that* document (§6.3) so unknown/future/video
+//! fields survive untouched — it never rebuilds the document from the projection.
+
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+/// Normalized bounding box `[x, y, w, h]`, origin top-left, each in `[0, 1]`.
+pub type BBox = [f32; 4];
+
+/// Upstream `RepeatDetectionOptions` (SPEC §3 defaults).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RdeOptions {
+    /// Confidence band considered (inclusive).
+    pub confidence_min: f32,
+    pub confidence_max: f32,
+    /// Distinct-image repeats before a location is "suspicious".
+    pub occurrence_threshold: usize,
+    /// How identical two boxes must be to count as the same location.
+    pub iou_threshold: f32,
+    /// Ignore boxes whose area (w·h) is outside this band.
+    pub min_suspicious_size: f32,
+    pub max_suspicious_size: f32,
+    /// Which folder level (from the leaf) identifies one camera.
+    pub n_dir_levels_from_leaf: usize,
+    /// Compare boxes across detection categories, or keep categories separate.
+    pub category_agnostic: bool,
+}
+
+impl Default for RdeOptions {
+    fn default() -> Self {
+        Self {
+            confidence_min: 0.1,
+            confidence_max: 1.0,
+            occurrence_threshold: 20,
+            iou_threshold: 0.9,
+            min_suspicious_size: 0.0,
+            max_suspicious_size: 0.2,
+            n_dir_levels_from_leaf: 0,
+            category_agnostic: false,
+        }
+    }
+}
+
+/// Stable coordinates of one detection inside the original MD document:
+/// `images[image_index].detections[detection_index]`. Invariant across
+/// re-clustering, so a saved review round-trips against the same document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DetRef {
+    pub image_index: usize,
+    pub detection_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Decision {
+    /// A suspicious instance is a removal candidate by default (SPEC §4/§6.1).
+    #[default]
+    Remove,
+    Keep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Instance {
+    pub det_ref: DetRef,
+    pub bbox: BBox,
+    pub conf: f32,
+    pub decision: Decision,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupStats {
+    pub count: usize,
+    pub conf_min: f32,
+    pub conf_median: f32,
+    pub conf_max: f32,
+}
+
+/// A cluster of near-identical boxes from one camera that recurs often enough to
+/// be suspicious. Instances default to `Remove`; review flips reals to `Keep`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspiciousGroup {
+    pub id: usize,
+    pub camera: String,
+    /// The category of this group. Under `category_agnostic` this is the
+    /// representative instance's category (instances may then differ).
+    pub category: String,
+    pub rep_bbox: BBox,
+    pub instances: Vec<Instance>,
+    pub stats: GroupStats,
+}
+
+/// Errors from parsing an MD document.
+#[derive(Debug)]
+pub enum RdeError {
+    Json(serde_json::Error),
+    Schema(String),
+}
+
+impl std::fmt::Display for RdeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RdeError::Json(error) => write!(f, "invalid MegaDetector json: {error}"),
+            RdeError::Schema(message) => write!(f, "unexpected MegaDetector json: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RdeError {}
+
+impl From<serde_json::Error> for RdeError {
+    fn from(error: serde_json::Error) -> Self {
+        RdeError::Json(error)
+    }
+}
+
+/// The parsed MegaDetector document, kept complete and immutable (SPEC §6.1).
+/// Backed by `serde_json::Value` with `preserve_order`, so an export preserves
+/// unknown/future/video fields and their order.
+#[derive(Debug, Clone)]
+pub struct MdDocument {
+    root: serde_json::Value,
+}
+
+impl MdDocument {
+    /// Parse raw bytes (e.g. a `File` `ArrayBuffer`, avoiding a JS-string copy).
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, RdeError> {
+        let root: serde_json::Value = serde_json::from_slice(bytes)?;
+        if !root.get("images").map(|v| v.is_array()).unwrap_or(false) {
+            return Err(RdeError::Schema("missing top-level 'images' array".into()));
+        }
+        Ok(Self { root })
+    }
+
+    pub fn images(&self) -> &[serde_json::Value] {
+        self.root
+            .get("images")
+            .and_then(|v| v.as_array())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Total detections across all images (for export accounting).
+    pub fn total_detections(&self) -> usize {
+        self.images()
+            .iter()
+            .filter_map(|image| image.get("detections").and_then(|d| d.as_array()))
+            .map(|d| d.len())
+            .sum()
+    }
+
+    /// The underlying document (read-only).
+    pub fn value(&self) -> &serde_json::Value {
+        &self.root
+    }
+
+    pub fn to_json_vec(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.root).expect("Value re-serializes")
+    }
+
+    pub fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(&self.root).expect("Value re-serializes")
+    }
+}
+
+/// Camera = the folder `2 + n_dir_levels_from_leaf` components from the end of
+/// the path (matches `verify_rde.py::camera_of` and our `camera_site_from_path`).
+fn camera_of(path: &str, n_dir_levels_from_leaf: usize) -> &str {
+    // Splitting on both separators is equivalent to normalizing '\' -> '/' first.
+    let parts: Vec<&str> = path.split(['/', '\\']).collect();
+    let want = 2 + n_dir_levels_from_leaf;
+    if parts.len() >= want {
+        parts[parts.len() - want]
+    } else {
+        // Path too shallow for that folder level; fall back to the leftmost part.
+        parts.first().copied().unwrap_or("")
+    }
+}
+
+/// Intersection-over-union of two normalized `[x, y, w, h]` boxes.
+fn iou(a: &BBox, b: &BBox) -> f32 {
+    let ix0 = a[0].max(b[0]);
+    let iy0 = a[1].max(b[1]);
+    let ix1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let iy1 = (a[1] + a[3]).min(b[1] + b[3]);
+    let iw = (ix1 - ix0).max(0.0);
+    let ih = (iy1 - iy0).max(0.0);
+    let inter = iw * ih;
+    let union = a[2] * a[3] + b[2] * b[3] - inter;
+    if union > 0.0 {
+        inter / union
+    } else {
+        0.0
+    }
+}
+
+fn parse_bbox(det: &serde_json::Value) -> Option<BBox> {
+    let arr = det.get("bbox")?.as_array()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut bbox = [0.0f32; 4];
+    for (i, value) in arr.iter().enumerate() {
+        bbox[i] = value.as_f64()? as f32;
+    }
+    Some(bbox)
+}
+
+fn group_stats(members: &[Instance]) -> GroupStats {
+    let mut confs: Vec<f32> = members.iter().map(|m| m.conf).collect();
+    confs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let count = confs.len();
+    let conf_min = confs.first().copied().unwrap_or(0.0);
+    let conf_max = confs.last().copied().unwrap_or(0.0);
+    let conf_median = if count == 0 {
+        0.0
+    } else if count % 2 == 1 {
+        confs[count / 2]
+    } else {
+        (confs[count / 2 - 1] + confs[count / 2]) / 2.0
+    };
+    GroupStats {
+        count,
+        conf_min,
+        conf_median,
+        conf_max,
+    }
+}
+
+// A growing cluster during the find pass. `rep` is fixed to the first member's
+// box (matching the reference), so cluster membership is order-stable.
+struct Cluster {
+    camera: String,
+    category: String,
+    rep: BBox,
+    members: Vec<Instance>,
+    images: HashSet<usize>,
+}
+
+/// Find suspicious detection groups (SPEC §3). Detections from different cameras
+/// are never compared; unless `category_agnostic`, neither are different
+/// categories. Groups are returned in a deterministic order with assigned ids.
+pub fn find_suspicious(doc: &MdDocument, opts: &RdeOptions) -> Vec<SuspiciousGroup> {
+    let mut clusters: Vec<Cluster> = Vec::new();
+
+    for (image_index, image) in doc.images().iter().enumerate() {
+        // Decode failures carry no RDE-relevant boxes.
+        if image.get("failure").is_some() {
+            continue;
+        }
+        let file = image.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let camera = camera_of(file, opts.n_dir_levels_from_leaf);
+        let Some(detections) = image.get("detections").and_then(|v| v.as_array()) else {
+            continue;
+        };
+
+        for (detection_index, det) in detections.iter().enumerate() {
+            let Some(bbox) = parse_bbox(det) else {
+                continue;
+            };
+            let conf = det.get("conf").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let area = bbox[2] * bbox[3];
+            if conf < opts.confidence_min || conf > opts.confidence_max {
+                continue;
+            }
+            if area < opts.min_suspicious_size || area > opts.max_suspicious_size {
+                continue;
+            }
+            let category = det
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let instance = Instance {
+                det_ref: DetRef {
+                    image_index,
+                    detection_index,
+                },
+                bbox,
+                conf,
+                decision: Decision::default(),
+            };
+
+            // Greedy: the first same-camera (and, unless agnostic, same-category)
+            // cluster whose fixed representative overlaps enough. Find the index
+            // first, then move `instance` exactly once.
+            let target = clusters.iter().position(|cluster| {
+                cluster.camera == camera
+                    && (opts.category_agnostic || cluster.category == category)
+                    && iou(&bbox, &cluster.rep) >= opts.iou_threshold
+            });
+            match target {
+                Some(index) => {
+                    clusters[index].images.insert(image_index);
+                    clusters[index].members.push(instance);
+                }
+                None => clusters.push(Cluster {
+                    camera: camera.to_string(),
+                    category,
+                    rep: bbox,
+                    images: HashSet::from([image_index]),
+                    members: vec![instance],
+                }),
+            }
+        }
+    }
+
+    let mut groups: Vec<SuspiciousGroup> = clusters
+        .into_iter()
+        .filter(|cluster| cluster.images.len() >= opts.occurrence_threshold)
+        .map(|cluster| SuspiciousGroup {
+            id: 0,
+            camera: cluster.camera,
+            category: cluster.category,
+            rep_bbox: cluster.rep,
+            stats: group_stats(&cluster.members),
+            instances: cluster.members,
+        })
+        .collect();
+
+    // Stable order (camera, category, rep position) then assign ids.
+    groups.sort_by(|a, b| {
+        a.camera
+            .cmp(&b.camera)
+            .then_with(|| a.category.cmp(&b.category))
+            .then_with(|| cmp_f32(a.rep_bbox[0], b.rep_bbox[0]))
+            .then_with(|| cmp_f32(a.rep_bbox[1], b.rep_bbox[1]))
+    });
+    for (index, group) in groups.iter_mut().enumerate() {
+        group.id = index;
+    }
+    groups
+}
+
+fn cmp_f32(a: f32, b: f32) -> Ordering {
+    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+}
+
+/// The `DetRef`s of every instance currently marked `Remove` (SPEC §6.3).
+pub fn removals(groups: &[SuspiciousGroup]) -> Vec<DetRef> {
+    groups
+        .iter()
+        .flat_map(|group| group.instances.iter())
+        .filter(|instance| instance.decision == Decision::Remove)
+        .map(|instance| instance.det_ref)
+        .collect()
+}
+
+/// Apply a removal mask to the original document (SPEC §6.3): a copy with the
+/// listed detections dropped and every other field preserved. Removal is by
+/// original index (no index-shift), so passing multiple refs per image is safe.
+pub fn apply_removals(doc: &MdDocument, refs: &[DetRef]) -> MdDocument {
+    let mut per_image: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for det_ref in refs {
+        per_image
+            .entry(det_ref.image_index)
+            .or_default()
+            .insert(det_ref.detection_index);
+    }
+
+    let mut root = doc.root.clone();
+    if let Some(images) = root.get_mut("images").and_then(|v| v.as_array_mut()) {
+        for (image_index, image) in images.iter_mut().enumerate() {
+            let Some(remove) = per_image.get(&image_index) else {
+                continue;
+            };
+            if let Some(detections) = image.get_mut("detections").and_then(|v| v.as_array_mut()) {
+                let mut index = 0usize;
+                detections.retain(|_| {
+                    let keep = !remove.contains(&index);
+                    index += 1;
+                    keep
+                });
+            }
+        }
+    }
+    MdDocument { root }
+}

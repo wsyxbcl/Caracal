@@ -1,4 +1,5 @@
 /target/
+**/target/
 /.venv/
 /web/target/
 /web/pkg/
