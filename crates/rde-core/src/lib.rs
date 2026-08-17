@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+pub mod path;
+pub use path::{match_paths, PathMatch};
+
 /// Normalized bounding box `[x, y, w, h]`, origin top-left, each in `[0, 1]`.
 pub type BBox = [f32; 4];
 
