@@ -39,7 +39,7 @@
     .group.done { opacity: 0.8; }
 
     .tiles { display: grid; grid-template-columns: repeat(auto-fill, 92px); gap: 8px; }
-    .tile { width: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; transition: transform 0.05s; }
+    .tile { width: 92px; height: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; transition: transform 0.05s; }
     .tile canvas { display: block; width: 92px; height: 92px; }
     .tile.remove { opacity: 0.5; }
     .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
@@ -152,6 +152,7 @@
         const loaded = await call("load", { bytes: buffer }, [buffer]);
         state.options = loaded.defaultOptions;
         state.groups = JSON.parse((await call("find", { options: state.options })).groups);
+        openGroup = state.groups[0] || null; // open the first group; the rest stay collapsed
 
         $("m-images").textContent = loaded.imageCount.toLocaleString();
         $("m-dets").textContent = loaded.totalDetections.toLocaleString();
@@ -235,10 +236,19 @@
     }, { rootMargin: "300px" });
 
     async function renderTileCrop(tile) {
-      if (tile._drawn) return;
+      if (tile._drawn || tile._decoding) return;
+      tile._decoding = true;
       const bmp = await scheduleDecode(() => decodeScaled(tile._instance.det_ref.image_index));
-      if (!bmp) return; // unmatched image -> keep placeholder
-      drawCrop(tile.querySelector("canvas"), bmp, tile._instance.bbox);
+      tile._decoding = false;
+      if (!bmp) return; // unmatched image -> keep the div's placeholder background
+      // Allocate the canvas only now (on scroll-in), not for all 18k tiles up front.
+      let canvas = tile.querySelector("canvas");
+      if (!canvas) {
+        canvas = document.createElement("canvas");
+        canvas.width = TILE; canvas.height = TILE;
+        tile.insertBefore(canvas, tile.firstChild);
+      }
+      drawCrop(canvas, bmp, tile._instance.bbox);
       bmp.close();
       tile._drawn = true;
     }
@@ -259,6 +269,12 @@
     }
 
     // ---- Review rendering ----------------------------------------------------
+    // 18k tiles across 227 groups would freeze the browser if all rendered at
+    // once, so groups are collapsed by default and only the *open* group renders
+    // its tiles (accordion — one at a time); tile canvases are then allocated
+    // lazily on scroll-in (see renderTileCrop).
+    let openGroup = null;
+
     function renderReview() {
       tileObserver.disconnect();
       const results = $("results");
@@ -267,12 +283,21 @@
         results.innerHTML = `<div class="card placeholder">No suspicious groups at the current parameters.</div>`;
         return;
       }
-      for (const group of state.groups) results.appendChild(renderGroup(group));
+      const frag = document.createDocumentFragment();
+      for (const group of state.groups) frag.appendChild(renderGroup(group));
+      results.appendChild(frag);
+    }
+
+    function openOnly(group) {
+      openGroup = group; // only this group's tiles live in the DOM
+      renderReview();
+      if (group) document.querySelector(`[data-gid="${group.id}"]`)?.scrollIntoView({ block: "nearest" });
     }
 
     function renderGroup(group) {
       const card = document.createElement("div");
       card.className = "card group" + (group.reviewed ? " done" : "");
+      card.dataset.gid = group.id;
       const box = group.rep_bbox.map((v) => v.toFixed(3)).join(", ");
       const kept = group.instances.filter((i) => i.decision === "Keep").length;
 
@@ -287,38 +312,33 @@
       card.appendChild(head);
 
       if (group.reviewed) {
-        // Collapsed: tiles (and their canvases) are freed; only a summary remains.
         actions.appendChild(tag(`✓ reviewed — ${kept} kept, ${group.instances.length - kept} drop`));
-        actions.appendChild(mini("Reopen", () => replaceGroup(card, group, false)));
+        actions.appendChild(mini("Reopen", () => { group.reviewed = false; openOnly(group); }));
         return card;
       }
 
+      const open = openGroup === group;
       actions.appendChild(mini("Keep all", () => setGroupDecision(group, "Keep")));
       actions.appendChild(mini("Remove all", () => setGroupDecision(group, "Remove")));
-      actions.appendChild(mini("Mark reviewed", () => replaceGroup(card, group, true), "primary"));
+      actions.appendChild(mini(open ? "Collapse ▲" : "Review ▼", () => openOnly(open ? null : group)));
+      actions.appendChild(mini("Mark reviewed", () => { if (openGroup === group) openGroup = null; group.reviewed = true; renderReview(); }, "primary"));
 
-      const grid = document.createElement("div");
-      grid.className = "tiles";
-      group._grid = grid;
-      for (const instance of group.instances) grid.appendChild(makeTile(instance));
-      card.appendChild(grid);
+      if (open) {
+        const grid = document.createElement("div");
+        grid.className = "tiles";
+        group._grid = grid;
+        for (const instance of group.instances) grid.appendChild(makeTile(instance));
+        card.appendChild(grid);
+      }
       return card;
-    }
-
-    function replaceGroup(oldCard, group, reviewed) {
-      group.reviewed = reviewed;
-      oldCard.replaceWith(renderGroup(group)); // dropping the old grid frees its tile canvases
     }
 
     function makeTile(instance) {
       const tile = document.createElement("div");
       tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove");
       tile._instance = instance;
-      const canvas = document.createElement("canvas");
-      canvas.width = TILE; canvas.height = TILE;
-      const ctx = canvas.getContext("2d");
-      ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, TILE, TILE);
-      tile.appendChild(canvas);
+      // No canvas yet — the div's background is the placeholder; the canvas is
+      // created + decoded only when the tile scrolls into view.
       tile.insertAdjacentHTML("beforeend",
         `<span class="badge">${instance.decision === "Keep" ? "keep" : "drop"}</span>` +
         `<span class="conf">${instance.conf.toFixed(2)}</span>`);
@@ -386,8 +406,10 @@
     }
     function setGroupDecision(group, decision) {
       group.instances.forEach((i) => (i.decision = decision));
-      // Restyle the existing tiles in place — no re-decode.
-      if (group._grid) [...group._grid.children].forEach((tile) => applyTileStyle(tile, decision));
+      // Restyle tiles in place if the group is open (no re-decode).
+      if (group._grid && group._grid.isConnected) {
+        [...group._grid.children].forEach((tile) => applyTileStyle(tile, decision));
+      }
       updateExportBar();
     }
 
@@ -424,6 +446,7 @@
       state.fileName = name;
       state.groups = [];
       state.fileByImageIndex.clear();
+      openGroup = null;
       tileObserver.disconnect();
       errorEl.textContent = "";
       $("results").innerHTML = "";
