@@ -139,6 +139,13 @@
       });
     }
 
+    // ---- Profiling: surface main-thread blocks so we can see UI freezes ------
+    try {
+      new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) console.warn(`[rde] long task ${Math.round(e.duration)} ms — main thread blocked`);
+      }).observe({ entryTypes: ["longtask"], buffered: true });
+    } catch { /* longtask not supported */ }
+
     // ---- State ---------------------------------------------------------------
     const state = {
       fileName: null,
@@ -229,9 +236,13 @@
     async function decodeScaled(imageIndex) {
       const file = state.fileByImageIndex.get(imageIndex);
       if (!file) return null;
+      const t = performance.now();
       try {
         // imageOrientation:'from-image' => EXIF-upright frame (matches bbox space).
-        return await createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: DECODE_W, resizeQuality: "medium" });
+        // (Time here includes reading the file off disk — slow on an HDD.)
+        const bmp = await createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: DECODE_W, resizeQuality: "medium" });
+        recordDecode(performance.now() - t);
+        return bmp;
       } catch {
         return null; // e.g. a video file, or an unreadable/corrupt image
       }
@@ -241,11 +252,16 @@
 
     let activeDecodes = 0;
     const decodeQueue = [];
+    let decodeStats = { n: 0, total: 0, max: 0, t0: 0 };
     function scheduleDecode(task) {
+      if (!activeDecodes && !decodeQueue.length && !decodeStats.n) decodeStats.t0 = performance.now();
       return new Promise((resolve, reject) => {
         decodeQueue.push({ task, resolve, reject });
         pumpDecodes();
       });
+    }
+    function recordDecode(ms) {
+      decodeStats.n++; decodeStats.total += ms; decodeStats.max = Math.max(decodeStats.max, ms);
     }
     function pumpDecodes() {
       while (activeDecodes < DECODE_CONCURRENCY && decodeQueue.length) {
@@ -258,6 +274,13 @@
     function updateDecodeProgress() {
       const pending = activeDecodes + decodeQueue.length;
       $("decode-progress").textContent = pending ? `Loading crops… ${pending} queued` : "";
+      // On drain, log throughput (per-decode ms includes the disk read).
+      if (!pending && decodeStats.n) {
+        const s = decodeStats;
+        const mem = performance.memory ? ` | JS heap ${(performance.memory.usedJSHeapSize / 1e6).toFixed(0)} MB` : "";
+        console.log(`[rde] decoded ${s.n} crops in ${Math.round(performance.now() - s.t0)} ms wall — avg ${Math.round(s.total / s.n)} ms, max ${Math.round(s.max)} ms${mem}`);
+        decodeStats = { n: 0, total: 0, max: 0, t0: 0 };
+      }
     }
 
     // Decode a tile's crop only when it nears the viewport.
