@@ -48,6 +48,10 @@
     .tile.remove .badge { background: var(--remove); }
     .tile.keep .badge { background: var(--keep); }
     .tile .conf { position: absolute; bottom: 0; left: 0; right: 0; font-size: 10px; color: #fff; background: rgba(0,0,0,0.5); text-align: center; }
+    .tilemark { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--muted); text-align: center; padding: 3px; line-height: 1.2; }
+    .tile.mark-video { background: #e6e0d4; }
+    .tile.mark-failed { background: #f2e3dc; }
+    button.mini.showmore { display: block; margin: 10px 0 0; }
 
     .workspace { display: flex; gap: 20px; align-items: flex-start; }
     .review { flex: 1 1 auto; min-width: 0; }
@@ -114,6 +118,7 @@
     const TILE = 92;
     const DECODE_W = 1000;        // decode/downscale cap (px): big camera images decode cheap + tiny transient
     const DECODE_CONCURRENCY = 6; // parallel decodes cap so a fast scroll doesn't fire hundreds at once
+    const PAGE = 200;             // tiles rendered per group at a time (a group can have thousands)
 
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     const worker = new Worker("./rde-worker.js", { type: "module" });
@@ -140,6 +145,7 @@
       options: null,
       groups: [],                      // parsed groups; instances carry `decision`
       fileByImageIndex: new Map(),     // image_index -> picked File (cheap: a disk reference)
+      folderLoaded: false,
     };
 
     // ---- 1. Load MD json -----------------------------------------------------
@@ -198,10 +204,16 @@
           if (m && m.status === "matched") { state.fileByImageIndex.set(idx, files[m.picked_index]); matched++; }
           else missing++;
         }
-        $("m-matched").textContent = `${matched}/${suspicious.size}`;
-        status.textContent = missing
-          ? `${matched} of ${suspicious.size} suspicious images matched — ${missing} missing/ambiguous (their tiles stay blank).`
-          : `All ${matched} suspicious images matched. Click tiles to keep the real ones.`;
+        state.folderLoaded = true;
+        const videos = [...suspicious].filter((idx) => { const f = state.fileByImageIndex.get(idx); return f && VIDEO_RE.test(f.name); }).length;
+        const images = matched - videos;
+        $("m-matched").textContent = `${images}/${suspicious.size}`;
+        console.log(`[rde] suspicious media: ${suspicious.size} — image ${images}, video ${videos}, missing/ambiguous ${missing}`);
+        status.textContent =
+          `${images.toLocaleString()} image crops ready` +
+          (videos ? `, ${videos.toLocaleString()} video (not shown yet)` : "") +
+          (missing ? `, ${missing.toLocaleString()} missing/ambiguous` : "") +
+          `. Click a group's “Review”, then click tiles to keep the real ones.`;
         await renderReview(); // now with crops
       } catch (err) {
         showError(err);
@@ -217,9 +229,15 @@
     async function decodeScaled(imageIndex) {
       const file = state.fileByImageIndex.get(imageIndex);
       if (!file) return null;
-      // imageOrientation:'from-image' => EXIF-upright frame (matches bbox space).
-      return createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: DECODE_W, resizeQuality: "medium" });
+      try {
+        // imageOrientation:'from-image' => EXIF-upright frame (matches bbox space).
+        return await createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: DECODE_W, resizeQuality: "medium" });
+      } catch {
+        return null; // e.g. a video file, or an unreadable/corrupt image
+      }
     }
+
+    const VIDEO_RE = /\.(mp4|avi|mov|mkv|webm|m4v)$/i;
 
     let activeDecodes = 0;
     const decodeQueue = [];
@@ -254,12 +272,17 @@
 
     async function renderTileCrop(tile) {
       if (tile._drawn || tile._decoding) return;
+      const idx = tile._instance.det_ref.image_index;
+      const file = state.fileByImageIndex.get(idx);
+      if (!file) { if (state.folderLoaded) markTile(tile, "unmatched", "no image"); return; }
+      if (VIDEO_RE.test(file.name)) { markTile(tile, "video", "▶ video"); return; } // decode is P3
       tile._decoding = true;
       // Skip if the tile was removed (group collapsed) before its turn came up.
-      const bmp = await scheduleDecode(() => (tile.isConnected ? decodeScaled(tile._instance.det_ref.image_index) : null));
+      const bmp = await scheduleDecode(() => (tile.isConnected ? decodeScaled(idx) : null));
       tile._decoding = false;
-      if (!bmp) return; // unmatched image -> keep the div's placeholder background
-      // Allocate the canvas only now (on scroll-in), not for all 18k tiles up front.
+      if (!tile.isConnected) return;
+      if (!bmp) { markTile(tile, "failed", "⚠"); return; } // decode failed (corrupt?)
+      // Allocate the canvas only now (on scroll-in), not for all tiles up front.
       let canvas = tile.querySelector("canvas");
       if (!canvas) {
         canvas = document.createElement("canvas");
@@ -269,6 +292,15 @@
       drawCrop(canvas, bmp, tile._instance.bbox);
       bmp.close();
       tile._drawn = true;
+    }
+
+    function markTile(tile, cls, label) {
+      tile._drawn = true; // don't retry
+      tile.classList.add("mark-" + cls);
+      const s = document.createElement("span");
+      s.className = "tilemark";
+      s.textContent = label;
+      tile.appendChild(s);
     }
 
     function drawCrop(canvas, bmp, bbox) {
@@ -307,6 +339,7 @@
     }
 
     function openOnly(group) {
+      if (group && group !== openGroup) group._shown = PAGE; // fresh page on (re)open
       openGroup = group; // only this group's tiles live in the DOM
       renderReview();
       if (group) document.querySelector(`[data-gid="${group.id}"]`)?.scrollIntoView({ block: "nearest" });
@@ -345,8 +378,23 @@
         const grid = document.createElement("div");
         grid.className = "tiles";
         group._grid = grid;
-        for (const instance of group.instances) grid.appendChild(makeTile(instance));
+        const shown = Math.min(group._shown || PAGE, group.instances.length);
+        group._shown = shown;
+        for (let i = 0; i < shown; i++) grid.appendChild(makeTile(group.instances[i]));
         card.appendChild(grid);
+        if (shown < group.instances.length) {
+          const more = document.createElement("button");
+          more.className = "mini showmore";
+          const label = () => `Show ${Math.min(PAGE, group.instances.length - group._shown)} more (${(group.instances.length - group._shown).toLocaleString()} of ${group.instances.length.toLocaleString()} hidden)`;
+          more.textContent = label();
+          more.addEventListener("click", () => {
+            const start = group._shown;
+            group._shown = Math.min(group.instances.length, start + PAGE);
+            for (let i = start; i < group._shown; i++) grid.appendChild(makeTile(group.instances[i]));
+            group._shown >= group.instances.length ? more.remove() : (more.textContent = label());
+          });
+          card.appendChild(more);
+        }
       }
       return card;
     }
@@ -464,6 +512,7 @@
       state.fileName = name;
       state.groups = [];
       state.fileByImageIndex.clear();
+      state.folderLoaded = false;
       openGroup = null;
       tileObserver.disconnect();
       errorEl.textContent = "";
