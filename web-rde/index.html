@@ -116,7 +116,6 @@
     const previewCanvas = $("preview-canvas");
     const previewMeta = $("preview-meta");
     const TILE = 92;
-    const DECODE_W = 1000;        // decode/downscale cap (px): big camera images decode cheap + tiny transient
     const DECODE_CONCURRENCY = 6; // parallel decodes cap so a fast scroll doesn't fire hundreds at once
     const PAGE = 200;             // tiles rendered per group at a time (a group can have thousands)
 
@@ -143,8 +142,32 @@
     try {
       new PerformanceObserver((list) => {
         for (const e of list.getEntries()) console.warn(`[rde] long task ${Math.round(e.duration)} ms — main thread blocked`);
-      }).observe({ entryTypes: ["longtask"], buffered: true });
+      }).observe({ type: "longtask", buffered: true });
     } catch { /* longtask not supported */ }
+
+    // ---- Media Worker (SPEC §5.1): decode + crop off the main thread ---------
+    const mediaWorker = new Worker("./media-worker.js", { type: "module" });
+    let mNextId = 0;
+    const mPending = new Map();
+    mediaWorker.addEventListener("message", (event) => {
+      const { id, ok, bitmap, width, height } = event.data;
+      const slot = mPending.get(id);
+      if (!slot) return;
+      mPending.delete(id);
+      slot.resolve(ok ? { bitmap, width, height } : null);
+    });
+    // Returns { bitmap, width, height } or null. Timing includes the disk read.
+    function mediaDecode(kind, file, bbox) {
+      const t = performance.now();
+      const id = ++mNextId;
+      return new Promise((resolve) => {
+        mPending.set(id, { resolve });
+        mediaWorker.postMessage({ id, kind, file, bbox });
+      }).then((res) => {
+        if (res) recordDecode(performance.now() - t);
+        return res;
+      });
+    }
 
     // ---- State ---------------------------------------------------------------
     const state = {
@@ -233,21 +256,6 @@
     // We draw only the crop (or one full-frame preview) to a canvas and close()
     // the bitmap immediately — no full-size pixels are ever retained, and tiles
     // decode only as they scroll into view.
-    async function decodeScaled(imageIndex) {
-      const file = state.fileByImageIndex.get(imageIndex);
-      if (!file) return null;
-      const t = performance.now();
-      try {
-        // imageOrientation:'from-image' => EXIF-upright frame (matches bbox space).
-        // (Time here includes reading the file off disk — slow on an HDD.)
-        const bmp = await createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: DECODE_W, resizeQuality: "medium" });
-        recordDecode(performance.now() - t);
-        return bmp;
-      } catch {
-        return null; // e.g. a video file, or an unreadable/corrupt image
-      }
-    }
-
     const VIDEO_RE = /\.(mp4|avi|mov|mkv|webm|m4v)$/i;
 
     let activeDecodes = 0;
@@ -295,25 +303,24 @@
 
     async function renderTileCrop(tile) {
       if (tile._drawn || tile._decoding) return;
-      const idx = tile._instance.det_ref.image_index;
-      const file = state.fileByImageIndex.get(idx);
+      const file = state.fileByImageIndex.get(tile._instance.det_ref.image_index);
       if (!file) { if (state.folderLoaded) markTile(tile, "unmatched", "no image"); return; }
       if (VIDEO_RE.test(file.name)) { markTile(tile, "video", "▶ video"); return; } // decode is P3
       tile._decoding = true;
-      // Skip if the tile was removed (group collapsed) before its turn came up.
-      const bmp = await scheduleDecode(() => (tile.isConnected ? decodeScaled(idx) : null));
+      // The Media Worker decodes + crops; skip if the tile was removed meanwhile.
+      const res = await scheduleDecode(() => (tile.isConnected ? mediaDecode("crop", file, tile._instance.bbox) : null));
       tile._decoding = false;
-      if (!tile.isConnected) return;
-      if (!bmp) { markTile(tile, "failed", "⚠"); return; } // decode failed (corrupt?)
-      // Allocate the canvas only now (on scroll-in), not for all tiles up front.
+      if (!tile.isConnected) { res?.bitmap?.close(); return; }
+      if (!res || !res.bitmap) { markTile(tile, "failed", "⚠"); return; }
+      // Allocate the canvas only now, and blit the finished crop with ~no main-
+      // thread pixel work (bitmaprenderer transfers the ImageBitmap in).
       let canvas = tile.querySelector("canvas");
       if (!canvas) {
         canvas = document.createElement("canvas");
         canvas.width = TILE; canvas.height = TILE;
         tile.insertBefore(canvas, tile.firstChild);
       }
-      drawCrop(canvas, bmp, tile._instance.bbox);
-      bmp.close();
+      canvas.getContext("bitmaprenderer").transferFromImageBitmap(res.bitmap);
       tile._drawn = true;
     }
 
@@ -324,21 +331,6 @@
       s.className = "tilemark";
       s.textContent = label;
       tile.appendChild(s);
-    }
-
-    function drawCrop(canvas, bmp, bbox) {
-      const ctx = canvas.getContext("2d");
-      const [x, y, w, h] = bbox;
-      const bx = x * bmp.width, by = y * bmp.height, bw = w * bmp.width, bh = h * bmp.height;
-      const pad = 0.6;
-      const cx = Math.max(0, bx - bw * pad), cy = Math.max(0, by - bh * pad);
-      const cw = Math.min(bmp.width - cx, bw * (1 + 2 * pad)), ch = Math.min(bmp.height - cy, bh * (1 + 2 * pad));
-      const scale = Math.min(TILE / cw, TILE / ch);
-      const dw = cw * scale, dh = ch * scale, dx = (TILE - dw) / 2, dy = (TILE - dh) / 2;
-      ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, TILE, TILE);
-      ctx.drawImage(bmp, cx, cy, cw, ch, dx, dy, dw, dh);
-      ctx.strokeStyle = "#ffcc33"; ctx.lineWidth = 2;
-      ctx.strokeRect(dx + (bx - cx) * scale, dy + (by - cy) * scale, bw * scale, bh * scale);
     }
 
     // ---- Review rendering ----------------------------------------------------
@@ -461,22 +453,20 @@
     async function drawPreview(instance) {
       const token = ++previewToken;
       const ctx = previewCanvas.getContext("2d");
-      const bmp = await decodeScaled(instance.det_ref.image_index);
-      if (token !== previewToken) { if (bmp) bmp.close(); return; } // a newer hover won
-      if (!bmp) {
-        previewCanvas.width = 400; previewCanvas.height = 220;
-        ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, 400, 220);
-        previewMeta.textContent = "Image not loaded — load the folder to see the full frame.";
-        return;
-      }
-      previewCanvas.width = bmp.width; previewCanvas.height = bmp.height;
-      ctx.drawImage(bmp, 0, 0);
-      const [x, y, w, h] = instance.bbox;
-      ctx.lineWidth = Math.max(2, bmp.width / 240); ctx.strokeStyle = "#e23b2e";
-      ctx.strokeRect(x * bmp.width, y * bmp.height, w * bmp.width, h * bmp.height);
-      bmp.close();
       const file = state.fileByImageIndex.get(instance.det_ref.image_index);
-      const name = file ? (file.webkitRelativePath || file.name) : "";
+      const blank = (msg) => { previewCanvas.width = 400; previewCanvas.height = 220; ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, 400, 220); previewMeta.textContent = msg; };
+      if (!file) { blank("Image not loaded — load the folder to see the full frame."); return; }
+      if (VIDEO_RE.test(file.name)) { blank("Video frame preview not supported yet."); return; }
+      const res = await mediaDecode("frame", file); // decoded in the Media Worker
+      if (token !== previewToken) { res?.bitmap?.close(); return; } // a newer hover won
+      if (!res || !res.bitmap) { blank("Could not read this image."); return; }
+      previewCanvas.width = res.width; previewCanvas.height = res.height;
+      ctx.drawImage(res.bitmap, 0, 0);
+      res.bitmap.close();
+      const [x, y, w, h] = instance.bbox;
+      ctx.lineWidth = Math.max(2, res.width / 240); ctx.strokeStyle = "#e23b2e";
+      ctx.strokeRect(x * res.width, y * res.height, w * res.width, h * res.height);
+      const name = file.webkitRelativePath || file.name;
       previewMeta.innerHTML = `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}<br>${name}`;
     }
 
