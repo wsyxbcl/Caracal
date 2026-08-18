@@ -120,7 +120,10 @@
     const PAGE = 200;             // tiles rendered per group at a time (a group can have thousands)
 
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
-    const worker = new Worker("./rde-worker.js", { type: "module" });
+    // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
+    // reload picks it up (no need to purge cache manually while iterating).
+    const BUILD = "2026-08-18a";
+    const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
     worker.addEventListener("message", (event) => {
@@ -146,7 +149,7 @@
     } catch { /* longtask not supported */ }
 
     // ---- Media Worker (SPEC §5.1): decode + crop off the main thread ---------
-    const mediaWorker = new Worker("./media-worker.js", { type: "module" });
+    const mediaWorker = new Worker(`./media-worker.js?v=${BUILD}`, { type: "module" });
     let mNextId = 0;
     const mPending = new Map();
     mediaWorker.addEventListener("message", (event) => {
@@ -191,7 +194,7 @@
         const loaded = await call("load", { bytes: buffer }, [buffer]);
         console.log(`[rde] parse: ${Math.round(performance.now() - tParse)} ms (${loaded.imageCount} media, ${loaded.totalDetections} detections)`);
         state.options = loaded.defaultOptions;
-        state.imageFiles = JSON.parse(loaded.imageFiles);
+        state.imageFiles = loaded.imageFiles ? JSON.parse(loaded.imageFiles) : null;
         status.textContent = `Clustering ${loaded.totalDetections.toLocaleString()} detections…`;
         const tFind = performance.now();
         state.groups = JSON.parse((await call("find", { options: state.options })).groups);
