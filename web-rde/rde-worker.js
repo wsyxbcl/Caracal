@@ -22,6 +22,7 @@ self.onmessage = async (event) => {
           imageCount: session.image_count(),
           totalDetections: session.total_detections(),
           defaultOptions: default_options(),
+          imageFiles: session.image_files(), // json paths, for path diagnostics + matching
         });
         break;
       }

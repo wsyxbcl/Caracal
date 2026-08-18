@@ -174,6 +174,7 @@
       fileName: null,
       options: null,
       groups: [],                      // parsed groups; instances carry `decision`
+      imageFiles: null,                // image_index -> json `file` path (for matching + diagnostics)
       fileByImageIndex: new Map(),     // image_index -> picked File (cheap: a disk reference)
       folderLoaded: false,
     };
@@ -190,6 +191,7 @@
         const loaded = await call("load", { bytes: buffer }, [buffer]);
         console.log(`[rde] parse: ${Math.round(performance.now() - tParse)} ms (${loaded.imageCount} media, ${loaded.totalDetections} detections)`);
         state.options = loaded.defaultOptions;
+        state.imageFiles = JSON.parse(loaded.imageFiles);
         status.textContent = `Clustering ${loaded.totalDetections.toLocaleString()} detections…`;
         const tFind = performance.now();
         state.groups = JSON.parse((await call("find", { options: state.options })).groups);
@@ -239,6 +241,15 @@
         const images = matched - videos;
         $("m-matched").textContent = `${images}/${suspicious.size}`;
         console.log(`[rde] suspicious media: ${suspicious.size} — image ${images}, video ${videos}, missing/ambiguous ${missing}`);
+        if (missing) {
+          // Show WHY the misses missed: the json path we looked for vs. a picked
+          // basename that exists, so a wrong-folder / path-mismatch is obvious.
+          const unmatched = [...suspicious].filter((idx) => matches[idx]?.status !== "matched");
+          console.warn(`[rde] ${missing} suspicious media not matched. Sample json paths we looked for:`,
+            unmatched.slice(0, 5).map((idx) => state.imageFiles?.[idx]));
+          console.warn(`[rde] Sample of the ${files.length} picked file paths:`,
+            files.slice(0, 5).map((f) => f.webkitRelativePath || f.name));
+        }
         status.textContent =
           `${images.toLocaleString()} image crops ready` +
           (videos ? `, ${videos.toLocaleString()} video (not shown yet)` : "") +
@@ -418,6 +429,7 @@
       const tile = document.createElement("div");
       tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove");
       tile._instance = instance;
+      tile.title = state.imageFiles?.[instance.det_ref.image_index] || ""; // hover: source path
       // No canvas yet — the div's background is the placeholder; the canvas is
       // created + decoded only when the tile scrolls into view.
       tile.insertAdjacentHTML("beforeend",
