@@ -56,6 +56,14 @@
     .tile.remove { opacity: 0.5; }
     .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
     .tile:hover { border-color: var(--muted); }
+    .tile.focused { outline: 3px solid var(--accent); outline-offset: 1px; z-index: 1; }
+
+    /* Buffer bar for the current group's crops (fades out once buffered). */
+    .buffer { display: flex; align-items: center; gap: 10px; margin: 6px 0 14px; opacity: 1; transition: opacity 0.4s 0.3s; }
+    .buffer.done { opacity: 0; }
+    .buffer-track { flex: 1; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+    .buffer-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
+    .buffer-label { color: var(--muted); font-size: 0.8rem; min-width: 92px; text-align: right; }
     .tile .badge { position: absolute; top: 3px; right: 3px; font-size: 11px; font-weight: 700; color: #fff; border-radius: 4px; padding: 1px 5px; }
     .tile.remove .badge { background: var(--remove); }
     .tile.keep .badge { background: var(--keep); }
@@ -228,7 +236,6 @@
         const tFind = performance.now();
         state.groups = JSON.parse((await call("find", { options: state.options })).groups);
         console.log(`[rde] cluster: ${Math.round(performance.now() - tFind)} ms (${state.groups.length} groups)`);
-        openGroup = state.groups[0] || null; // open the first group; the rest stay collapsed
 
         $("m-images").textContent = loaded.imageCount.toLocaleString();
         $("m-dets").textContent = loaded.totalDetections.toLocaleString();
@@ -237,7 +244,7 @@
         $("metrics").hidden = false;
         $("folder-label").classList.remove("disabled");
         status.textContent = `Loaded ${file.name}. ${state.groups.length} suspicious group(s). Load the image folder to review crops.`;
-        renderReview();
+        goToGroup(0);
         updateExportBar();
       } catch (err) {
         showError(err);
@@ -286,8 +293,8 @@
           `${images.toLocaleString()} image crops ready` +
           (videos ? `, ${videos.toLocaleString()} video (not shown yet)` : "") +
           (missing ? `, ${missing.toLocaleString()} missing/ambiguous` : "") +
-          `. Click a group's “Review”, then click tiles to keep the real ones.`;
-        await renderReview(); // now with crops
+          `. ← → to move, Space to keep, Enter for next group.`;
+        goToGroup(currentIndex); // re-render current group, now with crops + prefetch
       } catch (err) {
         showError(err);
       }
@@ -326,14 +333,23 @@
       tile._drawn = true;
     }
 
-    // Decode every image crop of `group` (batched by source, concurrency-capped),
-    // filling the cache + tiles and reporting progress. Idempotent: already-cached
-    // crops are skipped, so re-renders don't re-decode. `prefetchToken` supersedes
-    // an in-flight prefetch when the open group changes.
-    let prefetchToken = 0;
-    async function prefetchGroup(group) {
-      const token = ++prefetchToken;
-      const bySource = new Map(); // image_index -> { file, items:[{key,bbox}] }
+    // Shared decode limiter: at most DECODE_CONCURRENCY source reads in flight
+    // across the current group AND the prefetched-next group, so advancing is
+    // instant without ever seek-storming the HDD.
+    let activeSrc = 0; const srcQueue = [];
+    function decodeSourceLimited(file, items) {
+      return new Promise((resolve) => { srcQueue.push({ file, items, resolve }); pumpSrc(); });
+    }
+    function pumpSrc() {
+      while (activeSrc < DECODE_CONCURRENCY && srcQueue.length) {
+        const j = srcQueue.shift(); activeSrc++;
+        mediaCropBatch(j.file, j.items).then(j.resolve).finally(() => { activeSrc--; pumpSrc(); });
+      }
+    }
+
+    // A group's still-uncached image instances, grouped by source image.
+    function groupSources(group) {
+      const bySource = new Map();
       for (const inst of group.instances) {
         const k = cropKey(inst.det_ref);
         if (cropCache.has(k)) continue;
@@ -343,39 +359,67 @@
         if (!e) bySource.set(inst.det_ref.image_index, e = { file, items: [] });
         e.items.push({ key: k, bbox: inst.bbox });
       }
-      const sources = [...bySource.values()];
+      return [...bySource.values()];
+    }
+
+    // Prefetch a group's crops into the cache (+ fill its tiles if it's the one
+    // rendered). Idempotent; `group._active` gates it so an evicted group stops
+    // decoding. `showProgress` drives the current group's buffer bar.
+    async function prefetchGroup(group, showProgress) {
+      // Wait for the folder: before it loads there are no files, and marking a
+      // group "prefetched" with 0 sources would skip it once files arrive.
+      if (!group || !state.folderLoaded || group._prefetched || group._prefetching) { if (showProgress) setBuffering(1, 1); return; }
+      group._prefetching = true;
+      group._cachedKeys = group._cachedKeys || new Set();
+      const sources = groupSources(group);
       const total = sources.length;
-      let done = 0, idx = 0;
+      let done = 0;
       const t0 = performance.now();
-      setBuffering(done, total);
-      async function run() {
-        while (idx < sources.length && token === prefetchToken) {
-          const s = sources[idx++];
-          const results = await mediaCropBatch(s.file, s.items);
-          if (token !== prefetchToken) return; // group changed; drop stale results
-          if (results) {
-            for (const r of results) {
-              if (!r.blob) continue;
-              const url = URL.createObjectURL(r.blob);
-              cropCache.set(r.key, url);
-              fillTile(r.key, url);
-            }
-          } else {
-            for (const it of s.items) { const t = tileByKey.get(it.key); if (t) markTile(t, "failed", "⚠"); }
+      if (showProgress) setBuffering(done, total);
+      await Promise.all(sources.map(async (s) => {
+        if (!group._active) return;
+        const results = await decodeSourceLimited(s.file, s.items);
+        if (!group._active) return;
+        if (results) {
+          for (const r of results) {
+            if (!r.blob) continue;
+            const url = URL.createObjectURL(r.blob);
+            cropCache.set(r.key, url); group._cachedKeys.add(r.key);
+            fillTile(r.key, url);
           }
-          setBuffering(++done, total);
+        } else {
+          for (const it of s.items) { const t = tileByKey.get(it.key); if (t) markTile(t, "failed", "⚠"); }
         }
+        if (showProgress) setBuffering(++done, total); else done++;
+      }));
+      group._prefetching = false;
+      if (group._active && done >= total) {
+        group._prefetched = true;
+        if (total) console.log(`[rde] buffered “${group.camera}”: ${total} sources, ${Math.round(performance.now() - t0)} ms`);
       }
-      await Promise.all(Array.from({ length: DECODE_CONCURRENCY }, run));
-      if (token === prefetchToken) {
-        setBuffering(total, total);
-        if (total) console.log(`[rde] buffered “${group.camera}”: ${total} source images in ${Math.round(performance.now() - t0)} ms`);
+      if (showProgress) setBuffering(total, total);
+    }
+
+    // Keep only these groups' crops cached; revoke the rest (bounded memory).
+    function evictExcept(keep) {
+      const keepSet = new Set(keep.filter(Boolean));
+      for (const g of state.groups) g._active = keepSet.has(g);
+      for (const g of state.groups) {
+        if (!g._active && g._cachedKeys && g._cachedKeys.size) {
+          for (const k of g._cachedKeys) { const u = cropCache.get(k); if (u) { URL.revokeObjectURL(u); cropCache.delete(k); } }
+          g._cachedKeys.clear(); g._prefetched = false;
+        }
       }
     }
 
     function setBuffering(done, total) {
-      const el = $("decode-progress");
-      el.textContent = (!total || done >= total) ? "" : `Buffering crops… ${done}/${total} images`;
+      const bar = $("buffer-bar"), wrap = $("buffer"), lab = $("buffer-label");
+      if (!bar || !wrap) return;
+      const pct = total ? Math.round(done / total * 100) : 100;
+      bar.style.width = pct + "%";
+      const ready = !total || done >= total;
+      wrap.classList.toggle("done", ready);
+      lab.textContent = ready ? (total ? "buffered" : "") : `buffering ${done}/${total}`;
     }
 
     function markTile(tile, cls, label) {
@@ -387,90 +431,120 @@
       tile.appendChild(s);
     }
 
-    // ---- Review rendering ----------------------------------------------------
-    // 18k tiles across 227 groups would freeze the browser if all rendered at
-    // once, so groups are collapsed by default and only the *open* group renders
-    // its tiles (accordion — one at a time); the open group's crops are then
-    // prefetched (batched by source) into the crop cache.
-    let openGroup = null;
-    let cachedGroup = null; // whose crops are in cropCache right now
+    // ---- Review rendering: one group at a time, mouse + keyboard -------------
+    // The whole set (18k tiles / 227 groups) never renders at once. Only the
+    // current group is in the DOM; Next/Prev navigate, its crops are prefetched
+    // (batched by source) and the *next* group is prefetched in the background so
+    // advancing is instant. Fast loop: ← → to move, Space to keep a real animal,
+    // Enter to advance. Default is Remove, so you only mark the few real ones.
+    let currentIndex = 0;   // index into state.groups of the group on screen
+    let focusIndex = 0;     // focused tile within the current group
+    let currentGrid = null; // the current group's tile grid element
+    const currentGroup = () => state.groups[currentIndex] || null;
 
-    function renderReview() {
-      // Moving to a different group: drop the old group's crops (bounded memory).
-      if (openGroup !== cachedGroup) { clearCropCache(); cachedGroup = openGroup; }
+    function goToGroup(i, focus = 0) {
+      if (!state.groups.length) return;
+      currentIndex = Math.max(0, Math.min(state.groups.length - 1, i));
+      focusIndex = focus;
+      renderCurrent();
+      const g = currentGroup();
+      const next = state.groups[currentIndex + 1] || null;
+      evictExcept([g, next]);        // keep current + next cached, drop the rest
+      prefetchGroup(g, true);        // current: fills tiles, drives the buffer bar
+      prefetchGroup(next, false);    // next: silent, decoded ahead
+    }
+
+    function markReviewedAndNext() {
+      const g = currentGroup();
+      if (g) { g.reviewed = true; updateExportBar(); }
+      if (currentIndex < state.groups.length - 1) goToGroup(currentIndex + 1);
+      else renderCurrent(); // last group: stay, show it as reviewed
+    }
+
+    function renderCurrent() {
       tileByKey.clear();
+      currentGrid = null;
       const results = $("results");
       results.innerHTML = "";
       if (!state.groups.length) {
         results.innerHTML = `<div class="card placeholder">No suspicious groups at the current parameters.</div>`;
         return;
       }
-      const frag = document.createDocumentFragment();
-      for (const group of state.groups) frag.appendChild(renderGroup(group));
-      results.appendChild(frag);
-      if (openGroup && !openGroup.reviewed) prefetchGroup(openGroup); // idempotent: skips cached crops
-    }
+      const g = currentGroup();
+      const box = g.rep_bbox.map((v) => v.toFixed(3)).join(", ");
+      const reviewed = state.groups.filter((x) => x.reviewed).length;
 
-    function openOnly(group) {
-      if (group && group !== openGroup) group._shown = PAGE; // fresh page on (re)open
-      openGroup = group; // only this group's tiles live in the DOM
-      renderReview();
-      if (group) document.querySelector(`[data-gid="${group.id}"]`)?.scrollIntoView({ block: "nearest" });
-    }
-
-    function renderGroup(group) {
       const card = document.createElement("div");
-      card.className = "card group" + (group.reviewed ? " done" : "");
-      card.dataset.gid = group.id;
-      const box = group.rep_bbox.map((v) => v.toFixed(3)).join(", ");
-      const kept = group.instances.filter((i) => i.decision === "Keep").length;
+      card.className = "card group" + (g.reviewed ? " done" : "");
 
       const head = document.createElement("div");
       head.className = "group-head";
       head.innerHTML =
-        `<h3>${group.camera} · category ${group.category}</h3>` +
-        `<span class="meta">${group.instances.length} instances · box [${box}] · conf ${group.stats.conf_min.toFixed(2)}–${group.stats.conf_max.toFixed(2)}</span>`;
+        `<h3>${g.camera} · category ${g.category}</h3>` +
+        `<span class="meta">Group ${currentIndex + 1}/${state.groups.length}` +
+        `${g.reviewed ? " · ✓ reviewed" : ""} · ${reviewed} done` +
+        ` · ${g.instances.length} crops · conf ${g.stats.conf_min.toFixed(2)}–${g.stats.conf_max.toFixed(2)} · box [${box}]</span>`;
       const actions = document.createElement("span");
       actions.className = "actions";
+      actions.appendChild(mini("◀ Prev", () => goToGroup(currentIndex - 1)));
+      actions.appendChild(mini("Keep all", () => setGroupDecision(g, "Keep")));
+      actions.appendChild(mini("Remove all", () => setGroupDecision(g, "Remove")));
+      actions.appendChild(mini("Next ▶", markReviewedAndNext, "primary"));
       head.appendChild(actions);
       card.appendChild(head);
 
-      if (group.reviewed) {
-        actions.appendChild(tag(`✓ reviewed — ${kept} kept, ${group.instances.length - kept} drop`));
-        actions.appendChild(mini("Reopen", () => { group.reviewed = false; openOnly(group); }));
-        return card;
-      }
+      // buffer bar for the current group's crops
+      card.insertAdjacentHTML("beforeend",
+        `<div class="buffer" id="buffer"><div class="buffer-track"><div class="buffer-bar" id="buffer-bar"></div></div><span class="buffer-label" id="buffer-label"></span></div>`);
 
-      const open = openGroup === group;
-      actions.appendChild(mini("Keep all", () => setGroupDecision(group, "Keep")));
-      actions.appendChild(mini("Remove all", () => setGroupDecision(group, "Remove")));
-      actions.appendChild(mini(open ? "Collapse ▲" : "Review ▼", () => openOnly(open ? null : group)));
-      actions.appendChild(mini("Mark reviewed", () => { if (openGroup === group) openGroup = null; group.reviewed = true; renderReview(); }, "primary"));
-
-      if (open) {
-        const grid = document.createElement("div");
-        grid.className = "tiles";
-        group._grid = grid;
-        const shown = Math.min(group._shown || PAGE, group.instances.length);
-        group._shown = shown;
-        for (let i = 0; i < shown; i++) grid.appendChild(makeTile(group.instances[i]));
-        card.appendChild(grid);
-        if (shown < group.instances.length) {
-          const more = document.createElement("button");
-          more.className = "mini showmore";
-          const label = () => `Show ${Math.min(PAGE, group.instances.length - group._shown)} more (${(group.instances.length - group._shown).toLocaleString()} of ${group.instances.length.toLocaleString()} hidden)`;
-          more.textContent = label();
-          more.addEventListener("click", () => {
-            const start = group._shown;
-            group._shown = Math.min(group.instances.length, start + PAGE);
-            for (let i = start; i < group._shown; i++) grid.appendChild(makeTile(group.instances[i]));
-            group._shown >= group.instances.length ? more.remove() : (more.textContent = label());
-          });
-          card.appendChild(more);
-        }
-      }
-      return card;
+      const grid = document.createElement("div");
+      grid.className = "tiles";
+      currentGrid = grid;
+      for (const inst of g.instances) grid.appendChild(makeTile(inst));
+      card.appendChild(grid);
+      results.appendChild(card);
+      $("results").parentElement.scrollTop = 0; // top of the list on each group
+      applyFocus();
     }
+
+    // ---- Focus + keyboard ----------------------------------------------------
+    function tilesPerRow() {
+      if (!currentGrid) return 1;
+      return Math.max(1, Math.floor((currentGrid.clientWidth + 8) / (TILE + 8))); // 92px tiles, 8px gap
+    }
+    function applyFocus() {
+      if (!currentGrid) return;
+      const tiles = currentGrid.children;
+      if (!tiles.length) return;
+      focusIndex = Math.max(0, Math.min(tiles.length - 1, focusIndex));
+      for (let i = 0; i < tiles.length; i++) tiles[i].classList.toggle("focused", i === focusIndex);
+      const t = tiles[focusIndex];
+      t.scrollIntoView({ block: "nearest" });
+      setPreview(t._instance);
+    }
+    function moveFocus(delta) { focusIndex += delta; applyFocus(); }
+
+    document.addEventListener("keydown", (e) => {
+      if (!state.groups.length || /^(INPUT|TEXTAREA|BUTTON)$/.test(e.target.tagName)) return;
+      const row = tilesPerRow();
+      switch (e.key) {
+        case "ArrowRight": moveFocus(1); break;
+        case "ArrowLeft": moveFocus(-1); break;
+        case "ArrowDown": moveFocus(row); break;
+        case "ArrowUp": moveFocus(-row); break;
+        case " ": case "x": {
+          const t = currentGrid?.children[focusIndex];
+          if (t) toggleDecision(t._instance, t);
+          break;
+        }
+        case "Enter": case "n": markReviewedAndNext(); break;
+        case "p": goToGroup(currentIndex - 1); break;
+        case "k": setGroupDecision(currentGroup(), "Keep"); break;
+        case "d": setGroupDecision(currentGroup(), "Remove"); break;
+        default: return;
+      }
+      e.preventDefault();
+    });
 
     function makeTile(instance) {
       const tile = document.createElement("div");
@@ -497,6 +571,8 @@
       const b = document.createElement("button");
       b.className = "mini" + (cls ? " " + cls : "");
       b.textContent = label;
+      b.tabIndex = -1;
+      b.addEventListener("mousedown", (e) => e.preventDefault()); // don't steal keyboard focus
       b.addEventListener("click", onClick);
       return b;
     }
@@ -565,9 +641,9 @@
     }
     function setGroupDecision(group, decision) {
       group.instances.forEach((i) => (i.decision = decision));
-      // Restyle tiles in place if the group is open (no re-decode).
-      if (group._grid && group._grid.isConnected) {
-        [...group._grid.children].forEach((tile) => applyTileStyle(tile, decision));
+      // Restyle tiles in place if this is the group on screen (no re-decode).
+      if (group === currentGroup() && currentGrid) {
+        [...currentGrid.children].forEach((tile) => applyTileStyle(tile, decision));
       }
       updateExportBar();
     }
@@ -606,8 +682,9 @@
       state.groups = [];
       state.fileByImageIndex.clear();
       state.folderLoaded = false;
-      openGroup = null;
-      cachedGroup = null;
+      currentIndex = 0;
+      focusIndex = 0;
+      currentGrid = null;
       clearCropCache();
       tileByKey.clear();
       state.imageFiles = null;
