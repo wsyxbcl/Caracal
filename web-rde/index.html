@@ -37,21 +37,14 @@
     button.mini.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
     .reviewed-tag { color: var(--keep); font-weight: 600; font-size: 0.85rem; margin-right: 8px; }
     .group.done { opacity: 0.8; }
-    /* Skip layout+paint for off-screen groups (227 of them, a 30k-px page). This
-       is near-virtualization in one line: crucial on Linux/software-rendering
-       where a fixed/sticky element forces whole-viewport repaints on scroll.
-       `auto` in contain-intrinsic-size remembers each card's real height once
-       rendered, so the scrollbar stays stable. */
-    .group { content-visibility: auto; contain-intrinsic-size: auto 92px; }
 
     .tiles { display: grid; grid-template-columns: repeat(auto-fill, 92px); gap: 8px; }
-    .tile { width: 92px; height: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df;
-      /* No transform transition: it can promote every tile to its own compositor
-         layer, which is exactly what we're trying to avoid under software render. */
-      /* Skip painting off-screen tiles: under software rendering, compositing a
-         whole open group's canvases every scroll frame is the jank. This keeps
-         it to a viewport's worth. */
-      content-visibility: auto; contain-intrinsic-size: 92px 92px; }
+    /* No content-visibility and no transform transition on tiles: content-visibility
+       re-renders elements every time they cross the viewport (trace showed a
+       per-frame Layer/GC/decode churn -> ~700ms main-thread frames under software
+       rendering), and a transform transition can promote each tile to its own
+       layer. Tiles are plain <img> now, so neither is needed. */
+    .tile { width: 92px; height: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; }
     .tile canvas, .tile img.crop { display: block; width: 92px; height: 92px; object-fit: cover; }
     .tile.remove { opacity: 0.5; }
     .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
