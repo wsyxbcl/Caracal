@@ -10,8 +10,15 @@
       --bg: #fbf8f3; --card: #fff; --keep: #2f9e5b; --remove: #c0563a;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: var(--ink); background: var(--bg); }
-    main { max-width: 1280px; margin: 0 auto; padding: 28px 20px 120px; }
+    /* App-shell: the page itself never scrolls. Only the review list scrolls,
+       inside its own bounded container, so the browser can scroll it on the
+       compositor. A tall scrolling page + a fixed/sticky element forces
+       main-thread scrolling (a full-viewport repaint every frame), which is the
+       scroll jank under software rendering. */
+    body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: var(--ink); background: var(--bg);
+      height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    main { max-width: 1280px; margin: 0 auto; padding: 24px 20px 0; width: 100%; box-sizing: border-box;
+      flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
     h1 { font-size: 1.5rem; margin: 0 0 4px; }
     h2 { font-size: 1.05rem; margin: 0 0 10px; }
     .lede { color: var(--muted); margin: 0 0 22px; }
@@ -58,20 +65,24 @@
     .tile.mark-failed { background: #f2e3dc; }
     button.mini.showmore { display: block; margin: 10px 0 0; }
 
-    .workspace { display: flex; gap: 20px; align-items: flex-start; }
-    .review { flex: 1 1 auto; min-width: 0; }
-    .preview { flex: 0 0 400px; position: sticky; top: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+    .workspace { display: flex; gap: 20px; align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 18px; }
+    .review { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 2px 6px 24px 0; }
+    .preview { flex: 0 0 400px; overflow-y: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
     .preview h2 { font-size: 0.95rem; margin: 0 0 10px; }
     .preview canvas { width: 100%; height: auto; max-height: 62vh; object-fit: contain; border-radius: 6px; background: #efe9df; display: block; }
     .preview-meta { color: var(--muted); font-size: 0.82rem; margin: 10px 0 0; word-break: break-all; }
     .preview-meta b { color: var(--ink); }
     @media (max-width: 980px) {
-      .workspace { flex-direction: column; }
-      .preview { position: static; flex-basis: auto; width: 100%; }
+      /* Narrow: fall back to a normally-scrolling page (stack review over preview). */
+      body { height: auto; overflow: auto; display: block; }
+      main { height: auto; min-height: 0; display: block; padding-bottom: 24px; }
+      .workspace { flex-direction: column; min-height: 0; }
+      .review { overflow: visible; }
+      .preview { overflow: visible; flex-basis: auto; width: 100%; }
       .preview canvas { max-height: none; }
     }
 
-    .exportbar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 16px; align-items: center; justify-content: center; }
+    .exportbar { flex: 0 0 auto; background: var(--card); border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 16px; align-items: center; justify-content: center; }
     .exportbar button { font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; }
     .exportbar button:disabled { opacity: 0.4; cursor: default; }
     .exportbar .summary { color: var(--muted); font-size: 0.9rem; }
@@ -322,7 +333,7 @@
         entry.target._near = entry.isIntersecting;
         if (entry.isIntersecting) renderTileCrop(entry.target);
       }
-    }, { rootMargin: "200px" });
+    }, { root: document.querySelector(".review"), rootMargin: "200px" }); // the review list is the scroller now
 
     async function renderTileCrop(tile) {
       if (tile._drawn || tile._decoding) return;
@@ -484,11 +495,12 @@
     // drags tiles under a stationary cursor, firing a storm of `mouseenter`s —
     // decoding a full frame off the HDD for each would jank the scroll.
     let scrolling = false, scrollIdle = 0;
-    addEventListener("scroll", () => {
+    // Capture phase catches scroll on the inner .review scroller (scroll doesn't bubble).
+    document.addEventListener("scroll", () => {
       scrolling = true;
       clearTimeout(scrollIdle);
       scrollIdle = setTimeout(() => { scrolling = false; }, 160);
-    }, { passive: true });
+    }, { passive: true, capture: true });
     function setPreview(instance) {
       clearTimeout(previewTimer);
       previewTimer = setTimeout(() => { if (!scrolling) drawPreview(instance); }, 90); // settle + not mid-scroll
