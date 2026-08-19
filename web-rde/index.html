@@ -138,7 +138,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-19a";
+    const BUILD = "2026-08-19b";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -169,11 +169,11 @@
     let mNextId = 0;
     const mPending = new Map();
     mediaWorker.addEventListener("message", (event) => {
-      const { id, ok, bitmap, width, height, blob } = event.data;
+      const { id, ok, bitmap, width, height, blob, results } = event.data;
       const slot = mPending.get(id);
       if (!slot) return;
       mPending.delete(id);
-      slot.resolve(ok ? { bitmap, width, height, blob } : null); // crop=>blob, frame=>bitmap
+      slot.resolve(ok ? { bitmap, width, height, blob, results } : null); // crop=>blob, frame=>bitmap, cropBatch=>results
     });
     // Returns { bitmap, width, height } or null. Timing includes the disk read.
     function mediaDecode(kind, file, bbox) {
@@ -185,6 +185,19 @@
       }).then((res) => {
         if (res) recordDecode(performance.now() - t);
         return res;
+      });
+    }
+    // Decode one source once and get all its crops: items = [{ key, bbox }].
+    // Returns [{ key, blob }] or null. One disk read for the whole batch.
+    function mediaCropBatch(file, items) {
+      const t = performance.now();
+      const id = ++mNextId;
+      return new Promise((resolve) => {
+        mPending.set(id, { resolve });
+        mediaWorker.postMessage({ id, kind: "cropBatch", file, items });
+      }).then((res) => {
+        if (res) recordDecode(performance.now() - t);
+        return res?.results || null;
       });
     }
 
@@ -280,88 +293,89 @@
       }
     });
 
-    // ---- On-demand decode (SPEC §5) -----------------------------------------
-    // The browser decodes with its native codec; resizeWidth downscales big
-    // camera images so the decode is cheap and the transient bitmap is small.
-    // We draw only the crop (or one full-frame preview) to a canvas and close()
-    // the bitmap immediately — no full-size pixels are ever retained, and tiles
-    // decode only as they scroll into view.
+    // ---- Crop cache + prefetch (SPEC §5) ------------------------------------
+    // Crops are decoded by the Media Worker, batched by source image (one disk
+    // read yields all of that image's crops), into a cache of object URLs shown
+    // in <img> tiles. Opening a group prefetches all its image crops; the cache
+    // is cleared when you move to another group, so memory stays bounded to about
+    // one group of ~92px PNGs. Video crops are P3: those tiles show a placeholder
+    // and route through the same batch-by-source path later (WebCodecs frames).
     const VIDEO_RE = /\.(mp4|avi|mov|mkv|webm|m4v)$/i;
+    const cropKey = (ref) => ref.image_index + ":" + ref.detection_index;
+    const cropCache = new Map(); // key -> objectURL (bounded: cleared on group switch)
+    const tileByKey = new Map(); // key -> tile element for the current render
 
-    let activeDecodes = 0;
-    const decodeQueue = [];
-    let decodeStats = { n: 0, total: 0, max: 0, t0: 0 };
-    function scheduleDecode(task) {
-      if (!activeDecodes && !decodeQueue.length && !decodeStats.n) decodeStats.t0 = performance.now();
-      return new Promise((resolve, reject) => {
-        decodeQueue.push({ task, resolve, reject });
-        pumpDecodes();
-      });
-    }
-    function recordDecode(ms) {
-      decodeStats.n++; decodeStats.total += ms; decodeStats.max = Math.max(decodeStats.max, ms);
-    }
-    function pumpDecodes() {
-      while (activeDecodes < DECODE_CONCURRENCY && decodeQueue.length) {
-        const { task, resolve, reject } = decodeQueue.shift();
-        activeDecodes++;
-        task().then(resolve, reject).finally(() => { activeDecodes--; updateDecodeProgress(); pumpDecodes(); });
-      }
-      updateDecodeProgress();
-    }
-    function updateDecodeProgress() {
-      const pending = activeDecodes + decodeQueue.length;
-      $("decode-progress").textContent = pending ? `Loading crops… ${pending} queued` : "";
-      // On drain, log throughput (per-decode ms includes the disk read).
-      if (!pending && decodeStats.n) {
-        const s = decodeStats;
-        const mem = performance.memory ? ` | JS heap ${(performance.memory.usedJSHeapSize / 1e6).toFixed(0)} MB` : "";
-        console.log(`[rde] decoded ${s.n} crops in ${Math.round(performance.now() - s.t0)} ms wall — avg ${Math.round(s.total / s.n)} ms, max ${Math.round(s.max)} ms${mem}`);
-        decodeStats = { n: 0, total: 0, max: 0, t0: 0 };
-      }
+    function clearCropCache() {
+      for (const url of cropCache.values()) URL.revokeObjectURL(url);
+      cropCache.clear();
     }
 
-    // Decode a tile's crop only while it's near the viewport. We keep observing
-    // (don't unobserve on enter) and track `_near`, so a tile that scrolls back
-    // in re-triggers — and, crucially, so a decode can be skipped if the tile
-    // scrolled away before its turn (see the SKIP check below). That bounds disk
-    // reads to ~a viewport during a fast scroll instead of a whole group's page
-    // of them — the difference between a smooth HDD and a seek-storm.
-    const SKIP = Symbol("skip"); // decode not run: tile left the viewport / was removed
-    const tileObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        entry.target._near = entry.isIntersecting;
-        if (entry.isIntersecting) renderTileCrop(entry.target);
-      }
-    }, { root: document.querySelector(".review"), rootMargin: "200px" }); // the review list is the scroller now
+    let decodeN = 0, decodeMs = 0;
+    function recordDecode(ms) { decodeN++; decodeMs += ms; } // rough throughput, logged per group
 
-    async function renderTileCrop(tile) {
-      if (tile._drawn || tile._decoding) return;
-      const file = state.fileByImageIndex.get(tile._instance.det_ref.image_index);
-      if (!file) { if (state.folderLoaded) markTile(tile, "unmatched", "no image"); return; }
-      if (VIDEO_RE.test(file.name)) { markTile(tile, "video", "▶ video"); return; } // decode is P3
-      tile._decoding = true;
-      // Re-check at execution time: only touch the disk if the tile is still on
-      // screen. Otherwise skip — it re-enters -> re-triggers -> decodes then.
-      const res = await scheduleDecode(() =>
-        (tile.isConnected && tile._near) ? mediaDecode("crop", file, tile._instance.bbox) : SKIP);
-      tile._decoding = false;
-      if (res === SKIP) return; // scrolled away before its turn; will retry on re-entry
-      if (!tile.isConnected) { return; }
-      if (!res || !res.blob) { markTile(tile, "failed", "⚠"); return; }
-      // Show the crop in an <img>, not a <canvas>: a canvas becomes its own
-      // compositor layer and ~170 of them freezes the software compositor. An
-      // <img> paints into the grid layer. Revoke the object URL once decoded.
+    function fillTile(key, url) {
+      const tile = tileByKey.get(key);
+      if (!tile || tile._drawn) return;
       let img = tile.querySelector("img.crop");
       if (!img) {
         img = document.createElement("img");
         img.className = "crop"; img.width = TILE; img.height = TILE; img.decoding = "async";
         tile.insertBefore(img, tile.firstChild);
       }
-      const url = URL.createObjectURL(res.blob);
-      img.onload = img.onerror = () => URL.revokeObjectURL(url);
-      img.src = url;
+      img.src = url; // cache owns the URL (revoked on group switch), so don't revoke on load
       tile._drawn = true;
+    }
+
+    // Decode every image crop of `group` (batched by source, concurrency-capped),
+    // filling the cache + tiles and reporting progress. Idempotent: already-cached
+    // crops are skipped, so re-renders don't re-decode. `prefetchToken` supersedes
+    // an in-flight prefetch when the open group changes.
+    let prefetchToken = 0;
+    async function prefetchGroup(group) {
+      const token = ++prefetchToken;
+      const bySource = new Map(); // image_index -> { file, items:[{key,bbox}] }
+      for (const inst of group.instances) {
+        const k = cropKey(inst.det_ref);
+        if (cropCache.has(k)) continue;
+        const file = state.fileByImageIndex.get(inst.det_ref.image_index);
+        if (!file || VIDEO_RE.test(file.name)) continue; // video/missing marked at tile creation
+        let e = bySource.get(inst.det_ref.image_index);
+        if (!e) bySource.set(inst.det_ref.image_index, e = { file, items: [] });
+        e.items.push({ key: k, bbox: inst.bbox });
+      }
+      const sources = [...bySource.values()];
+      const total = sources.length;
+      let done = 0, idx = 0;
+      const t0 = performance.now();
+      setBuffering(done, total);
+      async function run() {
+        while (idx < sources.length && token === prefetchToken) {
+          const s = sources[idx++];
+          const results = await mediaCropBatch(s.file, s.items);
+          if (token !== prefetchToken) return; // group changed; drop stale results
+          if (results) {
+            for (const r of results) {
+              if (!r.blob) continue;
+              const url = URL.createObjectURL(r.blob);
+              cropCache.set(r.key, url);
+              fillTile(r.key, url);
+            }
+          } else {
+            for (const it of s.items) { const t = tileByKey.get(it.key); if (t) markTile(t, "failed", "⚠"); }
+          }
+          setBuffering(++done, total);
+        }
+      }
+      await Promise.all(Array.from({ length: DECODE_CONCURRENCY }, run));
+      if (token === prefetchToken) {
+        setBuffering(total, total);
+        if (total) console.log(`[rde] buffered “${group.camera}”: ${total} source images in ${Math.round(performance.now() - t0)} ms`);
+      }
+    }
+
+    function setBuffering(done, total) {
+      const el = $("decode-progress");
+      el.textContent = (!total || done >= total) ? "" : `Buffering crops… ${done}/${total} images`;
     }
 
     function markTile(tile, cls, label) {
@@ -376,12 +390,15 @@
     // ---- Review rendering ----------------------------------------------------
     // 18k tiles across 227 groups would freeze the browser if all rendered at
     // once, so groups are collapsed by default and only the *open* group renders
-    // its tiles (accordion — one at a time); tile canvases are then allocated
-    // lazily on scroll-in (see renderTileCrop).
+    // its tiles (accordion — one at a time); the open group's crops are then
+    // prefetched (batched by source) into the crop cache.
     let openGroup = null;
+    let cachedGroup = null; // whose crops are in cropCache right now
 
     function renderReview() {
-      tileObserver.disconnect();
+      // Moving to a different group: drop the old group's crops (bounded memory).
+      if (openGroup !== cachedGroup) { clearCropCache(); cachedGroup = openGroup; }
+      tileByKey.clear();
       const results = $("results");
       results.innerHTML = "";
       if (!state.groups.length) {
@@ -391,6 +408,7 @@
       const frag = document.createDocumentFragment();
       for (const group of state.groups) frag.appendChild(renderGroup(group));
       results.appendChild(frag);
+      if (openGroup && !openGroup.reviewed) prefetchGroup(openGroup); // idempotent: skips cached crops
     }
 
     function openOnly(group) {
@@ -459,14 +477,19 @@
       tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove");
       tile._instance = instance;
       tile.title = state.imageFiles?.[instance.det_ref.image_index] || ""; // hover: source path
-      // No canvas yet — the div's background is the placeholder; the canvas is
-      // created + decoded only when the tile scrolls into view.
+      const key = cropKey(instance.det_ref);
+      tileByKey.set(key, tile);
       tile.insertAdjacentHTML("beforeend",
         `<span class="badge">${instance.decision === "Keep" ? "keep" : "drop"}</span>` +
         `<span class="conf">${instance.conf.toFixed(2)}</span>`);
       tile.addEventListener("click", () => toggleDecision(instance, tile));
       tile.addEventListener("mouseenter", () => setPreview(instance));
-      tileObserver.observe(tile);
+      // Fill from cache if already decoded; else mark video/missing, or leave a
+      // placeholder for prefetchGroup to fill.
+      const file = state.fileByImageIndex.get(instance.det_ref.image_index);
+      if (cropCache.has(key)) fillTile(key, cropCache.get(key));
+      else if (file && VIDEO_RE.test(file.name)) markTile(tile, "video", "▶ video");
+      else if (!file && state.folderLoaded) markTile(tile, "unmatched", "no image");
       return tile;
     }
 
@@ -584,7 +607,10 @@
       state.fileByImageIndex.clear();
       state.folderLoaded = false;
       openGroup = null;
-      tileObserver.disconnect();
+      cachedGroup = null;
+      clearCropCache();
+      tileByKey.clear();
+      state.imageFiles = null;
       errorEl.textContent = "";
       $("results").innerHTML = "";
     }
