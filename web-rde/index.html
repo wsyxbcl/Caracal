@@ -45,7 +45,9 @@
     .group { content-visibility: auto; contain-intrinsic-size: auto 92px; }
 
     .tiles { display: grid; grid-template-columns: repeat(auto-fill, 92px); gap: 8px; }
-    .tile { width: 92px; height: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; transition: transform 0.05s;
+    .tile { width: 92px; height: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df;
+      /* No transform transition: it can promote every tile to its own compositor
+         layer, which is exactly what we're trying to avoid under software render. */
       /* Skip painting off-screen tiles: under software rendering, compositing a
          whole open group's canvases every scroll frame is the jank. This keeps
          it to a viewport's worth. */
@@ -53,7 +55,7 @@
     .tile canvas, .tile img.crop { display: block; width: 92px; height: 92px; object-fit: cover; }
     .tile.remove { opacity: 0.5; }
     .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
-    .tile:hover { transform: translateY(-1px); }
+    .tile:hover { border-color: var(--muted); }
     .tile .badge { position: absolute; top: 3px; right: 3px; font-size: 11px; font-weight: 700; color: #fff; border-radius: 4px; padding: 1px 5px; }
     .tile.remove .badge { background: var(--remove); }
     .tile.keep .badge { background: var(--keep); }
