@@ -24,9 +24,10 @@
     .lede { color: var(--muted); margin: 0 0 22px; }
     .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
     .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
-    label.file { display: inline-block; border: 1px dashed var(--accent); color: var(--accent); border-radius: 8px; padding: 11px 16px; cursor: pointer; font-weight: 600; }
-    label.file.disabled { opacity: 0.4; pointer-events: none; }
+    .file { display: inline-block; border: 1px dashed var(--accent); color: var(--accent); background: none; font: inherit; border-radius: 8px; padding: 11px 16px; cursor: pointer; font-weight: 600; }
+    .file.disabled, .file:disabled { opacity: 0.4; pointer-events: none; }
     label.file input { display: none; }
+    .file.fallback { border-style: solid; border-color: var(--line); color: var(--muted); font-weight: 500; }
     .metrics { display: flex; gap: 22px; margin-top: 14px; flex-wrap: wrap; }
     .metric b { display: block; font-size: 1.25rem; }
     .metric span { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
@@ -105,6 +106,7 @@
     <div class="card">
       <div class="row">
         <label class="file">1 · Load MegaDetector .json<input id="json-input" type="file" accept=".json,application/json" /></label>
+        <button class="file disabled" id="folder-fsa" hidden>2 · Load image folder</button>
         <label class="file disabled" id="folder-label">2 · Load image folder<input id="folder-input" type="file" webkitdirectory directory multiple /></label>
       </div>
       <p class="hint" id="status">Load a MegaDetector results .json to begin.</p>
@@ -146,7 +148,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-19b";
+    const BUILD = "2026-08-19c";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -177,35 +179,45 @@
     let mNextId = 0;
     const mPending = new Map();
     mediaWorker.addEventListener("message", (event) => {
-      const { id, ok, bitmap, width, height, blob, results } = event.data;
-      const slot = mPending.get(id);
+      const slot = mPending.get(event.data.id);
       if (!slot) return;
-      mPending.delete(id);
-      slot.resolve(ok ? { bitmap, width, height, blob, results } : null); // crop=>blob, frame=>bitmap, cropBatch=>results
+      mPending.delete(event.data.id);
+      slot.resolve(event.data); // callers read .ok / .results / .blob / .bitmap / .offset
     });
-    // Returns { bitmap, width, height } or null. Timing includes the disk read.
-    function mediaDecode(kind, file, bbox) {
+    // A "source" is { file } (webkitdirectory fallback) or { path } (File System
+    // Access — the worker resolves it against the retained directory handle).
+    // Returns { bitmap, width, height } or null.
+    function mediaDecode(kind, src) {
       const t = performance.now();
       const id = ++mNextId;
       return new Promise((resolve) => {
         mPending.set(id, { resolve });
-        mediaWorker.postMessage({ id, kind, file, bbox });
-      }).then((res) => {
-        if (res) recordDecode(performance.now() - t);
-        return res;
+        mediaWorker.postMessage({ id, kind, ...src });
+      }).then((d) => {
+        if (d.ok) { recordDecode(performance.now() - t); return { bitmap: d.bitmap, width: d.width, height: d.height, blob: d.blob }; }
+        return null;
       });
     }
     // Decode one source once and get all its crops: items = [{ key, bbox }].
     // Returns [{ key, blob }] or null. One disk read for the whole batch.
-    function mediaCropBatch(file, items) {
+    function mediaCropBatch(src, items) {
       const t = performance.now();
       const id = ++mNextId;
       return new Promise((resolve) => {
         mPending.set(id, { resolve });
-        mediaWorker.postMessage({ id, kind: "cropBatch", file, items });
-      }).then((res) => {
-        if (res) recordDecode(performance.now() - t);
-        return res?.results || null;
+        mediaWorker.postMessage({ id, kind: "cropBatch", ...src, items });
+      }).then((d) => {
+        if (d.ok) { recordDecode(performance.now() - t); return d.results; }
+        return null;
+      });
+    }
+    // Hand the picked directory handle to the worker; it detects the path offset
+    // from sample media paths. Returns { ok, offset } / { ok:false, error }.
+    function mediaSetRoot(rootHandle, samplePaths) {
+      const id = ++mNextId;
+      return new Promise((resolve) => {
+        mPending.set(id, { resolve });
+        mediaWorker.postMessage({ id, kind: "setRoot", rootHandle, samplePaths });
       });
     }
 
@@ -214,10 +226,20 @@
       fileName: null,
       options: null,
       groups: [],                      // parsed groups; instances carry `decision`
-      imageFiles: null,                // image_index -> json `file` path (for matching + diagnostics)
-      fileByImageIndex: new Map(),     // image_index -> picked File (cheap: a disk reference)
+      imageFiles: null,                // image_index -> json `file` path (also the FSA lookup key)
+      fileByImageIndex: new Map(),     // image_index -> picked File (webkitdirectory fallback only)
       folderLoaded: false,
+      folderMode: "files",             // "files" (webkitdirectory) | "fsa" (directory handle, lazy resolve)
     };
+
+    // A source descriptor for a media, per folder mode. In "fsa" mode we never
+    // build a file index: the worker resolves the json path against the handle.
+    function sourceOf(imageIndex) {
+      const path = state.imageFiles?.[imageIndex];
+      if (state.folderMode === "fsa") return path ? { path, name: path } : null;
+      const file = state.fileByImageIndex.get(imageIndex);
+      return file ? { file, name: file.name } : null;
+    }
 
     // ---- 1. Load MD json -----------------------------------------------------
     $("json-input").addEventListener("change", async (event) => {
@@ -243,6 +265,8 @@
         $("m-matched").textContent = "0";
         $("metrics").hidden = false;
         $("folder-label").classList.remove("disabled");
+        $("folder-fsa").classList.remove("disabled");
+        $("folder-fsa").disabled = false;
         status.textContent = `Loaded ${file.name}. ${state.groups.length} suspicious group(s). Load the image folder to review crops.`;
         goToGroup(0);
         updateExportBar();
@@ -300,6 +324,42 @@
       }
     });
 
+    // ---- 2b. Load image folder via File System Access (no enumeration) -------
+    // Retain the picked directory *handle* and resolve each media's known json
+    // path lazily in the Media Worker — no global file index is ever built. This
+    // is the fast path (Chromium); the webkitdirectory picker above is the
+    // fallback for other browsers.
+    if (window.showDirectoryPicker) {
+      $("folder-fsa").hidden = false;
+      $("folder-label").classList.add("fallback");
+      $("folder-label").firstChild && ($("folder-label").childNodes[0].textContent = "2 · …or webkitdirectory (slow)");
+    }
+    $("folder-fsa").addEventListener("click", async () => {
+      try {
+        const rootHandle = await window.showDirectoryPicker({ id: "rde-images", mode: "read" });
+        status.textContent = `Linking “${rootHandle.name}” to the json paths…`;
+        const suspicious = [...new Set(state.groups.flatMap((g) => g.instances.map((i) => i.det_ref.image_index)))];
+        const samples = suspicious.map((i) => state.imageFiles[i]).filter((p) => p && !VIDEO_RE.test(p)).slice(0, 8);
+        if (!samples.length) throw new Error("no suspicious images to align");
+        const res = await mediaSetRoot(rootHandle, samples);
+        if (!res.ok) throw new Error(res.error || "could not align the folder to the json paths");
+        state.folderMode = "fsa";
+        state.folderLoaded = true;
+        const nImg = suspicious.filter((i) => !VIDEO_RE.test(state.imageFiles[i] || "")).length;
+        const nVid = suspicious.length - nImg;
+        $("m-matched").textContent = `${nImg}`;
+        console.log(`[rde] FSA root “${rootHandle.name}” aligned (strip ${res.offset}) — ${suspicious.length} suspicious media (image ${nImg}, video ${nVid})`);
+        status.textContent =
+          `Linked ${rootHandle.name} — ${nImg.toLocaleString()} image crops` +
+          (nVid ? `, ${nVid.toLocaleString()} video (not shown yet)` : "") +
+          `. ← → to move, Space to keep, Enter for next group.`;
+        goToGroup(currentIndex);
+      } catch (err) {
+        if (err && err.name === "AbortError") return; // user dismissed the picker
+        showError(err);
+      }
+    });
+
     // ---- Crop cache + prefetch (SPEC §5) ------------------------------------
     // Crops are decoded by the Media Worker, batched by source image (one disk
     // read yields all of that image's crops), into a cache of object URLs shown
@@ -337,26 +397,26 @@
     // across the current group AND the prefetched-next group, so advancing is
     // instant without ever seek-storming the HDD.
     let activeSrc = 0; const srcQueue = [];
-    function decodeSourceLimited(file, items) {
-      return new Promise((resolve) => { srcQueue.push({ file, items, resolve }); pumpSrc(); });
+    function decodeSourceLimited(src, items) {
+      return new Promise((resolve) => { srcQueue.push({ src, items, resolve }); pumpSrc(); });
     }
     function pumpSrc() {
       while (activeSrc < DECODE_CONCURRENCY && srcQueue.length) {
         const j = srcQueue.shift(); activeSrc++;
-        mediaCropBatch(j.file, j.items).then(j.resolve).finally(() => { activeSrc--; pumpSrc(); });
+        mediaCropBatch(j.src, j.items).then(j.resolve).finally(() => { activeSrc--; pumpSrc(); });
       }
     }
 
-    // A group's still-uncached image instances, grouped by source image.
+    // A group's still-uncached image instances, grouped by source media.
     function groupSources(group) {
       const bySource = new Map();
       for (const inst of group.instances) {
         const k = cropKey(inst.det_ref);
         if (cropCache.has(k)) continue;
-        const file = state.fileByImageIndex.get(inst.det_ref.image_index);
-        if (!file || VIDEO_RE.test(file.name)) continue; // video/missing marked at tile creation
+        const src = sourceOf(inst.det_ref.image_index);
+        if (!src || VIDEO_RE.test(src.name)) continue; // video/missing handled at tile creation / on failure
         let e = bySource.get(inst.det_ref.image_index);
-        if (!e) bySource.set(inst.det_ref.image_index, e = { file, items: [] });
+        if (!e) bySource.set(inst.det_ref.image_index, e = { src, items: [] });
         e.items.push({ key: k, bbox: inst.bbox });
       }
       return [...bySource.values()];
@@ -378,7 +438,7 @@
       if (showProgress) setBuffering(done, total);
       await Promise.all(sources.map(async (s) => {
         if (!group._active) return;
-        const results = await decodeSourceLimited(s.file, s.items);
+        const results = await decodeSourceLimited(s.src, s.items);
         if (!group._active) return;
         if (results) {
           for (const r of results) {
@@ -388,7 +448,10 @@
             fillTile(r.key, url);
           }
         } else {
-          for (const it of s.items) { const t = tileByKey.get(it.key); if (t) markTile(t, "failed", "⚠"); }
+          // FSA: a failed source is almost always a path that didn't resolve
+          // (moved/renamed/case) — mark "no image"; fallback mode: a decode error.
+          const [cls, label] = state.folderMode === "fsa" ? ["unmatched", "no image"] : ["failed", "⚠"];
+          for (const it of s.items) { const t = tileByKey.get(it.key); if (t) markTile(t, cls, label); }
         }
         if (showProgress) setBuffering(++done, total); else done++;
       }));
@@ -558,12 +621,15 @@
         `<span class="conf">${instance.conf.toFixed(2)}</span>`);
       tile.addEventListener("click", () => toggleDecision(instance, tile));
       tile.addEventListener("mouseenter", () => setPreview(instance));
-      // Fill from cache if already decoded; else mark video/missing, or leave a
-      // placeholder for prefetchGroup to fill.
-      const file = state.fileByImageIndex.get(instance.det_ref.image_index);
+      // Fill from cache if already decoded; else mark video (known from the path)
+      // or missing; else leave a placeholder for prefetchGroup to fill. In FSA
+      // mode a missing image is only known once resolution fails, so we don't
+      // pre-mark "no image" there.
+      const path = state.imageFiles?.[instance.det_ref.image_index];
       if (cropCache.has(key)) fillTile(key, cropCache.get(key));
-      else if (file && VIDEO_RE.test(file.name)) markTile(tile, "video", "▶ video");
-      else if (!file && state.folderLoaded) markTile(tile, "unmatched", "no image");
+      else if (path && VIDEO_RE.test(path)) markTile(tile, "video", "▶ video");
+      else if (state.folderLoaded && state.folderMode === "files" && !state.fileByImageIndex.has(instance.det_ref.image_index))
+        markTile(tile, "unmatched", "no image");
       return tile;
     }
 
@@ -607,11 +673,12 @@
     async function drawPreview(instance) {
       const token = ++previewToken;
       const ctx = previewCanvas.getContext("2d");
-      const file = state.fileByImageIndex.get(instance.det_ref.image_index);
+      const src = sourceOf(instance.det_ref.image_index);
+      const path = state.imageFiles?.[instance.det_ref.image_index] || "";
       const blank = (msg) => { previewCanvas.width = 400; previewCanvas.height = 220; ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, 400, 220); previewMeta.textContent = msg; };
-      if (!file) { blank("Image not loaded — load the folder to see the full frame."); return; }
-      if (VIDEO_RE.test(file.name)) { blank("Video frame preview not supported yet."); return; }
-      const res = await mediaDecode("frame", file); // decoded in the Media Worker
+      if (!state.folderLoaded || !src) { blank("Image not loaded — load the folder to see the full frame."); return; }
+      if (VIDEO_RE.test(path)) { blank("Video frame preview not supported yet."); return; }
+      const res = await mediaDecode("frame", src); // decoded in the Media Worker
       if (token !== previewToken) { res?.bitmap?.close(); return; } // a newer hover won
       if (!res || !res.bitmap) { blank("Could not read this image."); return; }
       const scale = Math.min(1, PREVIEW_W / res.width);
@@ -622,8 +689,7 @@
       const [x, y, w, h] = instance.bbox;
       ctx.lineWidth = Math.max(2, cw / 240); ctx.strokeStyle = "#e23b2e";
       ctx.strokeRect(x * cw, y * chh, w * cw, h * chh);
-      const name = file.webkitRelativePath || file.name;
-      previewMeta.innerHTML = `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}<br>${name}`;
+      previewMeta.innerHTML = `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}<br>${path}`;
     }
 
     // ---- Decisions -----------------------------------------------------------
@@ -682,12 +748,15 @@
       state.groups = [];
       state.fileByImageIndex.clear();
       state.folderLoaded = false;
+      state.folderMode = "files";
       currentIndex = 0;
       focusIndex = 0;
       currentGrid = null;
       clearCropCache();
       tileByKey.clear();
       state.imageFiles = null;
+      $("folder-fsa").classList.add("disabled");
+      $("folder-fsa").disabled = true;
       errorEl.textContent = "";
       $("results").innerHTML = "";
     }
