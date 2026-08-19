@@ -61,7 +61,7 @@
 
     .workspace { display: flex; gap: 20px; align-items: flex-start; }
     .review { flex: 1 1 auto; min-width: 0; }
-    .preview { flex: 0 0 400px; position: sticky; top: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; will-change: transform; }
+    .preview { flex: 0 0 400px; position: sticky; top: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
     .preview h2 { font-size: 0.95rem; margin: 0 0 10px; }
     .preview canvas { width: 100%; height: auto; max-height: 62vh; object-fit: contain; border-radius: 6px; background: #efe9df; display: block; }
     .preview-meta { color: var(--muted); font-size: 0.82rem; margin: 10px 0 0; word-break: break-all; }
@@ -72,7 +72,7 @@
       .preview canvas { max-height: none; }
     }
 
-    .exportbar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 16px; align-items: center; justify-content: center; will-change: transform; }
+    .exportbar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 16px; align-items: center; justify-content: center; }
     .exportbar button { font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; }
     .exportbar button:disabled { opacity: 0.4; cursor: default; }
     .exportbar .summary { color: var(--muted); font-size: 0.9rem; }
@@ -472,11 +472,24 @@
     }
 
     // ---- Context preview: full frame + red box, decoded on demand ------------
+    // Keep the preview canvas modest: it's a ~400px sticky panel, and a big
+    // canvas is expensive to re-composite every scroll frame under software
+    // rendering. 720 covers a HiDPI panel with margin.
+    const PREVIEW_W = 720;
     let previewToken = 0;
     let previewTimer = 0;
+    // Don't decode/redraw the preview while the user is scrolling: scrolling
+    // drags tiles under a stationary cursor, firing a storm of `mouseenter`s —
+    // decoding a full frame off the HDD for each would jank the scroll.
+    let scrolling = false, scrollIdle = 0;
+    addEventListener("scroll", () => {
+      scrolling = true;
+      clearTimeout(scrollIdle);
+      scrollIdle = setTimeout(() => { scrolling = false; }, 160);
+    }, { passive: true });
     function setPreview(instance) {
       clearTimeout(previewTimer);
-      previewTimer = setTimeout(() => drawPreview(instance), 60); // settle before decoding
+      previewTimer = setTimeout(() => { if (!scrolling) drawPreview(instance); }, 90); // settle + not mid-scroll
     }
     async function drawPreview(instance) {
       const token = ++previewToken;
@@ -488,12 +501,14 @@
       const res = await mediaDecode("frame", file); // decoded in the Media Worker
       if (token !== previewToken) { res?.bitmap?.close(); return; } // a newer hover won
       if (!res || !res.bitmap) { blank("Could not read this image."); return; }
-      previewCanvas.width = res.width; previewCanvas.height = res.height;
-      ctx.drawImage(res.bitmap, 0, 0);
+      const scale = Math.min(1, PREVIEW_W / res.width);
+      const cw = Math.round(res.width * scale), chh = Math.round(res.height * scale);
+      previewCanvas.width = cw; previewCanvas.height = chh;
+      ctx.drawImage(res.bitmap, 0, 0, cw, chh);
       res.bitmap.close();
       const [x, y, w, h] = instance.bbox;
-      ctx.lineWidth = Math.max(2, res.width / 240); ctx.strokeStyle = "#e23b2e";
-      ctx.strokeRect(x * res.width, y * res.height, w * res.width, h * res.height);
+      ctx.lineWidth = Math.max(2, cw / 240); ctx.strokeStyle = "#e23b2e";
+      ctx.strokeRect(x * cw, y * chh, w * cw, h * chh);
       const name = file.webkitRelativePath || file.name;
       previewMeta.innerHTML = `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}<br>${name}`;
     }
