@@ -50,7 +50,7 @@
          whole open group's canvases every scroll frame is the jank. This keeps
          it to a viewport's worth. */
       content-visibility: auto; contain-intrinsic-size: 92px 92px; }
-    .tile canvas { display: block; width: 92px; height: 92px; }
+    .tile canvas, .tile img.crop { display: block; width: 92px; height: 92px; object-fit: cover; }
     .tile.remove { opacity: 0.5; }
     .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
     .tile:hover { transform: translateY(-1px); }
@@ -132,7 +132,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-18a";
+    const BUILD = "2026-08-19a";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -163,11 +163,11 @@
     let mNextId = 0;
     const mPending = new Map();
     mediaWorker.addEventListener("message", (event) => {
-      const { id, ok, bitmap, width, height } = event.data;
+      const { id, ok, bitmap, width, height, blob } = event.data;
       const slot = mPending.get(id);
       if (!slot) return;
       mPending.delete(id);
-      slot.resolve(ok ? { bitmap, width, height } : null);
+      slot.resolve(ok ? { bitmap, width, height, blob } : null); // crop=>blob, frame=>bitmap
     });
     // Returns { bitmap, width, height } or null. Timing includes the disk read.
     function mediaDecode(kind, file, bbox) {
@@ -341,17 +341,20 @@
         (tile.isConnected && tile._near) ? mediaDecode("crop", file, tile._instance.bbox) : SKIP);
       tile._decoding = false;
       if (res === SKIP) return; // scrolled away before its turn; will retry on re-entry
-      if (!tile.isConnected) { res?.bitmap?.close(); return; }
-      if (!res || !res.bitmap) { markTile(tile, "failed", "⚠"); return; }
-      // Allocate the canvas only now, and blit the finished crop with ~no main-
-      // thread pixel work (bitmaprenderer transfers the ImageBitmap in).
-      let canvas = tile.querySelector("canvas");
-      if (!canvas) {
-        canvas = document.createElement("canvas");
-        canvas.width = TILE; canvas.height = TILE;
-        tile.insertBefore(canvas, tile.firstChild);
+      if (!tile.isConnected) { return; }
+      if (!res || !res.blob) { markTile(tile, "failed", "⚠"); return; }
+      // Show the crop in an <img>, not a <canvas>: a canvas becomes its own
+      // compositor layer and ~170 of them freezes the software compositor. An
+      // <img> paints into the grid layer. Revoke the object URL once decoded.
+      let img = tile.querySelector("img.crop");
+      if (!img) {
+        img = document.createElement("img");
+        img.className = "crop"; img.width = TILE; img.height = TILE; img.decoding = "async";
+        tile.insertBefore(img, tile.firstChild);
       }
-      canvas.getContext("bitmaprenderer").transferFromImageBitmap(res.bitmap);
+      const url = URL.createObjectURL(res.blob);
+      img.onload = img.onerror = () => URL.revokeObjectURL(url);
+      img.src = url;
       tile._drawn = true;
     }
 

@@ -44,8 +44,12 @@ self.onmessage = async (event) => {
     ctx.strokeRect(dx + (bx - cx) * scale, dy + (by - cy) * scale, bw * scale, bh * scale);
     src.close();
 
-    const crop = off.transferToImageBitmap();
-    self.postMessage({ id, ok: true, bitmap: crop }, [crop]);
+    // Return a Blob, not an ImageBitmap: the tile shows it in an <img>, which
+    // paints into the grid layer. A <canvas> per tile would each become its own
+    // compositor layer — ~170 of them freezes the software compositor (SPEC §5,
+    // confirmed by trace: 156-171 layers, 2.6s commit stalls).
+    const blob = await off.convertToBlob({ type: "image/png" });
+    self.postMessage({ id, ok: true, blob });
   } catch {
     self.postMessage({ id, ok: false }); // e.g. video file or unreadable image
   }
