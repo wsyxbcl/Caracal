@@ -45,7 +45,11 @@
     .group { content-visibility: auto; contain-intrinsic-size: auto 92px; }
 
     .tiles { display: grid; grid-template-columns: repeat(auto-fill, 92px); gap: 8px; }
-    .tile { width: 92px; height: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; transition: transform 0.05s; }
+    .tile { width: 92px; height: 92px; border-radius: 7px; overflow: hidden; cursor: pointer; position: relative; border: 2px solid var(--remove); background: #efe9df; transition: transform 0.05s;
+      /* Skip painting off-screen tiles: under software rendering, compositing a
+         whole open group's canvases every scroll frame is the jank. This keeps
+         it to a viewport's worth. */
+      content-visibility: auto; contain-intrinsic-size: 92px 92px; }
     .tile canvas { display: block; width: 92px; height: 92px; }
     .tile.remove { opacity: 0.5; }
     .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
