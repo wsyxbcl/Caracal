@@ -311,15 +311,19 @@
       }
     }
 
-    // Decode a tile's crop only when it nears the viewport.
+    // Decode a tile's crop only while it's near the viewport. We keep observing
+    // (don't unobserve on enter) and track `_near`, so a tile that scrolls back
+    // in re-triggers — and, crucially, so a decode can be skipped if the tile
+    // scrolled away before its turn (see the SKIP check below). That bounds disk
+    // reads to ~a viewport during a fast scroll instead of a whole group's page
+    // of them — the difference between a smooth HDD and a seek-storm.
+    const SKIP = Symbol("skip"); // decode not run: tile left the viewport / was removed
     const tileObserver = new IntersectionObserver((entries) => {
       for (const entry of entries) {
-        if (entry.isIntersecting) {
-          tileObserver.unobserve(entry.target);
-          renderTileCrop(entry.target);
-        }
+        entry.target._near = entry.isIntersecting;
+        if (entry.isIntersecting) renderTileCrop(entry.target);
       }
-    }, { rootMargin: "300px" });
+    }, { rootMargin: "200px" });
 
     async function renderTileCrop(tile) {
       if (tile._drawn || tile._decoding) return;
@@ -327,9 +331,12 @@
       if (!file) { if (state.folderLoaded) markTile(tile, "unmatched", "no image"); return; }
       if (VIDEO_RE.test(file.name)) { markTile(tile, "video", "▶ video"); return; } // decode is P3
       tile._decoding = true;
-      // The Media Worker decodes + crops; skip if the tile was removed meanwhile.
-      const res = await scheduleDecode(() => (tile.isConnected ? mediaDecode("crop", file, tile._instance.bbox) : null));
+      // Re-check at execution time: only touch the disk if the tile is still on
+      // screen. Otherwise skip — it re-enters -> re-triggers -> decodes then.
+      const res = await scheduleDecode(() =>
+        (tile.isConnected && tile._near) ? mediaDecode("crop", file, tile._instance.bbox) : SKIP);
       tile._decoding = false;
+      if (res === SKIP) return; // scrolled away before its turn; will retry on re-entry
       if (!tile.isConnected) { res?.bitmap?.close(); return; }
       if (!res || !res.bitmap) { markTile(tile, "failed", "⚠"); return; }
       // Allocate the canvas only now, and blit the finished crop with ~no main-
