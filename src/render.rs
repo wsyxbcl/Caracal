@@ -15,6 +15,29 @@ fn chart_from_table(table: &DataFrame) -> Result<Chart> {
     Ok(Chart::build(dataset)?)
 }
 
+/// Species-count bar chart (maze-stats). `stats` has `species` + `detections`
+/// (and `captures`); `metric` picks which column to plot. Rows should already be
+/// sorted descending, so the categorical x-axis follows that order. Returns a
+/// background-stripped SVG the frontend inserts and can layer light interactions
+/// (hover/highlight) onto.
+pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str) -> Result<String> {
+    use polars::prelude::*;
+    let has_captures = stats.get_column_names().iter().any(|name| name.as_str() == "captures");
+    let value_col = if metric == "captures" && has_captures { "captures" } else { "detections" };
+    // Two columns (species, count) in the incoming sorted order.
+    let table = stats
+        .clone()
+        .lazy()
+        .select([col("species"), col(value_col).alias("count")])
+        .collect()
+        .context("failed to project species/count")?;
+    let svg = chart_from_table(&table)?
+        .mark_bar()?
+        .encode((x("species"), y("count")))?
+        .to_svg()?;
+    Ok(strip_svg_background(&svg))
+}
+
 fn add_series_to_dataset(dataset: &mut Dataset, series: &Series) -> Result<()> {
     let name = series.name().to_string();
     match series.dtype() {

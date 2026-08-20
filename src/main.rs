@@ -1,6 +1,7 @@
 mod data;
 mod render;
 mod report;
+mod species;
 mod util;
 mod web_app;
 

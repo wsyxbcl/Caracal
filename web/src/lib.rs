@@ -2,13 +2,17 @@
 mod data;
 #[path = "../../src/render.rs"]
 mod render;
+#[path = "../../src/species.rs"]
+mod species;
 #[path = "../../src/util.rs"]
 mod util;
 
+use polars::prelude::*;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 use crate::data::{OverviewBucket, PreparedData};
+use crate::species::SpeciesData;
 use crate::util::{format_count, format_date, format_timestamp};
 
 #[wasm_bindgen(start)]
@@ -19,6 +23,7 @@ pub fn init_runtime() {
 #[wasm_bindgen]
 pub struct WasmExplorer {
     data: PreparedData,
+    species: SpeciesData, // maze-stats: same CSV, species-analysis view
 }
 
 #[derive(Serialize)]
@@ -71,7 +76,72 @@ impl WasmExplorer {
     pub fn new(csv_content: String, deploy_path_index: i32) -> Result<WasmExplorer, JsValue> {
         let override_index = (deploy_path_index >= 1).then_some(deploy_path_index);
         let data = PreparedData::from_csv_text(&csv_content, override_index).map_err(to_js_error)?;
-        Ok(Self { data })
+        let species = SpeciesData::from_csv_text(&csv_content).map_err(to_js_error)?;
+        Ok(Self { data, species })
+    }
+
+    // ---- maze-stats: species analysis --------------------------------------
+    /// Whether this CSV carries a `species` column (enables the species tab).
+    pub fn species_available(&self) -> bool {
+        self.species.has_species()
+    }
+
+    /// Projects to choose from (JSON array). `["__all__"]` when there's no
+    /// `project` column.
+    pub fn projects_json(&self) -> Result<String, JsValue> {
+        let projects = self.species.projects().map_err(to_js_error)?;
+        serde_json::to_string(&projects).map_err(to_js_error)
+    }
+
+    /// Collections + deployments within a project, plus whether captures are
+    /// available. JSON: `{ collections, deployments, has_event_id }`.
+    pub fn project_summary_json(&self, project: String) -> Result<String, JsValue> {
+        let (collections, deployments) =
+            self.species.project_summary(&project).map_err(to_js_error)?;
+        #[derive(Serialize)]
+        struct Summary {
+            collections: Vec<String>,
+            deployments: Vec<String>,
+            has_event_id: bool,
+        }
+        serde_json::to_string(&Summary {
+            collections,
+            deployments,
+            has_event_id: self.species.has_event_id(),
+        })
+        .map_err(to_js_error)
+    }
+
+    /// Per-species counts as JSON rows `[{ species, detections, captures? }]`,
+    /// filtered + sorted by `sort_metric` ("detections" | "captures").
+    pub fn species_stats_json(
+        &self,
+        project: String,
+        collections: String,
+        deployments: String,
+        sort_metric: String,
+    ) -> Result<String, JsValue> {
+        let df = self
+            .species
+            .species_stats(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &sort_metric)
+            .map_err(to_js_error)?;
+        species_stats_to_json(&df)
+    }
+
+    /// Species bar chart (charton SVG) for the current filter + metric.
+    pub fn render_species_bar(
+        &self,
+        project: String,
+        collections: String,
+        deployments: String,
+        metric: String,
+        _theme: String,
+    ) -> Result<String, JsValue> {
+        let df = self
+            .species
+            .species_stats(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &metric)
+            .map_err(to_js_error)?;
+        render::species_bar_svg(&df, &metric).map_err(to_js_error)
     }
 
     pub fn metadata_json(&self) -> Result<String, JsValue> {
@@ -190,4 +260,31 @@ fn normalize_deployment(data: &PreparedData, deployment: &str) -> Result<String,
 
 fn to_js_error(error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&error.to_string())
+}
+
+/// Parse a JSON string array (the UI's multi-select) into `Vec<String>`.
+fn parse_str_list(json: &str) -> Result<Vec<String>, JsValue> {
+    serde_json::from_str(json).map_err(to_js_error)
+}
+
+/// Serialize a species-stats DataFrame (`species`, `detections`, optional
+/// `captures`) to JSON rows for the table.
+fn species_stats_to_json(df: &DataFrame) -> Result<String, JsValue> {
+    #[derive(Serialize)]
+    struct Row {
+        species: String,
+        detections: u32,
+        captures: Option<u32>,
+    }
+    let species = df.column("species").map_err(to_js_error)?.str().map_err(to_js_error)?;
+    let detections = df.column("detections").map_err(to_js_error)?.u32().map_err(to_js_error)?;
+    let captures = df.column("captures").ok().map(|c| c.u32()).transpose().map_err(to_js_error)?;
+    let rows: Vec<Row> = (0..df.height())
+        .map(|i| Row {
+            species: species.get(i).unwrap_or("").to_string(),
+            detections: detections.get(i).unwrap_or(0),
+            captures: captures.as_ref().and_then(|c| c.get(i)),
+        })
+        .collect();
+    serde_json::to_string(&rows).map_err(to_js_error)
 }
