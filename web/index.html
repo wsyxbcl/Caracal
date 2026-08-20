@@ -854,6 +854,22 @@
             height: calc(94vh - 20px);
             min-width: 0;
         }
+        /* maze-stats: species analysis */
+        .mode-switch { display: flex; gap: 6px; margin: 8px 0 18px; }
+        .mode-tab { font: inherit; font-weight: 600; padding: 8px 16px; border: 1px solid var(--line); background: var(--card); color: var(--muted); border-radius: var(--radius-sm); cursor: pointer; }
+        .mode-tab.is-active { color: var(--accent); border-color: var(--accent); }
+        .mode-tab:disabled { opacity: 0.4; cursor: not-allowed; }
+        .chip-multiselect { display: flex; flex-wrap: wrap; gap: 6px; max-height: 104px; overflow: auto; padding: 4px 0; }
+        .chip { font: inherit; font-size: 0.82rem; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--muted); cursor: pointer; }
+        .chip.is-on { background: var(--accent); color: #fff; border-color: var(--accent); }
+        .filter-hint { color: var(--muted); font-weight: 400; font-size: 0.78rem; }
+        .species-stat-line { color: var(--muted); font-size: 0.9rem; margin: 4px 0 12px; }
+        .species-table-head { display: flex; gap: 10px; align-items: center; margin: 16px 0 8px; }
+        .species-table-head input { flex: 1; font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); color: var(--ink); }
+        #species-table-wrap table { min-width: 0; }
+        #species-table-wrap th { cursor: pointer; user-select: none; white-space: nowrap; }
+        #species-table-wrap th.sorted-asc::after { content: " ▲"; color: var(--accent); }
+        #species-table-wrap th.sorted-desc::after { content: " ▼"; color: var(--accent); }
     </style>
     <script>
         // Set the theme before first paint to avoid a flash of the wrong theme.
@@ -944,6 +960,11 @@
                 </div>
             </section>
 
+            <div class="mode-switch hidden" id="mode-switch" role="tablist">
+                <button class="mode-tab is-active" id="mode-time" type="button" role="tab">Time analysis</button>
+                <button class="mode-tab" id="mode-species" type="button" role="tab" disabled title="Add a 'species' column to enable">Species analysis</button>
+            </div>
+
             <section class="panel hidden" id="controls-panel">
                 <h2 id="controls-title">Controls</h2>
                 <p id="controls-copy">These controls rerun the Rust aggregation and Charton rendering inside the WASM module, then swap in fresh SVG output.</p>
@@ -1008,6 +1029,44 @@
                 <div class="table-wrap" id="inventory-frame">
                     <div class="placeholder" id="inventory-placeholder">Upload a CSV to populate the deployment inventory.</div>
                 </div>
+            </section>
+
+            <!-- maze-stats: species analysis (hidden until you switch mode) -->
+            <section class="panel species-only hidden" id="section-species">
+                <h2>Species analysis</h2>
+                <p>Per-species counts from the same CSV — filter by project, then collection and deployment.</p>
+                <div class="toolbar">
+                    <div class="control">
+                        <label for="species-project">Project</label>
+                        <select id="species-project"></select>
+                    </div>
+                    <div class="control">
+                        <label for="species-metric">Metric</label>
+                        <select id="species-metric">
+                            <option value="detections">有效探测次数 (detections)</option>
+                            <option value="captures">独立捕获次数 (captures)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="toolbar" id="species-filters">
+                    <div class="control">
+                        <label>Collections <span class="filter-hint" id="species-collection-hint"></span></label>
+                        <div class="chip-multiselect" id="species-collections"></div>
+                    </div>
+                    <div class="control">
+                        <label>Deployments <span class="filter-hint" id="species-deployment-hint"></span></label>
+                        <div class="chip-multiselect" id="species-deployments"></div>
+                    </div>
+                </div>
+                <div class="species-stat-line" id="species-stat-line"></div>
+                <div class="chart-frame" id="species-frame">
+                    <div class="placeholder" id="species-placeholder">Pick a project to render species counts.</div>
+                </div>
+                <div class="species-table-head">
+                    <input type="search" id="species-table-search" placeholder="Filter species…" />
+                    <button class="secondary" id="species-table-export" type="button">Export CSV</button>
+                </div>
+                <div class="table-wrap" id="species-table-wrap"></div>
             </section>
         </div>
     </main>
@@ -2252,6 +2311,7 @@
 
             populateControls();
             await renderAll();
+            initSpeciesMode();
         }
 
         async function openLocalCsvFromDisk() {
@@ -2497,6 +2557,142 @@
                 closeFullscreen();
             }
         });
+
+        // ---- maze-stats: species analysis --------------------------------------
+        const spEl = {
+            switch: document.getElementById("mode-switch"),
+            timeTab: document.getElementById("mode-time"),
+            speciesTab: document.getElementById("mode-species"),
+            section: document.getElementById("section-species"),
+            project: document.getElementById("species-project"),
+            metric: document.getElementById("species-metric"),
+            collections: document.getElementById("species-collections"),
+            deployments: document.getElementById("species-deployments"),
+            collectionHint: document.getElementById("species-collection-hint"),
+            deploymentHint: document.getElementById("species-deployment-hint"),
+            statLine: document.getElementById("species-stat-line"),
+            frame: document.getElementById("species-frame"),
+            tableWrap: document.getElementById("species-table-wrap"),
+            tableSearch: document.getElementById("species-table-search"),
+            tableExport: document.getElementById("species-table-export"),
+        };
+        const TIME_SECTIONS = ["controls-panel", "section-overview", "section-detail", "section-hours", "section-inventory"];
+        const speciesState = { project: null, collections: new Set(), deployments: new Set(), metric: "detections", rows: [], sort: { key: "detections", dir: "desc" }, wired: false };
+
+        const escHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+        const escAttr = (s) => String(s).replace(/"/g, "&quot;");
+        const csvCell = (s) => { s = String(s); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+
+        function setMode(mode) {
+            const species = mode === "species";
+            spEl.timeTab.classList.toggle("is-active", !species);
+            spEl.speciesTab.classList.toggle("is-active", species);
+            TIME_SECTIONS.forEach((id) => document.getElementById(id).classList.toggle("hidden", species));
+            spEl.section.classList.toggle("hidden", !species);
+            if (species) renderSpecies();
+        }
+
+        function initSpeciesMode() {
+            const available = explorer.species_available();
+            spEl.switch.classList.remove("hidden");
+            spEl.speciesTab.disabled = !available;
+            if (!available) { setMode("time"); return; }
+            const projects = JSON.parse(explorer.projects_json());
+            spEl.project.innerHTML = projects.map((p) => `<option value="${escAttr(p)}">${p === "__all__" ? "(all data)" : escHtml(p)}</option>`).join("");
+            speciesState.project = projects[0];
+            loadProjectFilters();
+            if (!speciesState.wired) { wireSpeciesControls(); speciesState.wired = true; }
+        }
+
+        function loadProjectFilters() {
+            const summary = JSON.parse(explorer.project_summary_json(speciesState.project));
+            speciesState.collections = new Set(); // none selected = show all
+            speciesState.deployments = new Set();
+            renderChips(spEl.collections, summary.collections, speciesState.collections, spEl.collectionHint);
+            renderChips(spEl.deployments, summary.deployments, speciesState.deployments, spEl.deploymentHint);
+            const capOpt = spEl.metric.querySelector('option[value="captures"]');
+            capOpt.disabled = !summary.has_event_id;
+            if (!summary.has_event_id && speciesState.metric === "captures") { speciesState.metric = "detections"; spEl.metric.value = "detections"; }
+        }
+
+        function renderChips(container, values, selectedSet, hintEl) {
+            container.innerHTML = "";
+            values.forEach((v) => {
+                const chip = document.createElement("button");
+                chip.type = "button"; chip.className = "chip"; chip.textContent = v;
+                chip.addEventListener("click", () => {
+                    if (selectedSet.has(v)) { selectedSet.delete(v); chip.classList.remove("is-on"); }
+                    else { selectedSet.add(v); chip.classList.add("is-on"); }
+                    hintEl.textContent = selectedSet.size ? `(${selectedSet.size} of ${values.length})` : `(all ${values.length})`;
+                    renderSpecies();
+                });
+                container.appendChild(chip);
+            });
+            hintEl.textContent = `(all ${values.length})`;
+        }
+
+        function wireSpeciesControls() {
+            spEl.timeTab.addEventListener("click", () => setMode("time"));
+            spEl.speciesTab.addEventListener("click", () => { if (!spEl.speciesTab.disabled) setMode("species"); });
+            spEl.project.addEventListener("change", () => { speciesState.project = spEl.project.value; loadProjectFilters(); renderSpecies(); });
+            spEl.metric.addEventListener("change", () => { speciesState.metric = spEl.metric.value; speciesState.sort = { key: speciesState.metric, dir: "desc" }; renderSpecies(); });
+            spEl.tableSearch.addEventListener("input", renderSpeciesTable);
+            spEl.tableExport.addEventListener("click", exportSpeciesCsv);
+        }
+
+        function renderSpecies() {
+            if (spEl.section.classList.contains("hidden") || !explorer) return;
+            const project = speciesState.project;
+            const collections = JSON.stringify([...speciesState.collections]);
+            const deployments = JSON.stringify([...speciesState.deployments]);
+            const metric = speciesState.metric;
+            const summary = JSON.parse(explorer.project_summary_json(project));
+            spEl.statLine.textContent = `${summary.collections.length} collections · ${summary.deployments.length} deployments`
+                + (speciesState.collections.size ? ` · ${speciesState.collections.size} collection(s) selected` : "")
+                + (speciesState.deployments.size ? ` · ${speciesState.deployments.size} deployment(s) selected` : "");
+            try {
+                const svg = explorer.render_species_bar(project, collections, deployments, metric, chartTheme());
+                mountSvg(spEl.frame, svg, { zoomable: true });
+            } catch (err) { spEl.frame.innerHTML = `<div class="placeholder">${escHtml(err && err.message || err)}</div>`; }
+            speciesState.rows = JSON.parse(explorer.species_stats_json(project, collections, deployments, metric));
+            speciesState.sort = { key: metric, dir: "desc" };
+            renderSpeciesTable();
+        }
+
+        function renderSpeciesTable() {
+            const q = (spEl.tableSearch.value || "").trim().toLowerCase();
+            const hasCap = speciesState.rows.some((r) => r.captures != null);
+            const { key, dir } = speciesState.sort;
+            const rows = speciesState.rows
+                .filter((r) => !q || r.species.toLowerCase().includes(q))
+                .slice()
+                .sort((a, b) => {
+                    if (key === "species") return dir === "asc" ? String(a.species).localeCompare(b.species) : String(b.species).localeCompare(a.species);
+                    const av = a[key] ?? -1, bv = b[key] ?? -1;
+                    return dir === "asc" ? av - bv : bv - av;
+                });
+            const cols = [["species", "Species"], ["detections", "有效探测次数"]];
+            if (hasCap) cols.push(["captures", "独立捕获次数"]);
+            const ths = cols.map(([k, label]) => `<th data-key="${k}" class="${key === k ? (dir === "asc" ? "sorted-asc" : "sorted-desc") : ""}">${label}</th>`).join("");
+            const trs = rows.map((r) => `<tr><td>${escHtml(r.species)}</td><td>${r.detections}</td>${hasCap ? `<td>${r.captures ?? ""}</td>` : ""}</tr>`).join("");
+            spEl.tableWrap.innerHTML = `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+            spEl.tableWrap.querySelectorAll("th").forEach((th) => th.addEventListener("click", () => {
+                const k = th.dataset.key;
+                if (speciesState.sort.key === k) speciesState.sort.dir = speciesState.sort.dir === "asc" ? "desc" : "asc";
+                else speciesState.sort = { key: k, dir: k === "species" ? "asc" : "desc" };
+                renderSpeciesTable();
+            }));
+        }
+
+        function exportSpeciesCsv() {
+            const hasCap = speciesState.rows.some((r) => r.captures != null);
+            const header = hasCap ? "species,detections,captures" : "species,detections";
+            const lines = speciesState.rows.map((r) => hasCap ? `${csvCell(r.species)},${r.detections},${r.captures ?? ""}` : `${csvCell(r.species)},${r.detections}`);
+            const blob = new Blob(["﻿" + header + "\n" + lines.join("\n")], { type: "text/csv;charset=utf-8" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a"); a.href = url; a.download = "species_stats.csv"; a.click();
+            URL.revokeObjectURL(url);
+        }
     </script>
 </body>
 </html>
