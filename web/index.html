@@ -1986,6 +1986,12 @@
             if (!names.size) {
                 return;
             }
+            // Who handles a deployment picked from the graph: the main tool by
+            // default, or a caller-supplied handler (e.g. the species-time view).
+            const pick = options.onSelect || (async (label) => {
+                deploymentSelect.value = label;
+                await renderDetail();
+            });
 
             for (const node of frame.querySelectorAll("svg text")) {
                 const label = node.textContent?.trim();
@@ -2002,10 +2008,8 @@
                     if (options.rowHighlight) {
                         toggleDeploymentRowHighlight(frame, label);
                     }
-
-                    deploymentSelect.value = label;
                     try {
-                        await renderDetail();
+                        await pick(label);
                     } catch (error) {
                         showError(error && error.message ? error.message : String(error));
                     }
@@ -2024,9 +2028,8 @@
                             }
 
                             toggleDeploymentRowHighlight(frame, deployment);
-                            deploymentSelect.value = deployment;
                             try {
-                                await renderDetail();
+                                await pick(deployment);
                             } catch (error) {
                                 showError(error && error.message ? error.message : String(error));
                             }
@@ -2782,9 +2785,18 @@
         function renderSpeciesTime() {
             if (!speciesTimeExplorer) return;
             const theme = chartTheme();
-            try { mountSvg(spTimeEl.overview, speciesTimeExplorer.render_overview(spTimeEl.bucket.value, theme), { zoomable: true, deploymentAxis: true, rowHighlight: true }); }
+            // Picking a deployment in these graphs drives the species-time detail,
+            // not the (hidden) main tool.
+            const onSelect = (deployment) => {
+                if ([...spTimeEl.deployment.options].some((o) => o.value === deployment)) {
+                    spTimeEl.deployment.value = deployment;
+                    renderSpeciesDetail();
+                }
+            };
+            const opts = { zoomable: true, deploymentAxis: true, rowHighlight: true, onSelect };
+            try { mountSvg(spTimeEl.overview, speciesTimeExplorer.render_overview(spTimeEl.bucket.value, theme), opts); }
             catch (e) { spTimeEl.overview.innerHTML = `<div class="placeholder">${escHtml(e && e.message || e)}</div>`; }
-            try { mountSvg(spTimeEl.hour, speciesTimeExplorer.render_hour_heatmap(theme), { zoomable: true, deploymentAxis: true, rowHighlight: true }); } catch (e) {}
+            try { mountSvg(spTimeEl.hour, speciesTimeExplorer.render_hour_heatmap(theme), opts); } catch (e) {}
             renderSpeciesDetail();
         }
 

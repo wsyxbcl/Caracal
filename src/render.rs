@@ -51,74 +51,21 @@ pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str) -> Resu
         .encode((x("species"), y("count"), text("label")))?;
     let svg = bars
         .and(value_labels)
-        .with_size(width, 620)
-        .with_x_label("species")
+        .with_size(width, 460)
+        .with_x_label("") // "species" is redundant
         .with_y_label(y_label)
         .configure_theme(|_| {
             base_theme()
                 .with_tick_label_size(11.0)
-                .with_x_tick_label_angle(-45.0) // upright-ish CJK labels that don't collide
-                .with_axis_reserve_buffer(10.0)
-                .with_left_margin(0.09)
-                .with_right_margin(0.03)
-                .with_bottom_margin(0.28)
-                .with_top_margin(0.06)
+                .with_x_tick_label_angle(-45.0)
+                .with_axis_reserve_buffer(14.0)
+                .with_left_margin(0.07)
+                .with_right_margin(0.02)
+                .with_bottom_margin(0.34) // room for the full (untrimmed) labels
+                .with_top_margin(0.05)
         })
         .to_svg()?;
-    let svg = humanize_axis_numbers(&svg);
-    let svg = shorten_species_x_labels(&svg);
-    Ok(strip_svg_background(&svg))
-}
-
-/// Shorten long bilingual species labels on the x-axis to a compact form (the
-/// trailing CJK name if present, e.g. "Blue sheep 岩羊" -> "岩羊", matching the
-/// reference figures; otherwise truncate). The bars stay keyed by the full
-/// species — only the displayed tick text changes — and the table keeps full
-/// names.
-fn shorten_species_x_labels(svg: &str) -> String {
-    svg.lines()
-        .map(|line| {
-            if !is_rotated_bottom_tick_label(line) {
-                return line.to_string();
-            }
-            let (Some(open), Some(close)) = (line.find('>'), line.rfind('<')) else {
-                return line.to_string();
-            };
-            if open >= close {
-                return line.to_string();
-            }
-            let content = &line[open + 1..close];
-            let short = short_species_label(content);
-            if short == content {
-                line.to_string()
-            } else {
-                format!("{}>{}{}", &line[..open], short, &line[close..])
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn short_species_label(full: &str) -> String {
-    let trimmed = full.trim();
-    // Prefer a trailing space-separated token that is CJK (the Chinese name).
-    if let Some(last) = trimmed.rsplit(' ').next() {
-        if last != trimmed && last.chars().any(is_cjk) {
-            return last.to_string();
-        }
-    }
-    // Otherwise cap the length so it doesn't crowd the axis.
-    const MAX: usize = 14;
-    if trimmed.chars().count() > MAX {
-        let head: String = trimmed.chars().take(MAX).collect();
-        format!("{head}…")
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn is_cjk(ch: char) -> bool {
-    matches!(ch, '\u{3400}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+    Ok(strip_svg_background(&humanize_axis_numbers(&svg)))
 }
 
 /// Rewrite charton's scientific-notation tick labels (e.g. `2.0E4`) to plain
