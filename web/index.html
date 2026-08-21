@@ -878,6 +878,10 @@
         .species-insight { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 16px; }
         .species-insight h3 { margin: 0 0 4px; }
         .species-insight-copy { color: var(--muted); font-size: 0.85rem; margin: 0 0 10px; }
+        #species-map { height: 480px; border: 1px solid var(--line); border-radius: var(--radius-sm); z-index: 0; }
+        .rai-legend { background: var(--card); color: var(--ink); padding: 8px 10px; border-radius: 6px; font-size: 0.78rem; line-height: 1.6; box-shadow: 0 1px 6px rgba(0,0,0,0.2); }
+        .rai-legend .bar { display: block; height: 10px; width: 130px; border-radius: 3px; margin-bottom: 4px; }
+        .rai-legend .ends { display: flex; justify-content: space-between; color: var(--muted); }
     </style>
     <script>
         // Set the theme before first paint to avoid a flash of the wrong theme.
@@ -891,6 +895,7 @@
             }
         })();
     </script>
+    <link rel="stylesheet" href="./vendor/leaflet.css" />
 </head>
 <body>
     <header class="site-header">
@@ -1087,6 +1092,12 @@
                     <p class="species-insight-copy">Overall detection activity across the 24 h day for the selected species (all deployments combined).</p>
                     <div class="chart-frame" id="species-activity-frame"></div>
                 </div>
+
+                <div class="species-insight hidden" id="species-map-section">
+                    <h3 id="species-map-title">RAI map (5 km grid)</h3>
+                    <p class="species-insight-copy">Relative Abundance Index = events ÷ camera-days × 100, summed into 5 km cells. Needs <span class="mono">latitude</span>, <span class="mono">longitude</span>, <span class="mono">camera_days</span> columns.</p>
+                    <div id="species-map"></div>
+                </div>
             </section>
         </div>
     </main>
@@ -1097,6 +1108,7 @@
         </div>
     </div>
 
+    <script src="./vendor/leaflet.js"></script>
     <script type="module">
         import init, { WasmExplorer } from "./pkg/serval_charton_web.js";
         import { downloadTrapInfoTemplate, sortDeploymentOptions } from "./trap_info_export.js";
@@ -2716,7 +2728,8 @@
             speciesState.rows = JSON.parse(explorer.species_stats_json(project, collections, deployments, metric));
             speciesState.sort = { key: metric, dir: "desc" };
             renderSpeciesTable();
-            renderSpeciesActivity(); // keep the per-species insight in sync with filters
+            renderSpeciesActivity(); // keep the per-species insights in sync with filters
+            renderSpeciesMap();
         }
 
         function renderSpeciesTable() {
@@ -2773,6 +2786,7 @@
             selectedSpecies = (selectedSpecies === name) ? null : name;
             renderSpeciesTable();
             renderSpeciesActivity();
+            renderSpeciesMap();
         }
 
         // In-page per-species insight: overall activity by hour, updated on select.
@@ -2792,6 +2806,93 @@
             } catch (e) {
                 document.getElementById("species-activity-frame").innerHTML = `<div class="placeholder">${escHtml(e && e.message || e)}</div>`;
             }
+        }
+
+        // ---- RAI map (Leaflet) ---------------------------------------------
+        let speciesMap = null, speciesMapLayer = null, raiLegendCtl = null;
+
+        function renderSpeciesMap() {
+            const sec = document.getElementById("species-map-section");
+            const available = explorer && typeof explorer.map_available === "function" && explorer.map_available();
+            if (!selectedSpecies || spEl.section.classList.contains("hidden") || !available) {
+                sec.classList.add("hidden");
+                return;
+            }
+            sec.classList.remove("hidden");
+            document.getElementById("species-map-title").textContent = `RAI map (5 km grid) — ${selectedSpecies}`;
+            if (!speciesMap) {
+                speciesMap = L.map("species-map", { scrollWheelZoom: true });
+                L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+                    attribution: "© OpenStreetMap · © CARTO", maxZoom: 19, subdomains: "abcd",
+                }).addTo(speciesMap);
+                speciesMap.setView([35, 101], 5);
+            }
+            setTimeout(() => speciesMap.invalidateSize(), 30); // the section was just shown
+
+            const collections = JSON.stringify([...speciesState.collections]);
+            const deployments = JSON.stringify([...speciesState.deployments]);
+            let points;
+            try { points = JSON.parse(explorer.deployment_points_json(speciesState.project, collections, deployments, selectedSpecies)); }
+            catch (e) { return; }
+            points = points.filter((p) => p.lat != null && p.lon != null);
+            const cells = gridRai(points, 5);
+
+            if (speciesMapLayer) speciesMapLayer.remove();
+            speciesMapLayer = L.layerGroup().addTo(speciesMap);
+            const maxRai = Math.max(1e-6, ...cells.map((c) => c.rai));
+            const bounds = [];
+            for (const c of cells) {
+                L.rectangle([[c.lat0, c.lon0], [c.lat1, c.lon1]], {
+                    color: "#5a5a5a", weight: 0.5, fillColor: raiColor(c.rai / maxRai), fillOpacity: 0.7,
+                })
+                    .bindTooltip(`RAI <b>${c.rai.toFixed(1)}</b><br>${c.events} events · ${c.camera_days.toFixed(0)} cam-days`, { sticky: true })
+                    .addTo(speciesMapLayer);
+                bounds.push([c.lat0, c.lon0], [c.lat1, c.lon1]);
+            }
+            if (bounds.length) speciesMap.fitBounds(bounds, { padding: [24, 24], maxZoom: 12 });
+            drawRaiLegend(maxRai);
+        }
+
+        // Bin deployment points into ~`km` cells (fixed lon scale at the mean
+        // latitude so cells align) and compute RAI = events/camera_days*100.
+        function gridRai(points, km) {
+            if (!points.length) return [];
+            const meanLat = points.reduce((s, p) => s + p.lat, 0) / points.length;
+            const dLat = km / 111;
+            const dLon = km / (111 * Math.cos(meanLat * Math.PI / 180));
+            const cells = new Map();
+            for (const p of points) {
+                const gi = Math.floor(p.lat / dLat), gj = Math.floor(p.lon / dLon);
+                const key = gi + "|" + gj;
+                let c = cells.get(key);
+                if (!c) { c = { lat0: gi * dLat, lat1: (gi + 1) * dLat, lon0: gj * dLon, lon1: (gj + 1) * dLon, events: 0, camera_days: 0 }; cells.set(key, c); }
+                c.events += p.events || 0;
+                c.camera_days += p.camera_days || 0;
+            }
+            return [...cells.values()].map((c) => ({ ...c, rai: c.camera_days > 0 ? (c.events / c.camera_days) * 100 : 0 }));
+        }
+
+        // YlGn-style scale (0..1) matching the reference "observations per 100 trap nights".
+        function raiColor(t) {
+            t = Math.max(0, Math.min(1, t));
+            const stops = [[255, 255, 229], [120, 198, 121], [0, 90, 50]];
+            const seg = t < 0.5 ? 0 : 1, u = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
+            const a = stops[seg], b = stops[seg + 1];
+            const c = a.map((v, i) => Math.round(v + (b[i] - v) * u));
+            return `rgb(${c[0]},${c[1]},${c[2]})`;
+        }
+
+        function drawRaiLegend(maxRai) {
+            if (raiLegendCtl) raiLegendCtl.remove();
+            raiLegendCtl = L.control({ position: "bottomright" });
+            raiLegendCtl.onAdd = () => {
+                const div = L.DomUtil.create("div", "rai-legend");
+                div.innerHTML = `<div>RAI (events/100 cam-days)</div>` +
+                    `<span class="bar" style="background:linear-gradient(to right, ${raiColor(0)}, ${raiColor(0.5)}, ${raiColor(1)})"></span>` +
+                    `<span class="ends"><span>0</span><span>${maxRai.toFixed(1)}</span></span>`;
+                return div;
+            };
+            raiLegendCtl.addTo(speciesMap);
         }
 
         function updateOpenTimeButton() {
