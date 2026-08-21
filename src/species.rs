@@ -172,6 +172,58 @@ impl SpeciesData {
         CsvWriter::new(&mut buffer).finish(&mut df).context("failed to serialize species subset")?;
         String::from_utf8(buffer).context("species subset was not valid UTF-8")
     }
+
+    pub fn has_map_columns(&self) -> bool {
+        self.actual("latitude").is_some() && self.actual("longitude").is_some()
+    }
+
+    /// Per-deployment rows for the spatial RAI map: deployment, lat, lon,
+    /// camera_days, and the selected species' event count. All deployments in
+    /// scope are returned (events = 0 where the species is absent) so they still
+    /// contribute camera-days to a grid cell's RAI. Requires latitude/longitude
+    /// columns; camera_days is optional (null when absent).
+    pub fn deployment_points(
+        &self,
+        project: &str,
+        collections: &[String],
+        deployments: &[String],
+        species: &str,
+    ) -> Result<DataFrame> {
+        let dep = self.actual("deployment").ok_or_else(|| anyhow!("no 'deployment' column"))?.to_string();
+        let lat = self.actual("latitude").ok_or_else(|| anyhow!("no 'latitude' column"))?.to_string();
+        let lon = self.actual("longitude").ok_or_else(|| anyhow!("no 'longitude' column"))?.to_string();
+        let species_col = self.actual("species").ok_or_else(|| anyhow!("no 'species' column"))?.to_string();
+
+        // Every deployment in scope + its coordinates and camera days.
+        let mut aggs = vec![
+            col(&lat).cast(DataType::Float64).mean().alias("lat"),
+            col(&lon).cast(DataType::Float64).mean().alias("lon"),
+        ];
+        aggs.push(match self.actual("camera_days") {
+            Some(days) => col(days).cast(DataType::Float64).max().alias("camera_days"),
+            None => lit(NULL).cast(DataType::Float64).alias("camera_days"),
+        });
+        let deps = self
+            .scoped(project, collections, deployments)
+            .group_by([col(&dep).cast(DataType::String).alias("deployment")])
+            .agg(aggs);
+
+        // Species event (or detection) count per deployment.
+        let event_expr = match self.actual("event_id") {
+            Some(event) => col(event).n_unique().alias("events"),
+            None => len().alias("events"),
+        };
+        let events = self
+            .scoped(project, collections, deployments)
+            .filter(col(&species_col).cast(DataType::String).eq(lit(species.to_string())))
+            .group_by([col(&dep).cast(DataType::String).alias("deployment")])
+            .agg([event_expr]);
+
+        deps.join(events, [col("deployment")], [col("deployment")], JoinArgs::new(JoinType::Left))
+            .with_column(col("events").fill_null(lit(0)).cast(DataType::Int64))
+            .collect()
+            .context("failed to build deployment points")
+    }
 }
 
 /// `col == v0 OR col == v1 ...` (values cast to string). None if no values.
@@ -219,6 +271,36 @@ other,c9,dep9,赤狐,e9,d/1.jpg,2026-01-01 10:00:00
         assert_eq!(det[0], 4);
         let cap: Vec<u32> = stats.column("captures").unwrap().u32().unwrap().into_iter().flatten().collect();
         assert_eq!(cap[0], 3);
+    }
+
+    const CSV_MAP: &str = "\
+deployment,species,event_id,latitude,longitude,camera_days
+dep1,岩羊,e1,34.5,101.2,30
+dep1,岩羊,e2,34.5,101.2,30
+dep1,赤狐,e3,34.5,101.2,30
+dep2,岩羊,e4,34.6,101.3,20
+dep3,赤狐,e5,34.7,101.4,25
+";
+
+    #[test]
+    fn deployment_points_for_rai() {
+        let sd = SpeciesData::from_csv_text(CSV_MAP).unwrap();
+        assert!(sd.has_map_columns());
+        // 岩羊: dep1 {e1,e2}=2 events, dep2 {e4}=1, dep3 absent -> 0 (but still listed
+        // with its camera_days, so it contributes to a cell's RAI denominator).
+        let df = sd.deployment_points(PROJECT_ALL, &[], &[], "岩羊").unwrap();
+        assert_eq!(df.height(), 3);
+        let dep = df.column("deployment").unwrap().str().unwrap();
+        let ev = df.column("events").unwrap().i64().unwrap();
+        let cd = df.column("camera_days").unwrap().f64().unwrap();
+        let lat = df.column("lat").unwrap().f64().unwrap();
+        let mut m = std::collections::HashMap::new();
+        for i in 0..df.height() {
+            m.insert(dep.get(i).unwrap().to_string(), (ev.get(i).unwrap(), cd.get(i).unwrap(), lat.get(i).unwrap()));
+        }
+        assert_eq!(m["dep1"], (2, 30.0, 34.5));
+        assert_eq!(m["dep2"], (1, 20.0, 34.6));
+        assert_eq!(m["dep3"], (0, 25.0, 34.7));
     }
 
     #[test]

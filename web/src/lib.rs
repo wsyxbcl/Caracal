@@ -87,6 +87,27 @@ impl WasmExplorer {
         self.species.has_species()
     }
 
+    /// Whether the CSV has latitude/longitude (enables the RAI map).
+    pub fn map_available(&self) -> bool {
+        self.species.has_map_columns()
+    }
+
+    /// Per-deployment points for the RAI map, as JSON rows
+    /// `[{ deployment, lat, lon, camera_days, events }]`.
+    pub fn deployment_points_json(
+        &self,
+        project: String,
+        collections: String,
+        deployments: String,
+        species: String,
+    ) -> Result<String, JsValue> {
+        let df = self
+            .species
+            .deployment_points(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &species)
+            .map_err(to_js_error)?;
+        deployment_points_to_json(&df)
+    }
+
     /// Projects to choose from (JSON array). `["__all__"]` when there's no
     /// `project` column.
     pub fn projects_json(&self) -> Result<String, JsValue> {
@@ -325,6 +346,33 @@ fn species_stats_to_json(df: &DataFrame) -> Result<String, JsValue> {
             species: species.get(i).unwrap_or("").to_string(),
             detections: detections.get(i).unwrap_or(0),
             captures: captures.as_ref().and_then(|c| c.get(i)),
+        })
+        .collect();
+    serde_json::to_string(&rows).map_err(to_js_error)
+}
+
+/// Serialize deployment points (deployment, lat, lon, camera_days, events) to JSON.
+fn deployment_points_to_json(df: &DataFrame) -> Result<String, JsValue> {
+    #[derive(Serialize)]
+    struct Point {
+        deployment: String,
+        lat: Option<f64>,
+        lon: Option<f64>,
+        camera_days: Option<f64>,
+        events: i64,
+    }
+    let deployment = df.column("deployment").map_err(to_js_error)?.str().map_err(to_js_error)?;
+    let lat = df.column("lat").map_err(to_js_error)?.f64().map_err(to_js_error)?;
+    let lon = df.column("lon").map_err(to_js_error)?.f64().map_err(to_js_error)?;
+    let camera_days = df.column("camera_days").map_err(to_js_error)?.f64().map_err(to_js_error)?;
+    let events = df.column("events").map_err(to_js_error)?.i64().map_err(to_js_error)?;
+    let rows: Vec<Point> = (0..df.height())
+        .map(|i| Point {
+            deployment: deployment.get(i).unwrap_or("").to_string(),
+            lat: lat.get(i),
+            lon: lon.get(i),
+            camera_days: camera_days.get(i),
+            events: events.get(i).unwrap_or(0),
         })
         .collect();
     serde_json::to_string(&rows).map_err(to_js_error)
