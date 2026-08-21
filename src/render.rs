@@ -51,17 +51,20 @@ pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str) -> Resu
         .encode((x("species"), y("count"), text("label")))?;
     let svg = bars
         .and(value_labels)
-        .with_size(width, 460)
+        .with_size(width, 430)
         .with_x_label("") // "species" is redundant
         .with_y_label(y_label)
         .configure_theme(|_| {
             base_theme()
                 .with_tick_label_size(11.0)
                 .with_x_tick_label_angle(-45.0)
-                .with_axis_reserve_buffer(14.0)
-                .with_left_margin(0.07)
+                // No x-axis title, so no title margin — the rotated labels get
+                // their own space from axis_reserve_buffer. This keeps the plot
+                // filling the canvas instead of reserving empty title space.
+                .with_axis_reserve_buffer(16.0)
+                .with_left_margin(0.06)
                 .with_right_margin(0.02)
-                .with_bottom_margin(0.34) // room for the full (untrimmed) labels
+                .with_bottom_margin(0.04)
                 .with_top_margin(0.05)
         })
         .to_svg()?;
