@@ -875,6 +875,9 @@
         #species-table-wrap tbody tr.selected { background: color-mix(in srgb, var(--accent) 18%, transparent); }
         .species-context { display: flex; align-items: center; gap: 14px; margin: 0 0 18px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); background: var(--card); }
         .species-context b { color: var(--accent); }
+        .species-insight { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 16px; }
+        .species-insight h3 { margin: 0 0 4px; }
+        .species-insight-copy { color: var(--muted); font-size: 0.85rem; margin: 0 0 10px; }
     </style>
     <script>
         // Set the theme before first paint to avoid a flash of the wrong theme.
@@ -1078,6 +1081,12 @@
                     <button class="secondary" id="species-table-export" type="button">Export CSV</button>
                 </div>
                 <div class="table-wrap" id="species-table-wrap"></div>
+
+                <div class="species-insight hidden" id="species-activity">
+                    <h3 id="species-activity-title">Activity by hour</h3>
+                    <p class="species-insight-copy">Overall detection activity across the 24 h day for the selected species (all deployments combined).</p>
+                    <div class="chart-frame" id="species-activity-frame"></div>
+                </div>
             </section>
         </div>
     </main>
@@ -2533,6 +2542,7 @@
                 }
                 try {
                     await renderAll();
+                    renderSpeciesActivity(); // re-theme the in-page species chart too
                 } catch (error) {
                     showError(error && error.message ? error.message : String(error));
                 }
@@ -2706,6 +2716,7 @@
             speciesState.rows = JSON.parse(explorer.species_stats_json(project, collections, deployments, metric));
             speciesState.sort = { key: metric, dir: "desc" };
             renderSpeciesTable();
+            renderSpeciesActivity(); // keep the per-species insight in sync with filters
         }
 
         function renderSpeciesTable() {
@@ -2761,6 +2772,26 @@
         function selectSpeciesRow(name) {
             selectedSpecies = (selectedSpecies === name) ? null : name;
             renderSpeciesTable();
+            renderSpeciesActivity();
+        }
+
+        // In-page per-species insight: overall activity by hour, updated on select.
+        function renderSpeciesActivity() {
+            const sec = document.getElementById("species-activity");
+            if (!selectedSpecies || spEl.section.classList.contains("hidden") || !explorer) {
+                sec.classList.add("hidden");
+                return;
+            }
+            sec.classList.remove("hidden");
+            document.getElementById("species-activity-title").textContent = `Activity by hour — ${selectedSpecies}`;
+            const collections = JSON.stringify([...speciesState.collections]);
+            const deployments = JSON.stringify([...speciesState.deployments]);
+            try {
+                const svg = explorer.render_species_activity(speciesState.project, collections, deployments, selectedSpecies, chartTheme());
+                mountSvg(document.getElementById("species-activity-frame"), svg, { zoomable: true });
+            } catch (e) {
+                document.getElementById("species-activity-frame").innerHTML = `<div class="placeholder">${escHtml(e && e.message || e)}</div>`;
+            }
         }
 
         function updateOpenTimeButton() {

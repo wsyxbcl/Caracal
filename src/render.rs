@@ -485,6 +485,53 @@ pub fn overview_web_svg(
     Ok(force_zero_legend_stop(&svg, palette.blank_fill))
 }
 
+/// maze-stats: overall activity-by-hour for one species — the per-deployment hour
+/// heatmap summed into a single row (a compact 24-cell "fingerprint"). Reuses the
+/// hour-heatmap look/theme; the value is media rows per hour (detection activity).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn species_activity_web_svg(data: &PreparedData, theme: ChartTheme) -> Result<String> {
+    use polars::prelude::*;
+    let palette = WebPalette::from_theme(theme);
+    let table = data
+        .hour_heatmap
+        .clone()
+        .lazy()
+        .group_by([col("hour"), col("hour_label")])
+        .agg([col("event_count").sum().alias("event_count")])
+        .with_column(lit("activity").alias("deployment"))
+        .sort_by_exprs([col("hour")], SortMultipleOptions::default())
+        .collect()
+        .context("failed to aggregate hourly activity")?;
+    let svg = chart_from_table(&table)?
+        .mark_rect()?
+        .encode((x("hour_label"), y("deployment"), color("event_count")))?
+        .configure_rect(|rect| rect.with_stroke(palette.rect_stroke).with_stroke_width(0.4))
+        .with_size(1160, 200)
+        .with_x_label("Hour of day")
+        .with_y_label("")
+        .configure_theme(|_| {
+            web_theme(&palette)
+                .with_color_map(palette.hour_map)
+                .with_tick_label_size(11.0)
+                .with_tick_min_spacing(26.0)
+                .with_left_margin(0.05)
+                .with_right_margin(0.10)
+                .with_bottom_margin(0.26)
+                .with_top_margin(0.14)
+        })
+        .to_svg()?;
+    let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
+    let svg = shorten_hour_axis_labels(&svg);
+    let svg = strip_svg_background(&svg);
+    let svg = annotate_hour_heatmap_svg(&svg, &table)?;
+    let svg = match palette.low_positive_fill {
+        Some(fill) => boost_low_positive_event_cells(&svg, 3, fill),
+        None => svg,
+    };
+    let svg = force_zero_event_cells(&svg, palette.blank_fill);
+    Ok(force_zero_legend_stop(&svg, palette.blank_fill))
+}
+
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn detail_svg(data: &PreparedData, deployment: &str) -> Result<String> {
     let table = data.detail_table(deployment)?;

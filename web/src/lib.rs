@@ -145,6 +145,26 @@ impl WasmExplorer {
         render::species_bar_svg(&df, &metric).map_err(to_js_error)
     }
 
+    /// Overall activity-by-hour (1-D heatmap) for one species under the current
+    /// filters — shown in-page on the species tab, updated when a species is
+    /// picked.
+    pub fn render_species_activity(
+        &self,
+        project: String,
+        collections: String,
+        deployments: String,
+        species: String,
+        theme: String,
+    ) -> Result<String, JsValue> {
+        let csv = self
+            .species
+            .filtered_csv(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &species)
+            .map_err(to_js_error)?;
+        let override_index = (self.deploy_path_index >= 1).then_some(self.deploy_path_index);
+        let data = PreparedData::from_csv_text(&csv, override_index).map_err(to_js_error)?;
+        render::species_activity_web_svg(&data, parse_theme(&theme)).map_err(to_js_error)
+    }
+
     /// A new explorer scoped to one species under the current filters, so the
     /// existing time-analysis views (overview/detail/hour) render for just that
     /// species — "borrow time analysis for free".
