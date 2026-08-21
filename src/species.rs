@@ -15,8 +15,6 @@ use polars_io::prelude::{CsvReadOptions, CsvWriter, SerReader, SerWriter};
 use std::collections::HashMap;
 use std::io::Cursor;
 
-/// Species values that are not real observations (mirrors the reference notebook).
-pub const INVALID_SPECIES: &[&str] = &["Blank", "Useless data", "Human", "Unidentified"];
 /// Sent by the UI when there is no `project` column (or "all projects").
 pub const PROJECT_ALL: &str = "__all__";
 
@@ -112,19 +110,11 @@ impl SpeciesData {
         let mut lf = self.scoped(project, collections, deployments);
 
         // Drop non-observations and null/empty species.
-        // Real data labels species bilingually ("Blank 无动物", "Human 人"), so
-        // resolve which exact species values are invalid by prefix (in Rust —
-        // avoids polars' `strings` feature), then exclude them.
-        let invalid: Vec<String> = self
-            .unique_strings(&species_col)?
-            .into_iter()
-            .filter(|value| INVALID_SPECIES.iter().any(|bad| value.starts_with(bad)))
-            .collect();
+        // Keep every species value the taglist provides (incl. "Blank 无动物",
+        // "Human 人") — refining what to show is a UI filter later, not something
+        // we hardcode here. Only drop rows that have no species value at all.
         let sc = || col(&species_col).cast(DataType::String);
         lf = lf.filter(sc().is_not_null().and(sc().neq(lit(""))));
-        if let Some(bad_expr) = any_of(&species_col, &invalid) {
-            lf = lf.filter(bad_expr.not());
-        }
 
         let mut aggs = vec![len().alias("detections")];
         if let Some(event) = self.actual("event_id") {
@@ -217,15 +207,18 @@ other,c9,dep9,赤狐,e9,d/1.jpg,2026-01-01 10:00:00
         assert!(sd.has_species() && sd.has_event_id());
         assert_eq!(sd.projects().unwrap(), vec!["maze".to_string(), "other".to_string()]);
 
-        // project "maze", all collections/deployments: 岩羊 = 3 detections / 2 events (e1,e2 + e4=3 events? e1,e2,e4);
-        // detections 岩羊 = 3 rows (2x e1 + e2) + 1 (e4) = 4; captures = {e1,e2,e4} = 3. 赤狐 = 1 det / 1 cap. Blank dropped.
+        // project "maze": 岩羊 detections = 4 rows (2x e1 + e2 + e4), captures =
+        // {e1,e2,e4} = 3. All species kept (Blank NOT dropped — refining is a UI
+        // filter): {岩羊(4), 赤狐(1), Blank(1)}, 岩羊 on top by detections.
         let stats = sd.species_stats("maze", &[], &[], "detections").unwrap();
+        assert_eq!(stats.height(), 3);
         let species: Vec<&str> = stats.column("species").unwrap().str().unwrap().into_iter().flatten().collect();
-        assert_eq!(species, vec!["岩羊", "赤狐"]); // sorted by detections desc
+        assert_eq!(species[0], "岩羊");
+        assert!(species.contains(&"Blank"));
         let det: Vec<u32> = stats.column("detections").unwrap().u32().unwrap().into_iter().flatten().collect();
-        assert_eq!(det, vec![4, 1]);
+        assert_eq!(det[0], 4);
         let cap: Vec<u32> = stats.column("captures").unwrap().u32().unwrap().into_iter().flatten().collect();
-        assert_eq!(cap, vec![3, 1]);
+        assert_eq!(cap[0], 3);
     }
 
     #[test]
@@ -234,10 +227,10 @@ other,c9,dep9,赤狐,e9,d/1.jpg,2026-01-01 10:00:00
         let (collections, deployments) = sd.project_summary("maze").unwrap();
         assert_eq!(collections, vec!["c1".to_string(), "c2".to_string()]);
         assert_eq!(deployments, vec!["dep1".to_string(), "dep2".to_string(), "dep3".to_string()]);
-        // only c2: 岩羊 1 detection (e4), Blank dropped.
+        // only c2 (dep3): 岩羊 1 (e4) + Blank 1 (e8) — both kept now.
         let stats = sd.species_stats("maze", &["c2".to_string()], &[], "detections").unwrap();
-        assert_eq!(stats.height(), 1);
+        assert_eq!(stats.height(), 2);
         let det: Vec<u32> = stats.column("detections").unwrap().u32().unwrap().into_iter().flatten().collect();
-        assert_eq!(det, vec![1]);
+        assert_eq!(det, vec![1, 1]);
     }
 }

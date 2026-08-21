@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use charton::alt::{color, shape, x, y};
+use charton::alt::{color, shape, text, x, y};
 use charton::prelude::*;
 use chrono::DateTime;
 use polars::prelude::{DataFrame, DataType, Series};
@@ -25,20 +25,32 @@ pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str) -> Resu
     let has_captures = stats.get_column_names().iter().any(|name| name.as_str() == "captures");
     let value_col = if metric == "captures" && has_captures { "captures" } else { "detections" };
     let y_label = if value_col == "captures" { "independent captures" } else { "detections" };
-    // Two columns (species, count) in the incoming sorted order.
-    let table = stats
+    // species, count, and a pre-formatted string label (so the on-bar text is
+    // exact — the value channel would otherwise inherit sci-notation).
+    let mut table = stats
         .clone()
         .lazy()
         .select([col("species"), col(value_col).alias("count")])
         .collect()
         .context("failed to project species/count")?;
+    let counts = table.column("count")?.u32()?;
+    let bar_labels: Vec<String> = (0..table.height())
+        .map(|i| group_thousands(counts.get(i).unwrap_or(0) as f64))
+        .collect();
+    table.with_column(Series::new("label".into(), bar_labels))?;
     // Widen with the species count so the (rotated) labels have room even after
     // the frame scales the SVG to fit; the frame is also zoom/pan-able.
     let width = ((table.height() as i32) * 34 + 280).clamp(1000, 2800) as u32;
-    let svg = chart_from_table(&table)?
+    let bars = chart_from_table(&table)?
         .mark_bar()?
         .configure_bar(|bar| bar.with_stroke("#1f5b8f").with_stroke_width(0.6))
-        .encode((x("species"), y("count")))?
+        .encode((x("species"), y("count")))?;
+    let value_labels = chart_from_table(&table)?
+        .mark_text()?
+        .configure_text(|txt| txt.with_size(9.0))
+        .encode((x("species"), y("count"), text("label")))?;
+    let svg = bars
+        .and(value_labels)
         .with_size(width, 620)
         .with_x_label("species")
         .with_y_label(y_label)
