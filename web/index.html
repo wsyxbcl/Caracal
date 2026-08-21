@@ -873,8 +873,8 @@
         #species-table-wrap tbody tr { cursor: pointer; }
         #species-table-wrap tbody tr:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
         #species-table-wrap tbody tr.selected { background: color-mix(in srgb, var(--accent) 18%, transparent); }
-        .species-time { margin-top: 26px; border-top: 1px solid var(--line); padding-top: 18px; }
-        .species-time-h { margin: 18px 0 8px; font-size: 1rem; }
+        .species-context { display: flex; align-items: center; gap: 14px; margin: 0 0 18px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); background: var(--card); }
+        .species-context b { color: var(--accent); }
     </style>
     <script>
         // Set the theme before first paint to avoid a flash of the wrong theme.
@@ -968,6 +968,11 @@
             <div class="mode-switch hidden" id="mode-switch" role="tablist">
                 <button class="mode-tab is-active" id="mode-time" type="button" role="tab">Time analysis</button>
                 <button class="mode-tab" id="mode-species" type="button" role="tab" disabled title="Add a 'species' column to enable">Species analysis</button>
+            </div>
+
+            <div class="species-context hidden" id="species-context">
+                <button class="secondary" id="species-context-back" type="button">← Back to species</button>
+                <span>Time analysis — <b id="species-context-name"></b></span>
             </div>
 
             <section class="panel hidden" id="controls-panel">
@@ -1069,42 +1074,10 @@
                 </div>
                 <div class="species-table-head">
                     <input type="search" id="species-table-search" placeholder="Filter species…" />
+                    <button id="species-open-time" type="button" disabled>Time analysis</button>
                     <button class="secondary" id="species-table-export" type="button">Export CSV</button>
                 </div>
                 <div class="table-wrap" id="species-table-wrap"></div>
-
-                <div class="species-time hidden" id="species-time">
-                    <div class="panel-head">
-                        <div class="panel-copy">
-                            <h3 id="species-time-title">Time analysis</h3>
-                            <p>The existing time-analysis charts, scoped to the selected species.</p>
-                        </div>
-                        <div class="panel-actions">
-                            <button class="secondary" id="species-time-close" type="button">Back to all species</button>
-                        </div>
-                    </div>
-                    <div class="toolbar">
-                        <div class="control">
-                            <label for="species-time-bucket">Overview bucket</label>
-                            <select id="species-time-bucket">
-                                <option value="day">Daily</option>
-                                <option value="week">Weekly</option>
-                                <option value="month" selected>Monthly</option>
-                            </select>
-                        </div>
-                        <div class="control">
-                            <label for="species-time-deployment">Detail deployment</label>
-                            <select id="species-time-deployment"></select>
-                        </div>
-                    </div>
-                    <h4 class="species-time-h">Overview heatmap</h4>
-                    <div class="chart-frame" id="species-overview-frame"></div>
-                    <h4 class="species-time-h">Deployment detail</h4>
-                    <div class="chart-frame" id="species-detail-frame"></div>
-                    <div class="caption" id="species-detail-caption"></div>
-                    <h4 class="species-time-h">Hour-of-day heatmap</h4>
-                    <div class="chart-frame" id="species-hour-frame"></div>
-                </div>
             </section>
         </div>
     </main>
@@ -1122,6 +1095,11 @@
         let wasmReady = false;
         let explorer = null;
         let metadata = null;
+        // The unfiltered explorer/metadata. `explorer` may be swapped to a
+        // species-scoped one to reuse the time-analysis views for one species;
+        // these keep the originals so we can restore.
+        let fullExplorer = null;
+        let fullMetadata = null;
         const LANGUAGE_STORAGE_KEY = "serval_charton.lang";
         let currentLang = detectInitialLanguage();
         let lastErrorState = null;
@@ -2337,6 +2315,8 @@
 
             explorer = nextExplorer;
             metadata = nextMetadata;
+            fullExplorer = nextExplorer;
+            fullMetadata = nextMetadata;
             pendingPathSelection = null;
             lastCsvText = csvText;
             lastSourceLabel = sourceLabel;
@@ -2624,16 +2604,44 @@
         const escAttr = (s) => String(s).replace(/"/g, "&quot;");
         const csvCell = (s) => { s = String(s); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
 
+        function restoreFullExplorer() {
+            if (fullExplorer && explorer !== fullExplorer) {
+                explorer = fullExplorer;
+                metadata = fullMetadata;
+            }
+        }
+
+        function setSpeciesContext(name) {
+            const bar = document.getElementById("species-context");
+            if (name) {
+                document.getElementById("species-context-name").textContent = name;
+                bar.classList.remove("hidden");
+            } else {
+                bar.classList.add("hidden");
+            }
+        }
+
         function setMode(mode) {
             const species = mode === "species";
             spEl.timeTab.classList.toggle("is-active", !species);
             spEl.speciesTab.classList.toggle("is-active", species);
+            // Leaving a per-species view: go back to the full dataset.
+            restoreFullExplorer();
+            selectedSpecies = null;
+            setSpeciesContext(null);
             TIME_SECTIONS.forEach((id) => document.getElementById(id).classList.toggle("hidden", species));
             spEl.section.classList.toggle("hidden", !species);
-            if (species) renderSpecies();
+            if (species) {
+                renderSpecies();
+            } else {
+                populateControls();
+                renderAll();
+            }
         }
 
         function initSpeciesMode() {
+            selectedSpecies = null;
+            setSpeciesContext(null);
             const available = explorer.species_available();
             spEl.switch.classList.remove("hidden");
             spEl.speciesTab.disabled = !available;
@@ -2683,7 +2691,6 @@
 
         function renderSpecies() {
             if (spEl.section.classList.contains("hidden") || !explorer) return;
-            hideSpeciesTime(); // a filter/project/metric change makes any selected-species view stale
             const project = speciesState.project;
             const collections = JSON.stringify([...speciesState.collections]);
             const deployments = JSON.stringify([...speciesState.deployments]);
@@ -2718,7 +2725,8 @@
             const ths = cols.map(([k, label]) => `<th data-key="${k}" class="${key === k ? (dir === "asc" ? "sorted-asc" : "sorted-desc") : ""}">${label}</th>`).join("");
             const trs = rows.map((r) => `<tr data-species="${escAttr(r.species)}" class="${r.species === selectedSpecies ? "selected" : ""}"><td>${escHtml(r.species)}</td><td>${r.detections}</td>${hasCap ? `<td>${r.captures ?? ""}</td>` : ""}</tr>`).join("");
             spEl.tableWrap.innerHTML = `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
-            spEl.tableWrap.querySelectorAll("tbody tr").forEach((tr) => tr.addEventListener("click", () => selectSpecies(tr.dataset.species)));
+            spEl.tableWrap.querySelectorAll("tbody tr").forEach((tr) => tr.addEventListener("click", () => selectSpeciesRow(tr.dataset.species)));
+            updateOpenTimeButton();
             spEl.tableWrap.querySelectorAll("th").forEach((th) => th.addEventListener("click", () => {
                 const k = th.dataset.key;
                 if (speciesState.sort.key === k) speciesState.sort.dir = speciesState.sort.dir === "asc" ? "desc" : "asc";
@@ -2737,76 +2745,61 @@
             URL.revokeObjectURL(url);
         }
 
-        // ---- species -> time analysis (reuse the time views for one species) ---
-        let speciesTimeExplorer = null;
+        // ---- species -> time analysis --------------------------------------
+        // Selecting a species swaps `explorer` for a species-scoped one and
+        // re-runs the EXISTING time-analysis views (controls, overview, detail,
+        // hour, inventory) — no duplicated UI, so deployment select, buckets,
+        // dark mode, colours, zoom/pan all just work. "Back" restores the full
+        // explorer and returns to the species list.
         let selectedSpecies = null;
-        const spTimeEl = {
-            section: document.getElementById("species-time"),
-            title: document.getElementById("species-time-title"),
-            bucket: document.getElementById("species-time-bucket"),
-            deployment: document.getElementById("species-time-deployment"),
-            close: document.getElementById("species-time-close"),
-            overview: document.getElementById("species-overview-frame"),
-            detail: document.getElementById("species-detail-frame"),
-            caption: document.getElementById("species-detail-caption"),
-            hour: document.getElementById("species-hour-frame"),
-        };
-        spTimeEl.bucket.addEventListener("change", renderSpeciesTime);
-        spTimeEl.deployment.addEventListener("change", renderSpeciesDetail);
-        spTimeEl.close.addEventListener("click", hideSpeciesTime);
 
-        function hideSpeciesTime() {
-            spTimeEl.section.classList.add("hidden");
-            speciesTimeExplorer = null;
-            if (selectedSpecies !== null) { selectedSpecies = null; renderSpeciesTable(); }
+        document.getElementById("species-context-back").addEventListener("click", exitSpecies);
+        document.getElementById("species-open-time").addEventListener("click", openSpeciesTime);
+
+        // Row click just selects (highlights) a species; the user then presses the
+        // "Time analysis" button to open its time view (no auto-jump).
+        function selectSpeciesRow(name) {
+            selectedSpecies = (selectedSpecies === name) ? null : name;
+            renderSpeciesTable();
         }
 
-        function selectSpecies(name) {
-            if (!name) return;
+        function updateOpenTimeButton() {
+            const btn = document.getElementById("species-open-time");
+            btn.disabled = !selectedSpecies;
+            btn.textContent = selectedSpecies ? `Time analysis: ${selectedSpecies} →` : "Time analysis";
+        }
+
+        function openSpeciesTime() {
+            const name = selectedSpecies;
+            if (!name || !fullExplorer) return;
             const collections = JSON.stringify([...speciesState.collections]);
             const deployments = JSON.stringify([...speciesState.deployments]);
-            spTimeEl.section.classList.remove("hidden");
+            let scoped;
             try {
-                speciesTimeExplorer = explorer.species_time_explorer(speciesState.project, collections, deployments, name);
+                scoped = fullExplorer.species_time_explorer(speciesState.project, collections, deployments, name);
             } catch (err) {
-                spTimeEl.overview.innerHTML = `<div class="placeholder">${escHtml(err && err.message || err)}</div>`;
+                showError(err && err.message ? err.message : String(err));
                 return;
             }
+            explorer = scoped;
+            metadata = JSON.parse(scoped.metadata_json());
             selectedSpecies = name;
-            const md = JSON.parse(speciesTimeExplorer.metadata_json());
-            spTimeEl.title.textContent = `Time analysis — ${name} (${md.rows_display} rows · ${md.deployments_display} deployments)`;
-            spTimeEl.deployment.innerHTML = md.deployment_options.map((o) => `<option value="${escAttr(o.deployment)}">${escHtml(o.deployment)}</option>`).join("");
-            spTimeEl.deployment.value = md.default_deployment;
-            renderSpeciesTime();
-            renderSpeciesTable(); // reflect the selected row
-            spTimeEl.section.scrollIntoView({ behavior: "smooth", block: "start" });
+            setSpeciesContext(name);
+            spEl.section.classList.add("hidden");
+            TIME_SECTIONS.forEach((id) => document.getElementById(id).classList.remove("hidden"));
+            populateControls();
+            renderAll();
+            document.getElementById("species-context").scrollIntoView({ behavior: "smooth", block: "start" });
         }
 
-        function renderSpeciesTime() {
-            if (!speciesTimeExplorer) return;
-            const theme = chartTheme();
-            // Picking a deployment in these graphs drives the species-time detail,
-            // not the (hidden) main tool.
-            const onSelect = (deployment) => {
-                if ([...spTimeEl.deployment.options].some((o) => o.value === deployment)) {
-                    spTimeEl.deployment.value = deployment;
-                    renderSpeciesDetail();
-                }
-            };
-            const opts = { zoomable: true, deploymentAxis: true, rowHighlight: true, onSelect };
-            try { mountSvg(spTimeEl.overview, speciesTimeExplorer.render_overview(spTimeEl.bucket.value, theme), opts); }
-            catch (e) { spTimeEl.overview.innerHTML = `<div class="placeholder">${escHtml(e && e.message || e)}</div>`; }
-            try { mountSvg(spTimeEl.hour, speciesTimeExplorer.render_hour_heatmap(theme), opts); } catch (e) {}
-            renderSpeciesDetail();
-        }
-
-        function renderSpeciesDetail() {
-            if (!speciesTimeExplorer) return;
-            const deployment = spTimeEl.deployment.value;
-            try {
-                mountSvg(spTimeEl.detail, speciesTimeExplorer.render_detail(deployment, chartTheme()), { zoomable: true });
-                spTimeEl.caption.textContent = speciesTimeExplorer.detail_caption(deployment);
-            } catch (e) { spTimeEl.detail.innerHTML = `<div class="placeholder">${escHtml(e && e.message || e)}</div>`; }
+        function exitSpecies() {
+            restoreFullExplorer();
+            selectedSpecies = null;
+            setSpeciesContext(null);
+            TIME_SECTIONS.forEach((id) => document.getElementById(id).classList.add("hidden"));
+            spEl.section.classList.remove("hidden");
+            renderSpecies();
+            spEl.section.scrollIntoView({ block: "start" });
         }
     </script>
 </body>
