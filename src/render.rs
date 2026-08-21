@@ -24,6 +24,7 @@ pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str) -> Resu
     use polars::prelude::*;
     let has_captures = stats.get_column_names().iter().any(|name| name.as_str() == "captures");
     let value_col = if metric == "captures" && has_captures { "captures" } else { "detections" };
+    let y_label = if value_col == "captures" { "independent captures" } else { "detections" };
     // Two columns (species, count) in the incoming sorted order.
     let table = stats
         .clone()
@@ -31,11 +32,121 @@ pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str) -> Resu
         .select([col("species"), col(value_col).alias("count")])
         .collect()
         .context("failed to project species/count")?;
+    // Widen with the species count so the (rotated) labels have room even after
+    // the frame scales the SVG to fit; the frame is also zoom/pan-able.
+    let width = ((table.height() as i32) * 34 + 280).clamp(1000, 2800) as u32;
     let svg = chart_from_table(&table)?
         .mark_bar()?
+        .configure_bar(|bar| bar.with_stroke("#1f5b8f").with_stroke_width(0.6))
         .encode((x("species"), y("count")))?
+        .with_size(width, 620)
+        .with_x_label("species")
+        .with_y_label(y_label)
+        .configure_theme(|_| {
+            base_theme()
+                .with_tick_label_size(11.0)
+                .with_x_tick_label_angle(-45.0) // upright-ish CJK labels that don't collide
+                .with_axis_reserve_buffer(10.0)
+                .with_left_margin(0.09)
+                .with_right_margin(0.03)
+                .with_bottom_margin(0.28)
+                .with_top_margin(0.06)
+        })
         .to_svg()?;
+    let svg = humanize_axis_numbers(&svg);
+    let svg = shorten_species_x_labels(&svg);
     Ok(strip_svg_background(&svg))
+}
+
+/// Shorten long bilingual species labels on the x-axis to a compact form (the
+/// trailing CJK name if present, e.g. "Blue sheep 岩羊" -> "岩羊", matching the
+/// reference figures; otherwise truncate). The bars stay keyed by the full
+/// species — only the displayed tick text changes — and the table keeps full
+/// names.
+fn shorten_species_x_labels(svg: &str) -> String {
+    svg.lines()
+        .map(|line| {
+            if !is_rotated_bottom_tick_label(line) {
+                return line.to_string();
+            }
+            let (Some(open), Some(close)) = (line.find('>'), line.rfind('<')) else {
+                return line.to_string();
+            };
+            if open >= close {
+                return line.to_string();
+            }
+            let content = &line[open + 1..close];
+            let short = short_species_label(content);
+            if short == content {
+                line.to_string()
+            } else {
+                format!("{}>{}{}", &line[..open], short, &line[close..])
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn short_species_label(full: &str) -> String {
+    let trimmed = full.trim();
+    // Prefer a trailing space-separated token that is CJK (the Chinese name).
+    if let Some(last) = trimmed.rsplit(' ').next() {
+        if last != trimmed && last.chars().any(is_cjk) {
+            return last.to_string();
+        }
+    }
+    // Otherwise cap the length so it doesn't crowd the axis.
+    const MAX: usize = 14;
+    if trimmed.chars().count() > MAX {
+        let head: String = trimmed.chars().take(MAX).collect();
+        format!("{head}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch, '\u{3400}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+/// Rewrite charton's scientific-notation tick labels (e.g. `2.0E4`) to plain
+/// grouped integers (`20,000`). charton has no number-format option, so this is
+/// a small post-process on the axis `<text>` contents (same pattern as the other
+/// SVG axis fix-ups).
+fn humanize_axis_numbers(svg: &str) -> String {
+    svg.lines()
+        .map(|line| {
+            let (Some(open), Some(close)) = (line.find('>'), line.rfind('<')) else {
+                return line.to_string();
+            };
+            if open >= close {
+                return line.to_string();
+            }
+            let content = line[open + 1..close].trim();
+            // Only touch scientific-notation numbers charton emits for big ticks.
+            if !content.contains(['E', 'e']) {
+                return line.to_string();
+            }
+            match content.parse::<f64>() {
+                Ok(value) => format!("{}>{}{}", &line[..open], group_thousands(value), &line[close..]),
+                Err(_) => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn group_thousands(value: f64) -> String {
+    let n = value.round() as i64;
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 { format!("-{out}") } else { out }
 }
 
 fn add_series_to_dataset(dataset: &mut Dataset, series: &Series) -> Result<()> {

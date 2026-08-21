@@ -112,12 +112,19 @@ impl SpeciesData {
         let mut lf = self.scoped(project, collections, deployments);
 
         // Drop non-observations and null/empty species.
+        // Real data labels species bilingually ("Blank 无动物", "Human 人"), so
+        // resolve which exact species values are invalid by prefix (in Rust —
+        // avoids polars' `strings` feature), then exclude them.
+        let invalid: Vec<String> = self
+            .unique_strings(&species_col)?
+            .into_iter()
+            .filter(|value| INVALID_SPECIES.iter().any(|bad| value.starts_with(bad)))
+            .collect();
         let sc = || col(&species_col).cast(DataType::String);
-        let mut valid = sc().is_not_null().and(sc().neq(lit("")));
-        for bad in INVALID_SPECIES {
-            valid = valid.and(sc().neq(lit(*bad)));
+        lf = lf.filter(sc().is_not_null().and(sc().neq(lit(""))));
+        if let Some(bad_expr) = any_of(&species_col, &invalid) {
+            lf = lf.filter(bad_expr.not());
         }
-        lf = lf.filter(valid);
 
         let mut aggs = vec![len().alias("detections")];
         if let Some(event) = self.actual("event_id") {
