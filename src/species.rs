@@ -9,9 +9,9 @@
 //! Columns are matched case-insensitively and are all optional; a plain
 //! time-analysis `tags.csv` (no `species`) simply reports `has_species() == false`.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use polars::prelude::*;
-use polars_io::prelude::{CsvReadOptions, SerReader};
+use polars_io::prelude::{CsvReadOptions, CsvWriter, SerReader, SerWriter};
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -109,18 +109,7 @@ impl SpeciesData {
             .ok_or_else(|| anyhow!("this CSV has no 'species' column"))?
             .to_string();
 
-        let mut lf = self.frame.clone().lazy();
-        if project != PROJECT_ALL {
-            if let Some(name) = self.actual("project") {
-                lf = lf.filter(col(name).cast(DataType::String).eq(lit(project.to_string())));
-            }
-        }
-        if let Some(name) = self.actual("collection") {
-            if let Some(expr) = any_of(name, collections) { lf = lf.filter(expr); }
-        }
-        if let Some(name) = self.actual("deployment") {
-            if let Some(expr) = any_of(name, deployments) { lf = lf.filter(expr); }
-        }
+        let mut lf = self.scoped(project, collections, deployments);
 
         // Drop non-observations and null/empty species.
         let sc = || col(&species_col).cast(DataType::String);
@@ -142,6 +131,49 @@ impl SpeciesData {
             SortMultipleOptions::default().with_order_descending(true),
         );
         lf.collect().context("species aggregation failed")
+    }
+
+    /// Apply the project + collection + deployment filters (shared scope).
+    fn scoped(&self, project: &str, collections: &[String], deployments: &[String]) -> LazyFrame {
+        let mut lf = self.frame.clone().lazy();
+        if project != PROJECT_ALL {
+            if let Some(name) = self.actual("project") {
+                lf = lf.filter(col(name).cast(DataType::String).eq(lit(project.to_string())));
+            }
+        }
+        if let Some(name) = self.actual("collection") {
+            if let Some(expr) = any_of(name, collections) { lf = lf.filter(expr); }
+        }
+        if let Some(name) = self.actual("deployment") {
+            if let Some(expr) = any_of(name, deployments) { lf = lf.filter(expr); }
+        }
+        lf
+    }
+
+    /// A CSV of the rows for one species under the current filters — fed straight
+    /// back through the time-analysis pipeline so a selected species can reuse
+    /// the existing overview/detail/hour charts. All original columns are kept.
+    pub fn filtered_csv(
+        &self,
+        project: &str,
+        collections: &[String],
+        deployments: &[String],
+        species: &str,
+    ) -> Result<String> {
+        let species_col = self
+            .actual("species")
+            .ok_or_else(|| anyhow!("this CSV has no 'species' column"))?
+            .to_string();
+        let lf = self
+            .scoped(project, collections, deployments)
+            .filter(col(&species_col).cast(DataType::String).eq(lit(species.to_string())));
+        let mut df = lf.collect().context("failed to filter rows for species")?;
+        if df.height() == 0 {
+            bail!("no rows for species '{species}' under the current filters");
+        }
+        let mut buffer = Vec::new();
+        CsvWriter::new(&mut buffer).finish(&mut df).context("failed to serialize species subset")?;
+        String::from_utf8(buffer).context("species subset was not valid UTF-8")
     }
 }
 

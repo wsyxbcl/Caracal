@@ -24,6 +24,7 @@ pub fn init_runtime() {
 pub struct WasmExplorer {
     data: PreparedData,
     species: SpeciesData, // maze-stats: same CSV, species-analysis view
+    deploy_path_index: i32, // remembered so a species-scoped subset derives the same deployments
 }
 
 #[derive(Serialize)]
@@ -77,7 +78,7 @@ impl WasmExplorer {
         let override_index = (deploy_path_index >= 1).then_some(deploy_path_index);
         let data = PreparedData::from_csv_text(&csv_content, override_index).map_err(to_js_error)?;
         let species = SpeciesData::from_csv_text(&csv_content).map_err(to_js_error)?;
-        Ok(Self { data, species })
+        Ok(Self { data, species, deploy_path_index })
     }
 
     // ---- maze-stats: species analysis --------------------------------------
@@ -142,6 +143,26 @@ impl WasmExplorer {
             .species_stats(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &metric)
             .map_err(to_js_error)?;
         render::species_bar_svg(&df, &metric).map_err(to_js_error)
+    }
+
+    /// A new explorer scoped to one species under the current filters, so the
+    /// existing time-analysis views (overview/detail/hour) render for just that
+    /// species — "borrow time analysis for free".
+    pub fn species_time_explorer(
+        &self,
+        project: String,
+        collections: String,
+        deployments: String,
+        species: String,
+    ) -> Result<WasmExplorer, JsValue> {
+        let csv = self
+            .species
+            .filtered_csv(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &species)
+            .map_err(to_js_error)?;
+        let override_index = (self.deploy_path_index >= 1).then_some(self.deploy_path_index);
+        let data = PreparedData::from_csv_text(&csv, override_index).map_err(to_js_error)?;
+        let species = SpeciesData::from_csv_text(&csv).map_err(to_js_error)?;
+        Ok(WasmExplorer { data, species, deploy_path_index: self.deploy_path_index })
     }
 
     pub fn metadata_json(&self) -> Result<String, JsValue> {
