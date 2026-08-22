@@ -134,36 +134,84 @@ impl WasmExplorer {
         .map_err(to_js_error)
     }
 
-    /// Per-species counts as JSON rows `[{ species, detections, captures? }]`,
-    /// filtered + sorted by `sort_metric` ("detections" | "captures").
+    /// Whether the CSV carries taxonomy (a `classCN` column).
+    pub fn has_taxonomy(&self) -> bool { self.species.has_taxonomy() }
+
+    /// Distinct values for one taxon level (`class`/`family`/`genus`/`species`)
+    /// in scope, cascaded by the above-level selections in `taxon_filters_json`.
+    /// JSON array.
+    pub fn taxonomy_values_json(
+        &self,
+        level: String,
+        project: String,
+        collections: String,
+        deployments: String,
+        taxon_filters_json: String,
+        hide_non_animals: bool,
+    ) -> Result<String, JsValue> {
+        let values = self
+            .species
+            .taxonomy_values(
+                &level,
+                &project,
+                &parse_str_list(&collections)?,
+                &parse_str_list(&deployments)?,
+                &parse_taxon_filters(&taxon_filters_json)?,
+                hide_non_animals,
+            )
+            .map_err(to_js_error)?;
+        serde_json::to_string(&values).map_err(to_js_error)
+    }
+
+    /// Per-species counts as JSON rows `[{ species, detections, captures?, classCN?, ... }]`,
+    /// filtered by scope + taxon filter, sorted by `sort_metric`.
     pub fn species_stats_json(
         &self,
         project: String,
         collections: String,
         deployments: String,
         sort_metric: String,
+        taxon_filters_json: String,
+        hide_non_animals: bool,
     ) -> Result<String, JsValue> {
         let df = self
             .species
-            .species_stats(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &sort_metric)
+            .species_stats(
+                &project,
+                &parse_str_list(&collections)?,
+                &parse_str_list(&deployments)?,
+                &sort_metric,
+                &parse_taxon_filters(&taxon_filters_json)?,
+                hide_non_animals,
+            )
             .map_err(to_js_error)?;
         species_stats_to_json(&df)
     }
 
-    /// Species bar chart (charton SVG) for the current filter + metric.
+    /// Species bar chart (charton SVG) for the current filter + metric, split and
+    /// coloured by taxonomic class.
     pub fn render_species_bar(
         &self,
         project: String,
         collections: String,
         deployments: String,
         metric: String,
-        _theme: String,
+        taxon_filters_json: String,
+        hide_non_animals: bool,
+        theme: String,
     ) -> Result<String, JsValue> {
         let df = self
             .species
-            .species_stats(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &metric)
+            .species_stats(
+                &project,
+                &parse_str_list(&collections)?,
+                &parse_str_list(&deployments)?,
+                &metric,
+                &parse_taxon_filters(&taxon_filters_json)?,
+                hide_non_animals,
+            )
             .map_err(to_js_error)?;
-        render::species_bar_svg(&df, &metric).map_err(to_js_error)
+        render::species_bar_svg(&df, &metric, parse_theme(&theme)).map_err(to_js_error)
     }
 
     /// Overall activity-by-hour (1-D heatmap) for one species under the current
@@ -177,13 +225,11 @@ impl WasmExplorer {
         species: String,
         theme: String,
     ) -> Result<String, JsValue> {
-        let csv = self
+        let table = self
             .species
-            .filtered_csv(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &species)
+            .activity_by_hour(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &species)
             .map_err(to_js_error)?;
-        let override_index = (self.deploy_path_index >= 1).then_some(self.deploy_path_index);
-        let data = PreparedData::from_csv_text(&csv, override_index).map_err(to_js_error)?;
-        render::species_activity_web_svg(&data, parse_theme(&theme)).map_err(to_js_error)
+        render::species_activity_web_svg(&table, parse_theme(&theme)).map_err(to_js_error)
     }
 
     /// A new explorer scoped to one species under the current filters, so the
@@ -329,6 +375,16 @@ fn parse_str_list(json: &str) -> Result<Vec<String>, JsValue> {
     serde_json::from_str(json).map_err(to_js_error)
 }
 
+/// Parse `{"class":[...],"family":[...],...}` into `[(level, values)]`.
+fn parse_taxon_filters(json: &str) -> Result<Vec<(String, Vec<String>)>, JsValue> {
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let map: std::collections::HashMap<String, Vec<String>> =
+        serde_json::from_str(json).map_err(to_js_error)?;
+    Ok(map.into_iter().collect())
+}
+
 /// Serialize a species-stats DataFrame (`species`, `detections`, optional
 /// `captures`) to JSON rows for the table.
 fn species_stats_to_json(df: &DataFrame) -> Result<String, JsValue> {
@@ -337,15 +393,40 @@ fn species_stats_to_json(df: &DataFrame) -> Result<String, JsValue> {
         species: String,
         detections: u32,
         captures: Option<u32>,
+        #[serde(rename = "classCN", skip_serializing_if = "Option::is_none")]
+        class_cn: Option<String>,
+        #[serde(rename = "orderCN", skip_serializing_if = "Option::is_none")]
+        order_cn: Option<String>,
+        #[serde(rename = "familyCN", skip_serializing_if = "Option::is_none")]
+        family_cn: Option<String>,
+        #[serde(rename = "genusCN", skip_serializing_if = "Option::is_none")]
+        genus_cn: Option<String>,
+        #[serde(rename = "scientificName", skip_serializing_if = "Option::is_none")]
+        scientific_name: Option<String>,
     }
     let species = df.column("species").map_err(to_js_error)?.str().map_err(to_js_error)?;
     let detections = df.column("detections").map_err(to_js_error)?.u32().map_err(to_js_error)?;
     let captures = df.column("captures").ok().map(|c| c.u32()).transpose().map_err(to_js_error)?;
+    // Optional taxonomy string columns.
+    let str_col = |name: &str| df.column(name).ok().and_then(|c| c.str().ok().cloned());
+    let class_cn = str_col("classCN");
+    let order_cn = str_col("orderCN");
+    let family_cn = str_col("familyCN");
+    let genus_cn = str_col("genusCN");
+    let scientific_name = str_col("mazeScientificName");
+    let opt = |c: &Option<polars::prelude::StringChunked>, i: usize| {
+        c.as_ref().and_then(|s| s.get(i)).filter(|v| !v.is_empty()).map(str::to_string)
+    };
     let rows: Vec<Row> = (0..df.height())
         .map(|i| Row {
             species: species.get(i).unwrap_or("").to_string(),
             detections: detections.get(i).unwrap_or(0),
             captures: captures.as_ref().and_then(|c| c.get(i)),
+            class_cn: opt(&class_cn, i),
+            order_cn: opt(&order_cn, i),
+            family_cn: opt(&family_cn, i),
+            genus_cn: opt(&genus_cn, i),
+            scientific_name: opt(&scientific_name, i),
         })
         .collect();
     serde_json::to_string(&rows).map_err(to_js_error)

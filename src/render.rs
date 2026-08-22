@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use charton::alt::{color, shape, text, x, y};
+use charton::alt::{color, shape, x, y};
 use charton::prelude::*;
 use chrono::DateTime;
 use polars::prelude::{DataFrame, DataType, Series};
@@ -20,55 +20,191 @@ fn chart_from_table(table: &DataFrame) -> Result<Chart> {
 /// sorted descending, so the categorical x-axis follows that order. Returns a
 /// background-stripped SVG the frontend inserts and can layer light interactions
 /// (hover/highlight) onto.
-pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str) -> Result<String> {
+pub fn species_bar_svg(stats: &polars::prelude::DataFrame, metric: &str, theme: ChartTheme) -> Result<String> {
     use polars::prelude::*;
+    let web = WebPalette::from_theme(theme);
     let has_captures = stats.get_column_names().iter().any(|name| name.as_str() == "captures");
     let value_col = if metric == "captures" && has_captures { "captures" } else { "detections" };
     let y_label = if value_col == "captures" { "independent captures" } else { "detections" };
+    let has_class = stats.get_column_names().iter().any(|name| name.as_str() == "classCN");
+
     // species, count, and a pre-formatted string label (so the on-bar text is
     // exact — the value channel would otherwise inherit sci-notation).
+    let mut projected = vec![col("species"), col(value_col).alias("count")];
+    if has_class {
+        projected.push(col("classCN").cast(DataType::String).fill_null(lit("其他")).alias("classCN"));
+    }
     let mut table = stats
         .clone()
         .lazy()
-        .select([col("species"), col(value_col).alias("count")])
+        .select(projected)
         .collect()
         .context("failed to project species/count")?;
+    // Empty class strings (present but blank) also group under "其他".
+    if has_class {
+        let classes = table.column("classCN")?.str()?;
+        let normalized: Vec<&str> =
+            (0..table.height()).map(|i| match classes.get(i).unwrap_or("") { "" => "其他", other => other }).collect();
+        table.with_column(Series::new("classCN".into(), normalized))?;
+    }
+
+    // Order the x-axis so mammals sit on the left, birds on the right, "其他"
+    // last — within each class by descending count. charton follows the table's
+    // row order for the categorical axis, and assigns palette colours in the
+    // order categories first appear, so this ordering also drives the colours.
+    if has_class {
+        let class_rank = |c: &str| match c {
+            "哺乳纲" => 0i32,
+            "鸟纲" => 1,
+            _ => 2,
+        };
+        let classes = table.column("classCN")?.str()?;
+        let ranks: Vec<i32> = (0..table.height()).map(|i| class_rank(classes.get(i).unwrap_or(""))).collect();
+        table.with_column(Series::new("__class_rank".into(), ranks))?;
+        table = table
+            .lazy()
+            .sort_by_exprs(
+                [col("__class_rank"), col("count")],
+                SortMultipleOptions::default().with_order_descending_multi([false, true]),
+            )
+            .drop([col("__class_rank")])
+            .collect()
+            .context("failed to order species by class")?;
+    }
+
     let counts = table.column("count")?.u32()?;
     let bar_labels: Vec<String> = (0..table.height())
         .map(|i| group_thousands(counts.get(i).unwrap_or(0) as f64))
         .collect();
-    table.with_column(Series::new("label".into(), bar_labels))?;
-    // Widen with the species count so the (rotated) labels have room even after
-    // the frame scales the SVG to fit; the frame is also zoom/pan-able.
-    let width = ((table.height() as i32) * 34 + 280).clamp(1000, 2800) as u32;
-    let bars = chart_from_table(&table)?
-        .mark_bar()?
-        .configure_bar(|bar| bar.with_stroke("#1f5b8f").with_stroke_width(0.6))
-        .encode((x("species"), y("count")))?;
-    let value_labels = chart_from_table(&table)?
-        .mark_text()?
-        .configure_text(|txt| txt.with_size(9.0))
-        .encode((x("species"), y("count"), text("label")))?;
+
+    // Palette in the categories' first-appearance order (mammals, birds, other).
+    let palette: Vec<&str> = if has_class {
+        let classes = table.column("classCN")?.str()?;
+        let mut seen: Vec<&str> = Vec::new();
+        for i in 0..table.height() {
+            let c = classes.get(i).unwrap_or("");
+            if !seen.contains(&c) {
+                seen.push(c);
+            }
+        }
+        seen.into_iter().map(class_color).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Width sets the aspect ratio; the frame fits it to the page width. Keep it
+    // modest so the fit isn't too short and the left margin isn't wasteful.
+    let width = ((table.height() as i32) * 30 + 240).clamp(900, 1800) as u32;
+    // `with_stack("stacked")` makes charton draw ONE full-width bar per category
+    // (no per-class sub-slots) while `color()` still colours it and yields the
+    // native legend. Each species has a single class, so nothing visibly stacks.
+    let bars = {
+        let chart = chart_from_table(&table)?
+            .mark_bar()?
+            .configure_bar(|bar| bar.with_width(0.86).with_stroke("#33333322").with_stroke_width(0.4));
+        if has_class {
+            chart.encode((x("species"), y("count").with_stack("stacked"), color("classCN")))?
+        } else {
+            chart.encode((x("species"), y("count")))?
+        }
+    };
     let svg = bars
-        .and(value_labels)
-        .with_size(width, 430)
+        .with_size(width, 460)
         .with_x_label("") // "species" is redundant
         .with_y_label(y_label)
         .configure_theme(|_| {
-            base_theme()
+            // web_theme's transparent background lets the page colour show through
+            // (white in light mode) and makes the chart theme-aware.
+            let theme = web_theme(&web)
                 .with_tick_label_size(11.0)
                 .with_x_tick_label_angle(-45.0)
-                // No x-axis title, so no title margin — the rotated labels get
-                // their own space from axis_reserve_buffer. This keeps the plot
-                // filling the canvas instead of reserving empty title space.
                 .with_axis_reserve_buffer(16.0)
-                .with_left_margin(0.06)
+                .with_left_margin(0.035)
                 .with_right_margin(0.02)
                 .with_bottom_margin(0.04)
-                .with_top_margin(0.05)
+                .with_top_margin(0.14); // headroom for the vertical value labels
+            if palette.is_empty() { theme } else { theme.with_palette(palette.clone()) }
         })
         .to_svg()?;
+    let svg = relabel_legend_titles(&svg, &[("classCN", "class")]);
+    // charton can't place labels above bars (centred baseline), so draw them from
+    // the bar geometry — the one bit of surgery that's genuinely needed.
+    let svg = add_bar_value_labels(&svg, &bar_labels, web.axis_ink);
     Ok(strip_svg_background(&humanize_axis_numbers(&svg)))
+}
+
+/// Draw a value label centred just above each bar. charton renders bars as filled
+/// `<path>`s shaped `M x1 yb L x1 yt L x2 yt L x2 yb Z`; we read that geometry, sort
+/// the bars left→right (= the table's row order), and inject one `<text>` per bar.
+fn add_bar_value_labels(svg: &str, labels: &[String], ink: &str) -> String {
+    // (x_center, y_top) for each bar path. NB with stacked+colour charton emits one
+    // path per class per category — only one has real height; the others are
+    // zero-height stubs for the absent classes, so skip those.
+    let mut bars: Vec<(f64, f64)> = Vec::new();
+    for line in svg.lines() {
+        if !line.contains("<path") || !line.contains('Z') {
+            continue;
+        }
+        if let Some(coords) = parse_bar_path(line) {
+            let (x1, yb, _x1b, yt, x2, _yt2, _x2b, _yb2) = coords;
+            if (yb - yt).abs() < 0.05 {
+                continue; // zero-height stub
+            }
+            let x_center = (x1 + x2) / 2.0;
+            let y_top = yt.min(yb);
+            bars.push((x_center, y_top));
+        }
+    }
+    bars.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if bars.is_empty() {
+        return svg.to_string();
+    }
+    // Vertical labels (rotated -90°, reading bottom-to-top just above each bar) so
+    // they stay narrow and don't collide once the chart is fit to page width.
+    let font = sans_font();
+    let mut texts = String::new();
+    for (i, (xc, yt)) in bars.iter().enumerate() {
+        let Some(label) = labels.get(i) else { break };
+        let ly = yt - 3.0;
+        texts.push_str(&format!(
+            "<text x=\"{xc:.3}\" y=\"{ly:.3}\" font-size=\"10.0\" font-family=\"{font}\" fill=\"{ink}\" text-anchor=\"start\" dominant-baseline=\"central\" transform=\"rotate(-90 {xc:.3} {ly:.3})\">{}</text>\n",
+            escape_html(label),
+        ));
+    }
+    match svg.rfind("</svg>") {
+        Some(pos) => format!("{}{}{}", &svg[..pos], texts, &svg[pos..]),
+        None => svg.to_string(),
+    }
+}
+
+/// Parse a bar `<path d="M x1 yb L x1 yt L x2 yt L x2 yb Z">` into its 8 numbers,
+/// verifying the closed rectangle shape (x1 repeated, x2 repeated).
+fn parse_bar_path(line: &str) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+    let start = line.find("d=\"M ")? + 5;
+    let end = line[start..].find('"')? + start;
+    let nums: Vec<f64> = line[start..end]
+        .split(|c: char| c == 'L' || c == 'Z' || c.is_whitespace())
+        .filter_map(|t| t.trim().parse::<f64>().ok())
+        .collect();
+    if nums.len() != 8 {
+        return None;
+    }
+    // vertical-rectangle sanity: left x repeats, right x repeats.
+    if (nums[0] - nums[2]).abs() > 0.01 || (nums[4] - nums[6]).abs() > 0.01 {
+        return None;
+    }
+    Some((nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6], nums[7]))
+}
+
+/// Fixed colour per taxonomic class for the species bar chart. Caracal-tan for
+/// mammals (the logo's warm fur / terracotta family), blue for birds, grey for the
+/// rest. The two are colour-blind-distinguishable.
+fn class_color(class_cn: &str) -> &'static str {
+    match class_cn {
+        "哺乳纲" => "#D98A45", // mammals — caracal tan (matches the logo fur)
+        "鸟纲" => "#3E7CB1",   // birds — blue
+        _ => "#9AA0A6",        // other/unknown — grey
+    }
 }
 
 /// Rewrite charton's scientific-notation tick labels (e.g. `2.0E4`) to plain
@@ -485,28 +621,19 @@ pub fn overview_web_svg(
     Ok(force_zero_legend_stop(&svg, palette.blank_fill))
 }
 
-/// maze-stats: overall activity-by-hour for one species — the per-deployment hour
-/// heatmap summed into a single row (a compact 24-cell "fingerprint"). Reuses the
-/// hour-heatmap look/theme; the value is media rows per hour (detection activity).
+/// maze-stats: overall activity-by-hour for one species — a compact 24-cell
+/// "fingerprint" strip. `table` is a 24-row (`hour`, `hour_label`, `event_count`,
+/// `deployment="activity"`) frame from `SpeciesData::activity_by_hour`, where the
+/// value is independent events per hour (not media rows). Reuses the hour-heatmap
+/// look/theme.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn species_activity_web_svg(data: &PreparedData, theme: ChartTheme) -> Result<String> {
-    use polars::prelude::*;
+pub fn species_activity_web_svg(table: &DataFrame, theme: ChartTheme) -> Result<String> {
     let palette = WebPalette::from_theme(theme);
-    let table = data
-        .hour_heatmap
-        .clone()
-        .lazy()
-        .group_by([col("hour"), col("hour_label")])
-        .agg([col("event_count").sum().alias("event_count")])
-        .with_column(lit("activity").alias("deployment"))
-        .sort_by_exprs([col("hour")], SortMultipleOptions::default())
-        .collect()
-        .context("failed to aggregate hourly activity")?;
-    let svg = chart_from_table(&table)?
+    let svg = chart_from_table(table)?
         .mark_rect()?
         .encode((x("hour_label"), y("deployment"), color("event_count")))?
         .configure_rect(|rect| rect.with_stroke(palette.rect_stroke).with_stroke_width(0.4))
-        .with_size(1160, 200)
+        .with_size(1160, 138)
         .with_x_label("Hour of day")
         .with_y_label("")
         .configure_theme(|_| {
@@ -514,16 +641,18 @@ pub fn species_activity_web_svg(data: &PreparedData, theme: ChartTheme) -> Resul
                 .with_color_map(palette.hour_map)
                 .with_tick_label_size(11.0)
                 .with_tick_min_spacing(26.0)
-                .with_left_margin(0.05)
+                .with_left_margin(0.03) // no y-axis label to reserve for
                 .with_right_margin(0.10)
-                .with_bottom_margin(0.26)
-                .with_top_margin(0.14)
+                .with_bottom_margin(0.34)
+                .with_top_margin(0.12)
         })
         .to_svg()?;
-    let svg = relabel_legend_titles(&svg, &[("event_count", "media_count")]);
+    let svg = relabel_legend_titles(&svg, &[("event_count", "events")]);
     let svg = shorten_hour_axis_labels(&svg);
+    let svg = shift_hour_labels_to_boundaries(&svg);
+    let svg = strip_activity_axis_decor(&svg);
     let svg = strip_svg_background(&svg);
-    let svg = annotate_hour_heatmap_svg(&svg, &table)?;
+    let svg = annotate_activity_svg(&svg, table)?;
     let svg = match palette.low_positive_fill {
         Some(fill) => boost_low_positive_event_cells(&svg, 3, fill),
         None => svg,
@@ -1131,6 +1260,21 @@ fn annotate_hour_heatmap_svg(svg: &str, table: &DataFrame) -> Result<String> {
     Ok(inject_plot_titles(svg, &titles, &["rect"]))
 }
 
+/// Tooltips for the single-row species activity strip: hour + independent-event
+/// count (the value here is events, not media rows — so the label differs from
+/// the per-deployment hour heatmap).
+fn annotate_activity_svg(svg: &str, table: &DataFrame) -> Result<String> {
+    let hour_labels = table.column("hour_label")?.str()?;
+    let event_counts = table.column("event_count")?.i64()?;
+    let mut titles = Vec::with_capacity(table.height());
+    for index in 0..table.height() {
+        let hour_label = hour_labels.get(index).unwrap_or("");
+        let events = event_counts.get(index).unwrap_or_default().max(0) as usize;
+        titles.push(format!("Hour: {hour_label}\nEvents: {}", format_count(events)));
+    }
+    Ok(inject_plot_titles(svg, &titles, &["rect"]))
+}
+
 fn inject_plot_titles(svg: &str, titles: &[String], allowed_tags: &[&str]) -> String {
     let mut output = String::with_capacity(svg.len() + titles.len() * 72);
     let mut last_copied = 0usize;
@@ -1240,6 +1384,128 @@ fn shorten_hour_axis_labels(svg: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Parse an `<path d="M x1 y1 L x2 y2" …>` line into its two endpoints.
+fn parse_ml_path(line: &str) -> Option<(f64, f64, f64, f64)> {
+    let start = line.find("d=\"M ")? + 5;
+    let end = line[start..].find('"')? + start;
+    let body = line[start..end].replace('L', " ");
+    let nums: Vec<f64> = body.split_whitespace().filter_map(|t| t.parse::<f64>().ok()).collect();
+    match nums.as_slice() {
+        [x1, y1, x2, y2] => Some((*x1, *y1, *x2, *y2)),
+        _ => None,
+    }
+}
+
+/// The activity strip's boundary labels already carry all the axis meaning, so
+/// charton's per-cell tick marks, the whole (single-row) y-axis, and the
+/// "activity" row label are redundant clutter — and the y-label can drift out of
+/// the frame. Drop every vertical `<path>` (the x-tick marks + the y-axis spine)
+/// and the short horizontal y-tick, plus the "activity" text, keeping only the
+/// long horizontal x-axis spine under the cells.
+fn strip_activity_axis_decor(svg: &str) -> String {
+    let ends_with_newline = svg.ends_with('\n');
+    let mut out: Vec<&str> = Vec::new();
+    for line in svg.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("<text ")
+            && trimmed.contains("text-anchor=\"end\"")
+            && parse_svg_text_content(line) == Some("activity")
+        {
+            continue;
+        }
+        if trimmed.starts_with("<path ") {
+            if let Some((x1, y1, x2, y2)) = parse_ml_path(line) {
+                let vertical = (x2 - x1).abs() < 0.01;
+                let short_horizontal = (y2 - y1).abs() < 0.01 && (x2 - x1).abs() < 20.0;
+                if vertical || short_horizontal {
+                    continue; // x-tick marks + y-axis spine + y-tick
+                }
+            }
+        }
+        out.push(line);
+    }
+    let mut result = out.join("\n");
+    if ends_with_newline {
+        result.push('\n');
+    }
+    result
+}
+
+/// Read the `x="..."` attribute of an SVG element line as an f64 (with the raw
+/// string, so callers can string-replace it exactly).
+fn parse_svg_x_attr(line: &str) -> Option<(String, f64)> {
+    let start = line.find("x=\"")? + 3;
+    let end = line[start..].find('"')? + start;
+    let raw = &line[start..end];
+    raw.parse::<f64>().ok().map(|value| (raw.to_string(), value))
+}
+
+/// On the single-row activity strip each cell is a 1-hour bin, but a tick label
+/// centered under a cell can't tell you whether "00" means 00:00–01:00 or the
+/// hour ending at 00. Shift the hour labels to the cell *boundaries* (so a cell
+/// is bracketed by the two numbers around it) and add a trailing "24", turning
+/// the axis into a clear 0–24 scale. Assumes labels are already shortened to
+/// "HH" and evenly spaced.
+fn shift_hour_labels_to_boundaries(svg: &str) -> String {
+    let lines: Vec<&str> = svg.lines().collect();
+    let is_hour = |line: &str| -> Option<(String, f64)> {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("<text ") && trimmed.contains("dominant-baseline=\"hanging\"")) {
+            return None;
+        }
+        let content = parse_svg_text_content(line)?;
+        if content.len() == 2 && content.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(hour) = content.parse::<u32>() {
+                if hour < 24 {
+                    return parse_svg_x_attr(line);
+                }
+            }
+        }
+        None
+    };
+
+    let hours: Vec<f64> = lines.iter().filter_map(|line| is_hour(line).map(|(_, x)| x)).collect();
+    if hours.len() < 2 {
+        return svg.to_string();
+    }
+    let min_x = hours.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_x = hours.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let cell_w = (max_x - min_x) / (hours.len() as f64 - 1.0);
+    let half = cell_w / 2.0;
+
+    let shift_line = |line: &str, raw: &str, x: f64| -> String {
+        let new_x = format!("{:.3}", x - half);
+        line.replace(&format!("x=\"{raw}\""), &format!("x=\"{new_x}\""))
+            .replace(&format!("rotate(0 {raw} "), &format!("rotate(0 {new_x} "))
+    };
+
+    let ends_with_newline = svg.ends_with('\n');
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len() + 1);
+    for line in &lines {
+        match is_hour(line) {
+            Some((raw, x)) => {
+                out_lines.push(shift_line(line, &raw, x));
+                if (x - max_x).abs() < f64::EPSILON {
+                    // Insert the closing "24" boundary right after the last hour
+                    // label (a sibling within the SVG, not appended after </svg>).
+                    let cloned = shift_line(line, &raw, x + cell_w);
+                    let close = cloned.replace(
+                        &format!(">{}</text>", parse_svg_text_content(&cloned).unwrap_or("")),
+                        ">24</text>",
+                    );
+                    out_lines.push(close);
+                }
+            }
+            None => out_lines.push(line.to_string()),
+        }
+    }
+    let mut result = out_lines.join("\n");
+    if ends_with_newline {
+        result.push('\n');
+    }
+    result
 }
 
 fn force_zero_event_cells(svg: &str, fill: &str) -> String {
@@ -1366,3 +1632,14 @@ fn display_font() -> &'static str {
 fn sans_font() -> &'static str {
     "'IBM Plex Sans', 'Avenir Next', 'Segoe UI Variable', 'Segoe UI', 'Noto Sans', sans-serif"
 }
+
+
+
+
+
+
+
+
+
+
+

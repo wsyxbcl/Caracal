@@ -93,14 +93,73 @@ impl SpeciesData {
         Ok((collections, deployments))
     }
 
+    pub fn has_taxonomy(&self) -> bool { self.actual("classcn").is_some() }
+
+    /// The distinct values for one taxon level (`class`/`family`/`genus`/
+    /// `species`) in scope, after `hide_non_animals` and the filters for the
+    /// levels *above* this one (so the dropdowns cascade: family narrows to the
+    /// chosen class, genus to class+family, etc.). Empty values are dropped.
+    pub fn taxonomy_values(
+        &self,
+        level: &str,
+        project: &str,
+        collections: &[String],
+        deployments: &[String],
+        taxon_filters: &[(String, Vec<String>)],
+        hide_non_animals: bool,
+    ) -> Result<Vec<String>> {
+        let Some(target_idx) = TAXON_ORDER.iter().position(|l| *l == level) else {
+            return Ok(Vec::new());
+        };
+        let Some(actual) = taxon_level_col(level).and_then(|c| self.actual(c)).map(str::to_string) else {
+            return Ok(Vec::new());
+        };
+        let mut lf = self.scoped(project, collections, deployments);
+        lf = self.apply_hide_non_animals(lf, hide_non_animals);
+        // Only apply filters for the levels above `level`.
+        for (l, values) in taxon_filters {
+            let idx = TAXON_ORDER.iter().position(|x| x == l);
+            if matches!(idx, Some(i) if i < target_idx) {
+                if let Some(col_name) = taxon_level_col(l).and_then(|c| self.actual(c)) {
+                    if let Some(expr) = any_of(col_name, values) {
+                        lf = lf.filter(expr);
+                    }
+                }
+            }
+        }
+        let df = lf
+            .select([col(&actual).cast(DataType::String).alias("v")])
+            .collect()
+            .context("failed to scope taxon values")?;
+        let scoped = SpeciesData { frame: df, cols: [("v".to_string(), "v".to_string())].into() };
+        scoped.unique_strings("v")
+    }
+
+    /// Drop non-animals (taglist `rank == "null"`) when requested.
+    fn apply_hide_non_animals(&self, lf: LazyFrame, hide: bool) -> LazyFrame {
+        if hide {
+            if let Some(rank) = self.actual("rank") {
+                return lf.filter(col(rank).cast(DataType::String).fill_null(lit("")).neq(lit("null")));
+            }
+        }
+        lf
+    }
+
     /// Per-species counts, filtered. `sort_metric` is "detections" | "captures".
-    /// Columns: `species`, `detections`, and `captures` when `event_id` exists.
+    /// Columns: `species`, `detections`, `captures` (when `event_id` exists), and
+    /// the taxonomy fields (`classCN`, `orderCN`, `familyCN`, `genusCN`,
+    /// `mazeScientificName`, `rank`) when the taglist columns are present.
+    /// `taxon_filters` is a list of (level, values) on `class`/`family`/`genus`/
+    /// `species` (AND across levels); `hide_non_animals` drops `rank == "null"`
+    /// (the taglist's marker for Blank/Unidentified/etc.).
     pub fn species_stats(
         &self,
         project: &str,
         collections: &[String],
         deployments: &[String],
         sort_metric: &str,
+        taxon_filters: &[(String, Vec<String>)],
+        hide_non_animals: bool,
     ) -> Result<DataFrame> {
         let species_col = self
             .actual("species")
@@ -109,16 +168,39 @@ impl SpeciesData {
 
         let mut lf = self.scoped(project, collections, deployments);
 
-        // Drop non-observations and null/empty species.
-        // Keep every species value the taglist provides (incl. "Blank 无动物",
-        // "Human 人") — refining what to show is a UI filter later, not something
-        // we hardcode here. Only drop rows that have no species value at all.
+        // Drop null/empty species. Keep every species value the taglist provides
+        // (incl. "Blank 无动物", "Human 人"); which to hide is the taxon filter's
+        // job below, not something we hardcode.
         let sc = || col(&species_col).cast(DataType::String);
         lf = lf.filter(sc().is_not_null().and(sc().neq(lit(""))));
+
+        // Taxon filter: hide non-animals (rank == "null") and keep only the
+        // selected class/family/genus/species (AND across levels).
+        lf = self.apply_hide_non_animals(lf, hide_non_animals);
+        for (level, values) in taxon_filters {
+            if let Some(col_name) = taxon_level_col(level).and_then(|c| self.actual(c)) {
+                if let Some(expr) = any_of(col_name, values) {
+                    lf = lf.filter(expr);
+                }
+            }
+        }
 
         let mut aggs = vec![len().alias("detections")];
         if let Some(event) = self.actual("event_id") {
             aggs.push(col(event).n_unique().alias("captures"));
+        }
+        // Taxonomy is functionally dependent on species — carry it via first().
+        for (canonical, out) in [
+            ("classcn", "classCN"),
+            ("ordercn", "orderCN"),
+            ("familycn", "familyCN"),
+            ("genuscn", "genusCN"),
+            ("mazescientificname", "mazeScientificName"),
+            ("rank", "rank"),
+        ] {
+            if let Some(actual) = self.actual(canonical) {
+                aggs.push(col(actual).cast(DataType::String).first().alias(out));
+            }
         }
         lf = lf.group_by([sc().alias("species")]).agg(aggs);
 
@@ -224,6 +306,94 @@ impl SpeciesData {
             .collect()
             .context("failed to build deployment points")
     }
+
+    /// Overall activity-by-hour for one species: a 24-row table (`hour`,
+    /// `hour_label`, `event_count`, `deployment="activity"`). The value is the
+    /// number of **independent events** (distinct `event_id`) whose first
+    /// detection falls in that hour — not media rows — so a burst of frames for
+    /// one animal counts once. Without an `event_id` column it falls back to
+    /// media rows per hour. Hours with no activity are kept (zero-filled).
+    pub fn activity_by_hour(
+        &self,
+        project: &str,
+        collections: &[String],
+        deployments: &[String],
+        species: &str,
+    ) -> Result<DataFrame> {
+        let dt_col = self.actual("datetime").ok_or_else(|| anyhow!("no 'datetime' column"))?.to_string();
+        let species_col = self.actual("species").ok_or_else(|| anyhow!("no 'species' column"))?.to_string();
+
+        let lf = self
+            .scoped(project, collections, deployments)
+            .filter(col(&species_col).cast(DataType::String).eq(lit(species.to_string())));
+
+        let mut sel = vec![col(&dt_col).cast(DataType::String).alias("__dt")];
+        if let Some(event) = self.actual("event_id") {
+            sel.push(col(event).cast(DataType::String).alias("__ev"));
+        }
+        let df = lf.select(sel).collect().context("failed to gather activity rows")?;
+
+        let mut counts = [0i64; 24];
+        let dt = df.column("__dt")?.str()?;
+        if self.has_event_id() {
+            // Assign each distinct event to the hour of its earliest detection.
+            // ISO-ish datetime strings sort lexically = chronologically.
+            let ev = df.column("__ev")?.str()?;
+            let mut earliest: HashMap<String, (String, u32)> = HashMap::new();
+            for (d, e) in dt.into_iter().zip(ev.into_iter()) {
+                let (Some(d), Some(e)) = (d, e) else { continue };
+                let Some(h) = hour_of(d) else { continue };
+                earliest
+                    .entry(e.to_string())
+                    .and_modify(|cur| if d < cur.0.as_str() { *cur = (d.to_string(), h); })
+                    .or_insert_with(|| (d.to_string(), h));
+            }
+            for (_, (_, h)) in earliest {
+                counts[h as usize] += 1;
+            }
+        } else {
+            for d in dt.into_iter().flatten() {
+                if let Some(h) = hour_of(d) {
+                    counts[h as usize] += 1;
+                }
+            }
+        }
+
+        let hours: Vec<i32> = (0..24).collect();
+        let labels: Vec<String> = (0..24).map(|h| format!("{h:02}:00")).collect();
+        let events: Vec<i64> = counts.to_vec();
+        let deployment: Vec<&str> = vec!["activity"; 24];
+        df!(
+            "hour" => hours,
+            "hour_label" => labels,
+            "event_count" => events,
+            "deployment" => deployment,
+        )
+        .context("failed to build activity-by-hour table")
+    }
+}
+
+/// Hour-of-day (0..23) from an ISO-ish datetime string ("YYYY-MM-DD HH:MM:SS"
+/// or with a `T` separator), by reading the two digits after the date/time
+/// separator. Returns `None` if the shape is unexpected.
+fn hour_of(s: &str) -> Option<u32> {
+    let sep = s.find(|c| c == ' ' || c == 'T')?;
+    s.get(sep + 1..sep + 3)?.parse::<u32>().ok().filter(|h| *h < 24)
+}
+
+/// Taxon levels in hierarchy order (drives the cascading dropdowns).
+const TAXON_ORDER: [&str; 5] = ["class", "order", "family", "genus", "species"];
+
+/// Level key → canonical (lowercased) column name.
+fn taxon_level_col(level: &str) -> Option<&'static str> {
+    match level {
+        "class" => Some("classcn"),
+        "order" => Some("ordercn"),
+        "family" => Some("familycn"),
+        "genus" => Some("genuscn"),
+        "species" => Some("species"),
+        _ => None,
+    }
 }
 
 /// `col == v0 OR col == v1 ...` (values cast to string). None if no values.
@@ -262,7 +432,7 @@ other,c9,dep9,赤狐,e9,d/1.jpg,2026-01-01 10:00:00
         // project "maze": 岩羊 detections = 4 rows (2x e1 + e2 + e4), captures =
         // {e1,e2,e4} = 3. All species kept (Blank NOT dropped — refining is a UI
         // filter): {岩羊(4), 赤狐(1), Blank(1)}, 岩羊 on top by detections.
-        let stats = sd.species_stats("maze", &[], &[], "detections").unwrap();
+        let stats = sd.species_stats("maze", &[], &[], "detections", &[], false).unwrap();
         assert_eq!(stats.height(), 3);
         let species: Vec<&str> = stats.column("species").unwrap().str().unwrap().into_iter().flatten().collect();
         assert_eq!(species[0], "岩羊");
@@ -310,7 +480,7 @@ dep3,赤狐,e5,34.7,101.4,25
         assert_eq!(collections, vec!["c1".to_string(), "c2".to_string()]);
         assert_eq!(deployments, vec!["dep1".to_string(), "dep2".to_string(), "dep3".to_string()]);
         // only c2 (dep3): 岩羊 1 (e4) + Blank 1 (e8) — both kept now.
-        let stats = sd.species_stats("maze", &["c2".to_string()], &[], "detections").unwrap();
+        let stats = sd.species_stats("maze", &["c2".to_string()], &[], "detections", &[], false).unwrap();
         assert_eq!(stats.height(), 2);
         let det: Vec<u32> = stats.column("detections").unwrap().u32().unwrap().into_iter().flatten().collect();
         assert_eq!(det, vec![1, 1]);

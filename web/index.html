@@ -860,21 +860,35 @@
         .mode-tab.is-active { color: var(--accent); border-color: var(--accent); }
         .mode-tab:disabled { opacity: 0.4; cursor: not-allowed; }
         .chip-multiselect { display: flex; flex-wrap: wrap; gap: 6px; max-height: 104px; overflow: auto; padding: 4px 0; }
+        .checkbox-inline { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; cursor: pointer; white-space: nowrap; }
+        .checkbox-inline input { margin: 0; }
+        .ms { position: relative; min-width: 160px; }
+        .ms-btn { width: 100%; text-align: left; font: inherit; padding: 7px 26px 7px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); color: var(--ink); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .ms-btn::after { content: "▾"; position: absolute; right: 9px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
+        .ms-btn.is-active { border-color: var(--accent); }
+        .ms-panel { position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; min-width: 100%; max-width: 320px; max-height: 260px; overflow: auto; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); box-shadow: 0 6px 20px rgba(0,0,0,0.18); padding: 6px; }
+        .ms-actions { display: flex; justify-content: space-between; gap: 8px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+        .ms-actions button { font: inherit; font-size: 0.8rem; background: none; border: none; color: var(--accent); cursor: pointer; padding: 2px 4px; }
+        .ms-opt { display: flex; align-items: center; gap: 7px; padding: 4px 6px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+        .ms-opt:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+        .ms-opt input { margin: 0; }
+        .ms-empty { color: var(--muted); font-size: 0.85rem; padding: 6px; }
         .chip { font: inherit; font-size: 0.82rem; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--muted); cursor: pointer; }
         .chip.is-on { background: var(--accent); color: #fff; border-color: var(--accent); }
         .filter-hint { color: var(--muted); font-weight: 400; font-size: 0.78rem; }
         .species-stat-line { color: var(--muted); font-size: 0.9rem; margin: 4px 0 12px; }
         .species-table-head { display: flex; gap: 10px; align-items: center; margin: 16px 0 8px; }
         .species-table-head input { flex: 1; font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); color: var(--ink); }
+        #species-table-wrap { max-height: 340px; overflow: auto; }
         #species-table-wrap table { min-width: 0; }
+        #species-table-wrap thead th { position: sticky; top: 0; z-index: 1; }
         #species-table-wrap th { cursor: pointer; user-select: none; white-space: nowrap; }
         #species-table-wrap th.sorted-asc::after { content: " ▲"; color: var(--accent); }
         #species-table-wrap th.sorted-desc::after { content: " ▼"; color: var(--accent); }
         #species-table-wrap tbody tr { cursor: pointer; }
         #species-table-wrap tbody tr:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
         #species-table-wrap tbody tr.selected { background: color-mix(in srgb, var(--accent) 18%, transparent); }
-        .species-context { display: flex; align-items: center; gap: 14px; margin: 0 0 18px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); background: var(--card); }
-        .species-context b { color: var(--accent); }
+        #species-table-wrap td.sci { font-style: italic; color: var(--muted); }
         .species-insight { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 16px; }
         .species-insight h3 { margin: 0 0 4px; }
         .species-insight-copy { color: var(--muted); font-size: 0.85rem; margin: 0 0 10px; }
@@ -975,12 +989,7 @@
 
             <div class="mode-switch hidden" id="mode-switch" role="tablist">
                 <button class="mode-tab is-active" id="mode-time" type="button" role="tab">Time analysis</button>
-                <button class="mode-tab" id="mode-species" type="button" role="tab" disabled title="Add a 'species' column to enable">Species analysis</button>
-            </div>
-
-            <div class="species-context hidden" id="species-context">
-                <button class="secondary" id="species-context-back" type="button">← Back to species</button>
-                <span>Time analysis — <b id="species-context-name"></b></span>
+                <button class="mode-tab" id="mode-species" type="button" role="tab" disabled>Species analysis</button>
             </div>
 
             <section class="panel hidden" id="controls-panel">
@@ -1051,29 +1060,40 @@
 
             <!-- maze-stats: species analysis (hidden until you switch mode) -->
             <section class="panel species-only hidden" id="section-species">
-                <h2>Species analysis</h2>
-                <p>Per-species counts from the same CSV — filter by project, then collection and deployment.</p>
+                <h2 id="species-section-title">Species analysis</h2>
+                <p id="species-section-copy">Per-species counts from the same CSV — filter by project, then collection and deployment.</p>
                 <div class="toolbar">
                     <div class="control">
-                        <label for="species-project">Project</label>
+                        <label for="species-project" id="species-project-label">Project</label>
                         <select id="species-project"></select>
                     </div>
                     <div class="control">
-                        <label for="species-metric">Metric</label>
+                        <label for="species-metric" id="species-metric-label">Metric</label>
                         <select id="species-metric">
-                            <option value="detections">有效探测次数 (detections)</option>
-                            <option value="captures">独立捕获次数 (captures)</option>
+                            <option value="detections"></option>
+                            <option value="captures"></option>
                         </select>
                     </div>
                 </div>
                 <div class="toolbar" id="species-filters">
                     <div class="control">
-                        <label>Collections <span class="filter-hint" id="species-collection-hint"></span></label>
+                        <label><span id="species-collections-label">Collections</span> <span class="filter-hint" id="species-collection-hint"></span></label>
                         <div class="chip-multiselect" id="species-collections"></div>
                     </div>
                     <div class="control">
-                        <label>Deployments <span class="filter-hint" id="species-deployment-hint"></span></label>
+                        <label><span id="species-deployments-label">Deployments</span> <span class="filter-hint" id="species-deployment-hint"></span></label>
                         <div class="chip-multiselect" id="species-deployments"></div>
+                    </div>
+                </div>
+                <div class="toolbar hidden" id="species-taxon">
+                    <div class="control"><label data-taxon-label="class">Class</label><div class="ms" data-level="class"></div></div>
+                    <div class="control"><label data-taxon-label="order">Order</label><div class="ms" data-level="order"></div></div>
+                    <div class="control"><label data-taxon-label="family">Family</label><div class="ms" data-level="family"></div></div>
+                    <div class="control"><label data-taxon-label="genus">Genus</label><div class="ms" data-level="genus"></div></div>
+                    <div class="control"><label data-taxon-label="species">Species</label><div class="ms" data-level="species"></div></div>
+                    <div class="control">
+                        <label>&nbsp;</label>
+                        <label class="checkbox-inline"><input type="checkbox" id="species-hide-nonanimals" checked /> <span id="species-hide-label">Hide non-animals (rank = null)</span></label>
                     </div>
                 </div>
                 <div class="species-stat-line" id="species-stat-line"></div>
@@ -1089,13 +1109,13 @@
 
                 <div class="species-insight hidden" id="species-activity">
                     <h3 id="species-activity-title">Activity by hour</h3>
-                    <p class="species-insight-copy">Overall detection activity across the 24 h day for the selected species (all deployments combined).</p>
+                    <p class="species-insight-copy" id="species-activity-copy">Independent events by hour of day for the selected species (all deployments combined); each event counted once, at its first detection.</p>
                     <div class="chart-frame" id="species-activity-frame"></div>
                 </div>
 
                 <div class="species-insight hidden" id="species-map-section">
                     <h3 id="species-map-title">RAI map (5 km grid)</h3>
-                    <p class="species-insight-copy">Relative Abundance Index = events ÷ camera-days × 100, summed into 5 km cells. Needs <span class="mono">latitude</span>, <span class="mono">longitude</span>, <span class="mono">camera_days</span> columns.</p>
+                    <p class="species-insight-copy" id="species-map-copy">Relative Abundance Index = events ÷ camera-days × 100, summed into 5 km cells. Needs <span class="mono">latitude</span>, <span class="mono">longitude</span>, <span class="mono">camera_days</span> columns.</p>
                     <div id="species-map"></div>
                 </div>
             </section>
@@ -1295,6 +1315,44 @@
                     detail_copy_selected: "Each point is one media item for {deployment}. Images are nudged up-left and videos down-right.",
                     detail_caption: "{count} media items from {start} through {end}. Media types: {media_breakdown}.",
                     range: "{start} to {end}"
+                },
+                species: {
+                    mode_time: "Time analysis",
+                    mode_species: "Species analysis",
+                    mode_species_hint: "Add a 'species' column to enable",
+                    title: "Species analysis",
+                    copy: "Per-species counts from the same CSV — filter by project, then collection and deployment.",
+                    project: "Project",
+                    metric: "Metric",
+                    metric_detections: "Detections",
+                    metric_captures: "Independent captures",
+                    collections: "Collections",
+                    deployments: "Deployments",
+                    taxon_class: "Class",
+                    taxon_order: "Order",
+                    taxon_family: "Family",
+                    taxon_genus: "Genus",
+                    taxon_species: "Species",
+                    hide_nonanimals: "Hide non-animals (rank = null)",
+                    filter_placeholder: "Filter species…",
+                    open_time: "Time analysis",
+                    open_time_named: "Time analysis: {name} →",
+                    export_csv: "Export CSV",
+                    placeholder: "Pick a project to render species counts.",
+                    col_species: "Species",
+                    col_scientific: "Scientific name",
+                    col_detections: "Detections",
+                    col_captures: "Independent captures",
+                    activity_title: "Activity by hour",
+                    activity_copy: "Independent events by hour of day for the selected species (all deployments combined); each event counted once, at its first detection.",
+                    map_title: "RAI map (5 km grid)",
+                    map_copy_prefix: "Relative Abundance Index = events ÷ camera-days × 100, summed into 5 km cells. Needs ",
+                    map_copy_suffix: " columns.",
+                    ms_all: "All",
+                    ms_selected: "{n} selected",
+                    ms_clear: "Clear",
+                    stat: "{c} collections · {d} deployments",
+                    stat_sel: " · filtered to {c} collection(s), {d} deployment(s)"
                 }
             },
             zh: {
@@ -1389,6 +1447,44 @@
                     detail_copy_selected: "{deployment} 的每个点代表一个媒体。图片会略微向左上偏移，视频会略微向右下偏移。",
                     detail_caption: "{start} 至 {end} 共 {count} 个媒体。媒体类型：{media_breakdown}。",
                     range: "{start} 至 {end}"
+                },
+                species: {
+                    mode_time: "时间分析",
+                    mode_species: "物种分析",
+                    mode_species_hint: "需包含 species 列",
+                    title: "物种分析",
+                    copy: "基于同一 CSV 的物种统计 —— 先选项目，再按 collection 和位点筛选。",
+                    project: "项目",
+                    metric: "指标",
+                    metric_detections: "有效探测次数",
+                    metric_captures: "独立捕获次数",
+                    collections: "Collection",
+                    deployments: "位点",
+                    taxon_class: "纲",
+                    taxon_order: "目",
+                    taxon_family: "科",
+                    taxon_genus: "属",
+                    taxon_species: "种",
+                    hide_nonanimals: "隐藏非动物（rank = null）",
+                    filter_placeholder: "筛选物种…",
+                    open_time: "时间分析",
+                    open_time_named: "时间分析：{name} →",
+                    export_csv: "导出 CSV",
+                    placeholder: "选择项目以显示物种统计。",
+                    col_species: "物种",
+                    col_scientific: "学名",
+                    col_detections: "有效探测次数",
+                    col_captures: "独立捕获次数",
+                    activity_title: "每日活动节律",
+                    activity_copy: "所选物种按一天中的小时统计的独立事件（合并所有位点）；每个事件只计一次，取首次探测时刻。",
+                    map_title: "RAI 分布图（5 公里网格）",
+                    map_copy_prefix: "相对多度指数 = 事件数 ÷ 相机工作日 × 100，按 5 公里网格汇总。需要 ",
+                    map_copy_suffix: " 列。",
+                    ms_all: "全部",
+                    ms_selected: "已选 {n}",
+                    ms_clear: "清除",
+                    stat: "{c} 个 collection · {d} 个位点",
+                    stat_sel: " · 已筛选 {c} 个 collection、{d} 个位点"
                 }
             }
         };
@@ -1639,6 +1735,54 @@
             for (const option of bucketSelect.options) {
                 option.textContent = bucketLabel(option.value);
             }
+            applySpeciesText();
+        }
+
+        // Static text for the species-analysis panel (kept in one place so both
+        // languages stay in sync).
+        function applySpeciesText() {
+            const set = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+            set("mode-time", t("species", "mode_time"));
+            set("mode-species", t("species", "mode_species"));
+            const speciesTab = document.getElementById("mode-species");
+            if (speciesTab) speciesTab.title = t("species", "mode_species_hint");
+            set("species-section-title", t("species", "title"));
+            set("species-section-copy", t("species", "copy"));
+            set("species-project-label", t("species", "project"));
+            set("species-metric-label", t("species", "metric"));
+            const metricSel = document.getElementById("species-metric");
+            if (metricSel && metricSel.options.length >= 2) {
+                metricSel.options[0].textContent = t("species", "metric_detections");
+                metricSel.options[1].textContent = t("species", "metric_captures");
+            }
+            set("species-collections-label", t("species", "collections"));
+            set("species-deployments-label", t("species", "deployments"));
+            document.querySelectorAll("[data-taxon-label]").forEach((el) => {
+                el.textContent = t("species", "taxon_" + el.dataset.taxonLabel);
+            });
+            set("species-hide-label", t("species", "hide_nonanimals"));
+            const search = document.getElementById("species-table-search");
+            if (search) search.placeholder = t("species", "filter_placeholder");
+            set("species-table-export", t("species", "export_csv"));
+            set("species-placeholder", t("species", "placeholder"));
+            set("species-activity-title", t("species", "activity_title"));
+            set("species-activity-copy", t("species", "activity_copy"));
+            set("species-map-title", t("species", "map_title"));
+            const mapCopy = document.getElementById("species-map-copy");
+            if (mapCopy) {
+                // Rebuild from spans so the <code>-styled column names survive; the
+                // prefix/suffix are trusted i18n strings (no markup).
+                mapCopy.textContent = "";
+                mapCopy.append(t("species", "map_copy_prefix"));
+                ["latitude", "longitude", "camera_days"].forEach((name, i) => {
+                    if (i) mapCopy.append(", ");
+                    const code = document.createElement("span");
+                    code.className = "mono";
+                    code.textContent = name;
+                    mapCopy.append(code);
+                });
+                mapCopy.append(t("species", "map_copy_suffix"));
+            }
         }
 
         function applyLanguage() {
@@ -1653,6 +1797,12 @@
             if (metadata) {
                 renderInventory();
                 populatePathLevelControl();
+            }
+            // Re-render the species panel so its chart text + table headers pick up
+            // the new language (only when it's the active view).
+            if (explorer && !document.getElementById("section-species").classList.contains("hidden")) {
+                updateOpenTimeButton();
+                renderSpecies();
             }
         }
 
@@ -2211,6 +2361,7 @@
                         .replaceAll("Deployment: ", "位点：")
                         .replaceAll("\nBucket: ", "\n时间桶：")
                         .replaceAll("\nMedia count: ", "\n媒体数量：")
+                        .replaceAll("\nEvents: ", "\n事件数：")
                         .replaceAll("Timestamp: ", "时间：")
                         .replaceAll("\nHour: ", "\n小时：")
                         .replaceAll("\nMedia: image", "\n媒体：图片")
@@ -2219,12 +2370,19 @@
                         .replaceAll("\nPath: ", "\n路径：");
                 }
 
+                const svgTextZh = {
+                    media_count: "媒体数量",
+                    events: "事件数",
+                    class: "纲",
+                    media: "媒体",
+                    detections: "有效探测次数",
+                    "independent captures": "独立捕获次数",
+                    "Hour of day": "每日时段",
+                };
                 for (const textNode of svg.querySelectorAll("text")) {
                     const value = textNode.textContent?.trim();
-                    if (value === "media_count") {
-                        textNode.textContent = "媒体数量";
-                    } else if (value === "media") {
-                        textNode.textContent = "媒体";
+                    if (value && Object.prototype.hasOwnProperty.call(svgTextZh, value)) {
+                        textNode.textContent = svgTextZh[value];
                     }
                 }
             }
@@ -2613,6 +2771,8 @@
             deployments: document.getElementById("species-deployments"),
             collectionHint: document.getElementById("species-collection-hint"),
             deploymentHint: document.getElementById("species-deployment-hint"),
+            taxon: document.getElementById("species-taxon"),
+            hideNonAnimals: document.getElementById("species-hide-nonanimals"),
             statLine: document.getElementById("species-stat-line"),
             frame: document.getElementById("species-frame"),
             tableWrap: document.getElementById("species-table-wrap"),
@@ -2620,7 +2780,9 @@
             tableExport: document.getElementById("species-table-export"),
         };
         const TIME_SECTIONS = ["controls-panel", "section-overview", "section-detail", "section-hours", "section-inventory"];
-        const speciesState = { project: null, collections: new Set(), deployments: new Set(), metric: "detections", rows: [], sort: { key: "detections", dir: "desc" }, wired: false };
+        const TAXON_LEVELS = ["class", "order", "family", "genus", "species"];
+        const speciesState = { project: null, collections: new Set(), deployments: new Set(), taxon: { class: new Set(), order: new Set(), family: new Set(), genus: new Set(), species: new Set() }, hideNonAnimals: true, metric: "detections", rows: [], sort: { key: "detections", dir: "desc" }, wired: false };
+        const msWidgets = {}; // level -> { btn, panel }
 
         const escHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
         const escAttr = (s) => String(s).replace(/"/g, "&quot;");
@@ -2633,16 +2795,6 @@
             }
         }
 
-        function setSpeciesContext(name) {
-            const bar = document.getElementById("species-context");
-            if (name) {
-                document.getElementById("species-context-name").textContent = name;
-                bar.classList.remove("hidden");
-            } else {
-                bar.classList.add("hidden");
-            }
-        }
-
         function setMode(mode) {
             const species = mode === "species";
             spEl.timeTab.classList.toggle("is-active", !species);
@@ -2650,7 +2802,6 @@
             // Leaving a per-species view: go back to the full dataset.
             restoreFullExplorer();
             selectedSpecies = null;
-            setSpeciesContext(null);
             TIME_SECTIONS.forEach((id) => document.getElementById(id).classList.toggle("hidden", species));
             spEl.section.classList.toggle("hidden", !species);
             if (species) {
@@ -2663,7 +2814,6 @@
 
         function initSpeciesMode() {
             selectedSpecies = null;
-            setSpeciesContext(null);
             const available = explorer.species_available();
             spEl.switch.classList.remove("hidden");
             spEl.speciesTab.disabled = !available;
@@ -2679,14 +2829,101 @@
             const summary = JSON.parse(explorer.project_summary_json(speciesState.project));
             speciesState.collections = new Set(); // none selected = show all
             speciesState.deployments = new Set();
-            renderChips(spEl.collections, summary.collections, speciesState.collections, spEl.collectionHint);
-            renderChips(spEl.deployments, summary.deployments, speciesState.deployments, spEl.deploymentHint);
+            const onScopeChange = () => { refreshTaxonLevels(TAXON_LEVELS); renderSpecies(); };
+            renderChips(spEl.collections, summary.collections, speciesState.collections, spEl.collectionHint, onScopeChange);
+            renderChips(spEl.deployments, summary.deployments, speciesState.deployments, spEl.deploymentHint, onScopeChange);
             const capOpt = spEl.metric.querySelector('option[value="captures"]');
             capOpt.disabled = !summary.has_event_id;
             if (!summary.has_event_id && speciesState.metric === "captures") { speciesState.metric = "detections"; spEl.metric.value = "detections"; }
+            loadTaxonFilter();
         }
 
-        function renderChips(container, values, selectedSet, hintEl) {
+        function taxonFiltersJson() {
+            const obj = {};
+            for (const lvl of TAXON_LEVELS) { const s = speciesState.taxon[lvl]; if (s.size) obj[lvl] = [...s]; }
+            return JSON.stringify(obj);
+        }
+
+        // Build the four dropdown widgets once (idempotent).
+        function ensureTaxonWidgets() {
+            if (Object.keys(msWidgets).length) return;
+            spEl.taxon.querySelectorAll(".ms").forEach((root) => {
+                const level = root.dataset.level;
+                root.innerHTML = `<button type="button" class="ms-btn">${escHtml(t("species", "ms_all"))}</button><div class="ms-panel hidden"></div>`;
+                const btn = root.querySelector(".ms-btn"), panel = root.querySelector(".ms-panel");
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const willOpen = panel.classList.contains("hidden");
+                    closeAllTaxonPanels();
+                    if (willOpen) panel.classList.remove("hidden");
+                });
+                panel.addEventListener("click", (e) => e.stopPropagation());
+                msWidgets[level] = { btn, panel };
+            });
+            document.addEventListener("click", closeAllTaxonPanels);
+        }
+
+        function closeAllTaxonPanels() {
+            for (const lvl of TAXON_LEVELS) msWidgets[lvl] && msWidgets[lvl].panel.classList.add("hidden");
+        }
+
+        // Repopulate the checkbox list of one level's dropdown from its available
+        // values, pruning selections that are no longer valid.
+        function populateMs(level, values) {
+            const { btn, panel } = msWidgets[level];
+            const selected = speciesState.taxon[level];
+            for (const v of [...selected]) if (!values.includes(v)) selected.delete(v);
+            const rows = values.map((v) => {
+                const on = selected.has(v) ? "checked" : "";
+                return `<label class="ms-opt"><input type="checkbox" value="${escAttr(v)}" ${on}/> ${escHtml(v)}</label>`;
+            }).join("");
+            panel.innerHTML = `<div class="ms-actions"><span>${values.length}</span><button type="button" data-clear>${escHtml(t("species", "ms_clear"))}</button></div>`
+                + (values.length ? rows : `<div class="ms-empty">—</div>`);
+            panel.querySelector("[data-clear]").addEventListener("click", () => { selected.clear(); onTaxonChange(level); });
+            panel.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+                cb.addEventListener("change", () => {
+                    if (cb.checked) selected.add(cb.value); else selected.delete(cb.value);
+                    onTaxonChange(level);
+                });
+            });
+            btn.textContent = selected.size ? t("species", "ms_selected", { n: selected.size }) : t("species", "ms_all");
+            btn.classList.toggle("is-active", selected.size > 0);
+        }
+
+        // Fetch + repopulate the given levels (cascading), scoped by current filters.
+        function refreshTaxonLevels(levels) {
+            const collections = JSON.stringify([...speciesState.collections]);
+            const deployments = JSON.stringify([...speciesState.deployments]);
+            for (const level of levels) {
+                const values = JSON.parse(explorer.taxonomy_values_json(
+                    level, speciesState.project, collections, deployments, taxonFiltersJson(), speciesState.hideNonAnimals));
+                populateMs(level, values);
+            }
+        }
+
+        function loadTaxonFilter() {
+            const hasTaxonomy = explorer.has_taxonomy();
+            spEl.taxon.classList.toggle("hidden", !hasTaxonomy);
+            if (!hasTaxonomy) return;
+            ensureTaxonWidgets();
+            for (const lvl of TAXON_LEVELS) speciesState.taxon[lvl] = new Set();
+            refreshTaxonLevels(TAXON_LEVELS);
+        }
+
+        // A change at one level narrows the levels below it (hierarchy), then redraws.
+        function onTaxonChange(changedLevel) {
+            const idx = TAXON_LEVELS.indexOf(changedLevel);
+            const below = TAXON_LEVELS.slice(idx + 1);
+            // update the changed level's button label + refresh dependent levels
+            const sel = speciesState.taxon[changedLevel];
+            msWidgets[changedLevel].btn.textContent = sel.size ? t("species", "ms_selected", { n: sel.size }) : t("species", "ms_all");
+            msWidgets[changedLevel].btn.classList.toggle("is-active", sel.size > 0);
+            if (below.length) refreshTaxonLevels(below);
+            renderSpecies();
+        }
+
+        function renderChips(container, values, selectedSet, hintEl, onChange) {
+            const changed = onChange || renderSpecies;
             container.innerHTML = "";
             values.forEach((v) => {
                 const chip = document.createElement("button");
@@ -2695,7 +2932,7 @@
                     if (selectedSet.has(v)) { selectedSet.delete(v); chip.classList.remove("is-on"); }
                     else { selectedSet.add(v); chip.classList.add("is-on"); }
                     hintEl.textContent = selectedSet.size ? `(${selectedSet.size} of ${values.length})` : `(all ${values.length})`;
-                    renderSpecies();
+                    changed();
                 });
                 container.appendChild(chip);
             });
@@ -2709,6 +2946,7 @@
             spEl.metric.addEventListener("change", () => { speciesState.metric = spEl.metric.value; speciesState.sort = { key: speciesState.metric, dir: "desc" }; renderSpecies(); });
             spEl.tableSearch.addEventListener("input", renderSpeciesTable);
             spEl.tableExport.addEventListener("click", exportSpeciesCsv);
+            spEl.hideNonAnimals.addEventListener("change", () => { speciesState.hideNonAnimals = spEl.hideNonAnimals.checked; refreshTaxonLevels(TAXON_LEVELS); renderSpecies(); });
         }
 
         function renderSpecies() {
@@ -2717,15 +2955,18 @@
             const collections = JSON.stringify([...speciesState.collections]);
             const deployments = JSON.stringify([...speciesState.deployments]);
             const metric = speciesState.metric;
+            const taxonFilters = taxonFiltersJson();
+            const hideNonAnimals = speciesState.hideNonAnimals;
             const summary = JSON.parse(explorer.project_summary_json(project));
-            spEl.statLine.textContent = `${summary.collections.length} collections · ${summary.deployments.length} deployments`
-                + (speciesState.collections.size ? ` · ${speciesState.collections.size} collection(s) selected` : "")
-                + (speciesState.deployments.size ? ` · ${speciesState.deployments.size} deployment(s) selected` : "");
+            spEl.statLine.textContent = t("species", "stat", { c: summary.collections.length, d: summary.deployments.length })
+                + (speciesState.collections.size || speciesState.deployments.size
+                    ? t("species", "stat_sel", { c: speciesState.collections.size, d: speciesState.deployments.size })
+                    : "");
             try {
-                const svg = explorer.render_species_bar(project, collections, deployments, metric, chartTheme());
+                const svg = explorer.render_species_bar(project, collections, deployments, metric, taxonFilters, hideNonAnimals, chartTheme());
                 mountSvg(spEl.frame, svg, { zoomable: true });
             } catch (err) { spEl.frame.innerHTML = `<div class="placeholder">${escHtml(err && err.message || err)}</div>`; }
-            speciesState.rows = JSON.parse(explorer.species_stats_json(project, collections, deployments, metric));
+            speciesState.rows = JSON.parse(explorer.species_stats_json(project, collections, deployments, metric, taxonFilters, hideNonAnimals));
             speciesState.sort = { key: metric, dir: "desc" };
             renderSpeciesTable();
             renderSpeciesActivity(); // keep the per-species insights in sync with filters
@@ -2736,18 +2977,19 @@
             const q = (spEl.tableSearch.value || "").trim().toLowerCase();
             const hasCap = speciesState.rows.some((r) => r.captures != null);
             const { key, dir } = speciesState.sort;
+            const strKey = (k) => k === "species" || k === "scientificName";
             const rows = speciesState.rows
-                .filter((r) => !q || r.species.toLowerCase().includes(q))
+                .filter((r) => !q || r.species.toLowerCase().includes(q) || (r.scientificName || "").toLowerCase().includes(q))
                 .slice()
                 .sort((a, b) => {
-                    if (key === "species") return dir === "asc" ? String(a.species).localeCompare(b.species) : String(b.species).localeCompare(a.species);
+                    if (strKey(key)) return dir === "asc" ? String(a[key] || "").localeCompare(b[key] || "") : String(b[key] || "").localeCompare(a[key] || "");
                     const av = a[key] ?? -1, bv = b[key] ?? -1;
                     return dir === "asc" ? av - bv : bv - av;
                 });
-            const cols = [["species", "Species"], ["detections", "有效探测次数"]];
-            if (hasCap) cols.push(["captures", "独立捕获次数"]);
-            const ths = cols.map(([k, label]) => `<th data-key="${k}" class="${key === k ? (dir === "asc" ? "sorted-asc" : "sorted-desc") : ""}">${label}</th>`).join("");
-            const trs = rows.map((r) => `<tr data-species="${escAttr(r.species)}" class="${r.species === selectedSpecies ? "selected" : ""}"><td>${escHtml(r.species)}</td><td>${r.detections}</td>${hasCap ? `<td>${r.captures ?? ""}</td>` : ""}</tr>`).join("");
+            const cols = [["species", t("species", "col_species")], ["scientificName", t("species", "col_scientific")], ["detections", t("species", "col_detections")]];
+            if (hasCap) cols.push(["captures", t("species", "col_captures")]);
+            const ths = cols.map(([k, label]) => `<th data-key="${k}" class="${key === k ? (dir === "asc" ? "sorted-asc" : "sorted-desc") : ""}">${escHtml(label)}</th>`).join("");
+            const trs = rows.map((r) => `<tr data-species="${escAttr(r.species)}" class="${r.species === selectedSpecies ? "selected" : ""}"><td>${escHtml(r.species)}</td><td class="sci">${escHtml(r.scientificName || "")}</td><td>${r.detections}</td>${hasCap ? `<td>${r.captures ?? ""}</td>` : ""}</tr>`).join("");
             spEl.tableWrap.innerHTML = `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
             spEl.tableWrap.querySelectorAll("tbody tr").forEach((tr) => tr.addEventListener("click", () => selectSpeciesRow(tr.dataset.species)));
             updateOpenTimeButton();
@@ -2761,8 +3003,11 @@
 
         function exportSpeciesCsv() {
             const hasCap = speciesState.rows.some((r) => r.captures != null);
-            const header = hasCap ? "species,detections,captures" : "species,detections";
-            const lines = speciesState.rows.map((r) => hasCap ? `${csvCell(r.species)},${r.detections},${r.captures ?? ""}` : `${csvCell(r.species)},${r.detections}`);
+            const header = hasCap ? "species,scientific_name,detections,captures" : "species,scientific_name,detections";
+            const lines = speciesState.rows.map((r) => {
+                const base = `${csvCell(r.species)},${csvCell(r.scientificName || "")},${r.detections}`;
+                return hasCap ? `${base},${r.captures ?? ""}` : base;
+            });
             const blob = new Blob(["﻿" + header + "\n" + lines.join("\n")], { type: "text/csv;charset=utf-8" });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a"); a.href = url; a.download = "species_stats.csv"; a.click();
@@ -2777,7 +3022,6 @@
         // explorer and returns to the species list.
         let selectedSpecies = null;
 
-        document.getElementById("species-context-back").addEventListener("click", exitSpecies);
         document.getElementById("species-open-time").addEventListener("click", openSpeciesTime);
 
         // Row click just selects (highlights) a species; the user then presses the
@@ -2887,7 +3131,7 @@
             raiLegendCtl = L.control({ position: "bottomright" });
             raiLegendCtl.onAdd = () => {
                 const div = L.DomUtil.create("div", "rai-legend");
-                div.innerHTML = `<div>RAI (events/100 cam-days)</div>` +
+                div.innerHTML = `<div>RAI (events per 100 cam-days)</div>` +
                     `<span class="bar" style="background:linear-gradient(to right, ${raiColor(0)}, ${raiColor(0.5)}, ${raiColor(1)})"></span>` +
                     `<span class="ends"><span>0</span><span>${maxRai.toFixed(1)}</span></span>`;
                 return div;
@@ -2898,7 +3142,9 @@
         function updateOpenTimeButton() {
             const btn = document.getElementById("species-open-time");
             btn.disabled = !selectedSpecies;
-            btn.textContent = selectedSpecies ? `Time analysis: ${selectedSpecies} →` : "Time analysis";
+            btn.textContent = selectedSpecies
+                ? t("species", "open_time_named", { name: selectedSpecies })
+                : t("species", "open_time");
         }
 
         function openSpeciesTime() {
@@ -2916,22 +3162,15 @@
             explorer = scoped;
             metadata = JSON.parse(scoped.metadata_json());
             selectedSpecies = name;
-            setSpeciesContext(name);
+            // Show this species' time-analysis views; mark the Time tab active so the
+            // Species tab is the clear way back (no separate banner needed).
+            spEl.timeTab.classList.add("is-active");
+            spEl.speciesTab.classList.remove("is-active");
             spEl.section.classList.add("hidden");
             TIME_SECTIONS.forEach((id) => document.getElementById(id).classList.remove("hidden"));
             populateControls();
             renderAll();
-            document.getElementById("species-context").scrollIntoView({ behavior: "smooth", block: "start" });
-        }
-
-        function exitSpecies() {
-            restoreFullExplorer();
-            selectedSpecies = null;
-            setSpeciesContext(null);
-            TIME_SECTIONS.forEach((id) => document.getElementById(id).classList.add("hidden"));
-            spEl.section.classList.remove("hidden");
-            renderSpecies();
-            spEl.section.scrollIntoView({ block: "start" });
+            document.getElementById("section-overview").scrollIntoView({ behavior: "smooth", block: "start" });
         }
     </script>
 </body>
