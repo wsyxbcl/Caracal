@@ -46,6 +46,7 @@ impl SpeciesData {
 
     pub fn has_species(&self) -> bool { self.actual("species").is_some() }
     pub fn has_event_id(&self) -> bool { self.actual("event_id").is_some() }
+    pub fn has_collection(&self) -> bool { self.actual("collection").is_some() }
 
     /// Distinct, non-empty, sorted values of a column (cast to string first, so a
     /// numeric deployment/collection id still works).
@@ -232,6 +233,27 @@ impl SpeciesData {
     /// A CSV of the rows for one species under the current filters — fed straight
     /// back through the time-analysis pipeline so a selected species can reuse
     /// the existing overview/detail/hour charts. All original columns are kept.
+    /// A CSV of all rows under a project/collection/deployment scope (no species
+    /// filter) — fed back through the time-analysis pipeline so the heavy
+    /// deployment charts render only the selected scope, not the whole dataset.
+    pub fn scoped_csv(
+        &self,
+        project: &str,
+        collections: &[String],
+        deployments: &[String],
+    ) -> Result<String> {
+        let mut df = self
+            .scoped(project, collections, deployments)
+            .collect()
+            .context("failed to scope rows")?;
+        if df.height() == 0 {
+            bail!("no rows under the current scope");
+        }
+        let mut buffer = Vec::new();
+        CsvWriter::new(&mut buffer).finish(&mut df).context("failed to serialize scoped subset")?;
+        String::from_utf8(buffer).context("scoped subset was not valid UTF-8")
+    }
+
     pub fn filtered_csv(
         &self,
         project: &str,

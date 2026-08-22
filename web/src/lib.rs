@@ -252,6 +252,29 @@ impl WasmExplorer {
         Ok(WasmExplorer { data, species, deploy_path_index: self.deploy_path_index })
     }
 
+    /// A new explorer scoped to a project + collections (no species filter), so
+    /// the time-analysis views render only that scope — the whole-dataset
+    /// deployment heatmaps are too large (and not useful) on big multi-collection
+    /// imports.
+    pub fn scoped_time_explorer(
+        &self,
+        project: String,
+        collections: String,
+    ) -> Result<WasmExplorer, JsValue> {
+        let csv = self
+            .species
+            .scoped_csv(&project, &parse_str_list(&collections)?, &[])
+            .map_err(to_js_error)?;
+        let override_index = (self.deploy_path_index >= 1).then_some(self.deploy_path_index);
+        let data = PreparedData::from_csv_text(&csv, override_index).map_err(to_js_error)?;
+        let species = SpeciesData::from_csv_text(&csv).map_err(to_js_error)?;
+        Ok(WasmExplorer { data, species, deploy_path_index: self.deploy_path_index })
+    }
+
+    /// Whether the CSV carries a `collection` column (drives the time-analysis
+    /// scope selector).
+    pub fn has_collection(&self) -> bool { self.species.has_collection() }
+
     pub fn metadata_json(&self) -> Result<String, JsValue> {
         let metadata = ExplorerMetadata {
             rows: self.data.events.height(),
