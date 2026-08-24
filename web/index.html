@@ -3527,6 +3527,19 @@
                     await openLocalCsvFromDisk();
                 } catch (error) {
                     if (error && error.name === "AbortError") {
+                        return; // user cancelled the picker
+                    }
+                    // showOpenFilePicker sometimes rejects with a security /
+                    // "user activation required" error (e.g. when the gesture is
+                    // considered stale). Fall back to the plain file input, which
+                    // is far more permissive about activation.
+                    const activationIssue =
+                        error &&
+                        (error.name === "SecurityError" ||
+                            error.name === "NotAllowedError" ||
+                            /user activation/i.test(error.message || ""));
+                    if (activationIssue) {
+                        csvUploadInput.click();
                         return;
                     }
                     reportLoadError(error);

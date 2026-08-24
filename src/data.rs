@@ -779,6 +779,20 @@ fn parse_datetime_text(raw: &str, row_number: usize, column_name: &str) -> Resul
         }
     }
 
+    // Minute precision (no seconds) — e.g. Excel exports "2026/1/14 9:38".
+    // chrono parses non-zero-padded month/day/hour, so this covers "1/14 9:38" too.
+    for format in [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%dT%H:%M",
+        "%Y:%m:%d %H:%M",
+    ] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(value, format) {
+            return Ok(parsed);
+        }
+    }
+
     for format in ["%Y-%m-%d", "%Y/%m/%d", "%Y:%m:%d"] {
         if let Ok(parsed) = NaiveDate::parse_from_str(value, format) {
             return parsed
@@ -1385,3 +1399,4 @@ mod tests {
         assert_eq!(data.default_deployment(), "explicit");
     }
 }
+
