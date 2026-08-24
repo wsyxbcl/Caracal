@@ -1805,6 +1805,7 @@
                         time_collection: "Collection",
                         time_scope_hint: "This is a large multi-collection dataset — pick a collection to render its time-analysis charts.",
                         time_scope_prompt: "Select a project and collection above to render the time-analysis charts.",
+                        parsing: "Parsing CSV…",
                         metric_rows: "Rows",
                         metric_deployments: "Deployments",
                         metric_range: "Range",
@@ -1972,6 +1973,7 @@
                         time_collection: "Collection",
                         time_scope_hint: "这是一个较大的多 collection 数据集 —— 请选择一个 collection 以渲染其时间分析图表。",
                         time_scope_prompt: "在上方选择项目与 collection 以渲染时间分析图表。",
+                        parsing: "正在解析 CSV…",
                         metric_rows: "记录数",
                         metric_deployments: "位点数",
                         metric_range: "时间范围",
@@ -3305,13 +3307,19 @@
                 clearError();
                 lastAttempt = { csvText, sourceLabel, source };
 
+                // Paint a "parsing" state before the (main-thread-blocking) build.
+                showParsingState();
+                await yieldToPaint();
+
+                // Only the light species view is parsed here now; the heavy
+                // time-analysis model is built lazily (on first render / scope).
                 const nextExplorer = new WasmExplorer(csvText, pathIndex);
-                const nextMetadata = JSON.parse(nextExplorer.metadata_json());
+                const light = JSON.parse(nextExplorer.light_metadata_json());
 
                 explorer = nextExplorer;
-                metadata = nextMetadata;
+                metadata = light;
                 fullExplorer = nextExplorer;
-                fullMetadata = nextMetadata;
+                fullMetadata = light;
                 pendingPathSelection = null;
                 lastCsvText = csvText;
                 lastSourceLabel = sourceLabel;
@@ -3321,30 +3329,54 @@
                     updateSourceControls();
                 }
 
-                setMetric("metric-rows", metadata.rows_display);
-                setMetric("metric-deployments", metadata.deployments_display);
+                setMetric("metric-rows", light.rows_display);
+                setMetric("metric-deployments", light.deployments_display);
                 setMetric(
                     "metric-range",
-                    formatRange(metadata.range_start, metadata.range_end),
+                    formatRange(light.range_start, light.range_end),
                 );
 
                 // Big multi-collection datasets: don't draw a whole-dataset overview
                 // (1000+ deployments = an unusably large, slow SVG). Require a scope.
-                const deploymentCount = metadata.deployment_options?.length || 0;
                 timeExplorer = null;
                 timeLazy =
-                    typeof explorer.has_collection === "function" &&
-                    explorer.has_collection() &&
-                    deploymentCount > LAZY_TIME_THRESHOLD;
+                    light.has_collection &&
+                    light.deployments > LAZY_TIME_THRESHOLD;
                 populateTimeScope();
                 if (timeLazy) {
                     showTimePlaceholders();
                 } else {
+                    // Small dataset: build the full time model now and render.
                     timeScopeSection.classList.add("hidden");
+                    metadata = JSON.parse(nextExplorer.metadata_json());
+                    fullMetadata = metadata;
+                    setMetric("metric-rows", metadata.rows_display);
+                    setMetric("metric-deployments", metadata.deployments_display);
+                    setMetric(
+                        "metric-range",
+                        formatRange(metadata.range_start, metadata.range_end),
+                    );
                     populateControls();
                     await renderAll();
                 }
                 initSpeciesMode();
+            }
+
+            // Double-rAF so the browser actually paints before we block the thread.
+            const yieldToPaint = () =>
+                new Promise((resolve) =>
+                    requestAnimationFrame(() => requestAnimationFrame(resolve)),
+                );
+
+            function showParsingState() {
+                const msg = `<div class="placeholder">${escHtml(t("static", "parsing"))}</div>`;
+                overviewFrame.innerHTML = msg;
+                detailFrame.innerHTML = msg;
+                hourFrame.innerHTML = msg;
+                if (spEl.frame) spEl.frame.innerHTML = msg;
+                setMetric("metric-rows", "…");
+                setMetric("metric-deployments", "…");
+                setMetric("metric-range", "…");
             }
 
             // Fill the time-analysis scope selectors from the full dataset.

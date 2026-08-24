@@ -48,6 +48,48 @@ impl SpeciesData {
     pub fn has_event_id(&self) -> bool { self.actual("event_id").is_some() }
     pub fn has_collection(&self) -> bool { self.actual("collection").is_some() }
 
+    // --- cheap accessors for "light" metadata (no PreparedData build) ---
+
+    pub fn row_count(&self) -> usize { self.frame.height() }
+
+    /// Distinct `deployment` values (0 when the column is absent — such CSVs
+    /// derive deployments from `path` and go through the eager path anyway).
+    pub fn deployment_count(&self) -> usize {
+        self.actual("deployment")
+            .and_then(|name| self.frame.column(name).ok())
+            .and_then(|c| c.as_materialized_series().n_unique().ok())
+            .unwrap_or(0)
+    }
+
+    /// (min, max) date (`YYYY-MM-DD`) of the `datetime` column by lexical scan —
+    /// ISO-ish strings sort chronologically, so no timestamp parsing is needed.
+    pub fn datetime_range(&self) -> (String, String) {
+        let Some(name) = self.actual("datetime") else {
+            return (String::new(), String::new());
+        };
+        let Ok(series) = self
+            .frame
+            .column(name)
+            .and_then(|c| c.as_materialized_series().cast(&DataType::String))
+        else {
+            return (String::new(), String::new());
+        };
+        let Ok(ca) = series.str() else {
+            return (String::new(), String::new());
+        };
+        let (mut lo, mut hi): (Option<&str>, Option<&str>) = (None, None);
+        for value in ca.into_iter().flatten() {
+            if lo.map_or(true, |l| value < l) {
+                lo = Some(value);
+            }
+            if hi.map_or(true, |h| value > h) {
+                hi = Some(value);
+            }
+        }
+        let date = |s: Option<&str>| s.map(|v| v.get(..10).unwrap_or(v).to_string()).unwrap_or_default();
+        (date(lo), date(hi))
+    }
+
     /// Distinct, non-empty, sorted values of a column (cast to string first, so a
     /// numeric deployment/collection id still works).
     fn unique_strings(&self, actual_name: &str) -> Result<Vec<String>> {

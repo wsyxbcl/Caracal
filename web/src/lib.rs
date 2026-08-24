@@ -7,6 +7,8 @@ mod species;
 #[path = "../../src/util.rs"]
 mod util;
 
+use std::cell::{Ref, RefCell};
+
 use polars::prelude::*;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -22,9 +24,34 @@ pub fn init_runtime() {
 
 #[wasm_bindgen]
 pub struct WasmExplorer {
-    data: PreparedData,
+    // The time-analysis model is heavy to build (parses every row + aggregates all
+    // deployments), so build it lazily: species mode + the light metadata don't
+    // need it, and big multi-collection imports only ever render a scoped subset.
+    csv: String,
+    data: RefCell<Option<PreparedData>>,
     species: SpeciesData, // maze-stats: same CSV, species-analysis view
     deploy_path_index: i32, // remembered so a species-scoped subset derives the same deployments
+}
+
+impl WasmExplorer {
+    /// Shared constructor: parse the (cheap) species view now; defer the heavy
+    /// time-analysis `PreparedData` to first use.
+    fn from_csv(csv: String, deploy_path_index: i32) -> Result<WasmExplorer, JsValue> {
+        let species = SpeciesData::from_csv_text(&csv).map_err(to_js_error)?;
+        Ok(Self { csv, data: RefCell::new(None), species, deploy_path_index })
+    }
+
+    /// The time-analysis model, built on first access and cached.
+    fn data(&self) -> Result<Ref<'_, PreparedData>, JsValue> {
+        let needs_build = self.data.borrow().is_none();
+        if needs_build {
+            let override_index = (self.deploy_path_index >= 1).then_some(self.deploy_path_index);
+            let prepared =
+                PreparedData::from_csv_text(&self.csv, override_index).map_err(to_js_error)?;
+            *self.data.borrow_mut() = Some(prepared);
+        }
+        Ok(Ref::map(self.data.borrow(), |slot| slot.as_ref().expect("just built")))
+    }
 }
 
 #[derive(Serialize)]
@@ -75,10 +102,7 @@ impl WasmExplorer {
     /// value below 1 (e.g. -1) to auto-detect.
     #[wasm_bindgen(constructor)]
     pub fn new(csv_content: String, deploy_path_index: i32) -> Result<WasmExplorer, JsValue> {
-        let override_index = (deploy_path_index >= 1).then_some(deploy_path_index);
-        let data = PreparedData::from_csv_text(&csv_content, override_index).map_err(to_js_error)?;
-        let species = SpeciesData::from_csv_text(&csv_content).map_err(to_js_error)?;
-        Ok(Self { data, species, deploy_path_index })
+        Self::from_csv(csv_content, deploy_path_index)
     }
 
     // ---- maze-stats: species analysis --------------------------------------
@@ -246,10 +270,7 @@ impl WasmExplorer {
             .species
             .filtered_csv(&project, &parse_str_list(&collections)?, &parse_str_list(&deployments)?, &species)
             .map_err(to_js_error)?;
-        let override_index = (self.deploy_path_index >= 1).then_some(self.deploy_path_index);
-        let data = PreparedData::from_csv_text(&csv, override_index).map_err(to_js_error)?;
-        let species = SpeciesData::from_csv_text(&csv).map_err(to_js_error)?;
-        Ok(WasmExplorer { data, species, deploy_path_index: self.deploy_path_index })
+        Self::from_csv(csv, self.deploy_path_index)
     }
 
     /// A new explorer scoped to a project + collections (no species filter), so
@@ -265,28 +286,27 @@ impl WasmExplorer {
             .species
             .scoped_csv(&project, &parse_str_list(&collections)?, &[])
             .map_err(to_js_error)?;
-        let override_index = (self.deploy_path_index >= 1).then_some(self.deploy_path_index);
-        let data = PreparedData::from_csv_text(&csv, override_index).map_err(to_js_error)?;
-        let species = SpeciesData::from_csv_text(&csv).map_err(to_js_error)?;
-        Ok(WasmExplorer { data, species, deploy_path_index: self.deploy_path_index })
+        Self::from_csv(csv, self.deploy_path_index)
     }
 
     /// Whether the CSV carries a `collection` column (drives the time-analysis
     /// scope selector).
     pub fn has_collection(&self) -> bool { self.species.has_collection() }
 
+    /// Full time-analysis metadata (builds `PreparedData`). Used only when the
+    /// time charts are actually rendered — `light_metadata_json` covers load.
     pub fn metadata_json(&self) -> Result<String, JsValue> {
+        let data = self.data()?;
         let metadata = ExplorerMetadata {
-            rows: self.data.events.height(),
-            rows_display: format_count(self.data.events.height()),
-            deployments: self.data.deployments.len(),
-            deployments_display: format_count(self.data.deployments.len()),
-            range_start: format_date(self.data.min_timestamp),
-            range_end: format_date(self.data.max_timestamp),
+            rows: data.events.height(),
+            rows_display: format_count(data.events.height()),
+            deployments: data.deployments.len(),
+            deployments_display: format_count(data.deployments.len()),
+            range_start: format_date(data.min_timestamp),
+            range_end: format_date(data.max_timestamp),
             default_bucket: OverviewBucket::Month.slug(),
-            default_deployment: self.data.default_deployment().to_string(),
-            deployment_options: self
-                .data
+            default_deployment: data.default_deployment().to_string(),
+            deployment_options: data
                 .deployments
                 .iter()
                 .map(|summary| DeploymentOption {
@@ -299,11 +319,10 @@ impl WasmExplorer {
                     has_gps: summary.has_gps,
                 })
                 .collect(),
-            deployment_from_path: self.data.deployment_source.from_path,
-            deploy_path_index: self.data.deployment_source.path_index,
-            detected_path_index: self.data.deployment_source.detected_path_index,
-            path_levels: self
-                .data
+            deployment_from_path: data.deployment_source.from_path,
+            deploy_path_index: data.deployment_source.path_index,
+            detected_path_index: data.deployment_source.detected_path_index,
+            path_levels: data
                 .deployment_source
                 .path_levels
                 .iter()
@@ -316,6 +335,37 @@ impl WasmExplorer {
         };
 
         serde_json::to_string(&metadata).map_err(to_js_error)
+    }
+
+    /// Cheap load-time metadata straight from the species frame — row/deployment
+    /// counts + date range + column presence, WITHOUT building `PreparedData`.
+    /// Enough for the metrics strip and the lazy-render decision.
+    pub fn light_metadata_json(&self) -> Result<String, JsValue> {
+        let (range_start, range_end) = self.species.datetime_range();
+        let deployments = self.species.deployment_count();
+        let rows = self.species.row_count();
+        #[derive(Serialize)]
+        struct LightMetadata {
+            rows: usize,
+            rows_display: String,
+            deployments: usize,
+            deployments_display: String,
+            range_start: String,
+            range_end: String,
+            has_species: bool,
+            has_collection: bool,
+        }
+        serde_json::to_string(&LightMetadata {
+            rows,
+            rows_display: format_count(rows),
+            deployments,
+            deployments_display: format_count(deployments),
+            range_start,
+            range_end,
+            has_species: self.species.has_species(),
+            has_collection: self.species.has_collection(),
+        })
+        .map_err(to_js_error)
     }
 
     /// Probe a CSV's `path` column so the UI can offer manual level selection
@@ -343,21 +393,25 @@ impl WasmExplorer {
 
     pub fn render_overview(&self, bucket: String, theme: String) -> Result<String, JsValue> {
         let bucket = parse_bucket(&bucket)?;
-        render::overview_web_svg(&self.data, bucket, parse_theme(&theme)).map_err(to_js_error)
+        let data = self.data()?;
+        render::overview_web_svg(&data, bucket, parse_theme(&theme)).map_err(to_js_error)
     }
 
     pub fn render_detail(&self, deployment: String, theme: String) -> Result<String, JsValue> {
-        let deployment = normalize_deployment(&self.data, &deployment)?;
-        render::detail_web_svg(&self.data, &deployment, parse_theme(&theme)).map_err(to_js_error)
+        let data = self.data()?;
+        let deployment = normalize_deployment(&data, &deployment)?;
+        render::detail_web_svg(&data, &deployment, parse_theme(&theme)).map_err(to_js_error)
     }
 
     pub fn render_hour_heatmap(&self, theme: String) -> Result<String, JsValue> {
-        render::hour_heatmap_web_svg(&self.data, parse_theme(&theme)).map_err(to_js_error)
+        let data = self.data()?;
+        render::hour_heatmap_web_svg(&data, parse_theme(&theme)).map_err(to_js_error)
     }
 
     pub fn detail_caption(&self, deployment: String) -> Result<String, JsValue> {
-        let deployment = normalize_deployment(&self.data, &deployment)?;
-        render::detail_caption(&self.data, &deployment).map_err(to_js_error)
+        let data = self.data()?;
+        let deployment = normalize_deployment(&data, &deployment)?;
+        render::detail_caption(&data, &deployment).map_err(to_js_error)
     }
 }
 
