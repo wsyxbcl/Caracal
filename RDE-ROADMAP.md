@@ -98,11 +98,35 @@ sample across the boundary; the demuxer choice is perf-irrelevant either way
   labelled placeholder — that's what the out-of-band ffmpeg pre-extraction escape
   hatch is for. `.mp4/.m4v/.mov` are covered.
 
+## Measured on real production clips (2026-08-26)
+36 clips off the capture drive onto a local HDD, plus a full-document run on the
+user's Windows box. See the `rde-video-benchmark-2026-08-26` memory for the
+numbers; the load-bearing conclusions:
+- Clips are **2592x1944 (5 MP)**, ~20 s, ~50 MB, GOP **160** — not 1080p. GOP
+  varies per camera (8 / 39 / 150 / 160), which is what decides the merge ratio.
+- **Two regimes.** Only 21% of video detections target frame 0; those clips are
+  I/O-bound (a whole ~50 MB read per crop). The other **77% are decode-bound** —
+  up to 2.9 s/clip in software. Byte-range reads therefore help far less than the
+  "52 MB per crop" headline suggests, and are now the *smallest* lever.
+- **Concurrency is flat** from 2 to 6 (the disk saturates at ~242 MB/s); 6 only
+  inflates per-clip latency 6.6x and holds six ~50 MB reads in flight. Default 3.
+- **Thumbnail encode is 1-5 ms/clip** — format choice is a cache-size question,
+  not a latency one.
+- The user's machine runs **entirely software-rendered** (`chrome://gpu`: Canvas,
+  Compositing, Rasterization, Video Decode all "Software only", adapter =
+  Microsoft Basic Render Driver via SwANGLE). Getting a real GPU driver active is
+  probably a bigger lever than any code change.
+
 ## Remaining / roadmap
-1. **Test P3 on real data.** The `maze_trans` clips aren't mounted here, so decode
-   throughput on real 1080p H.264 is still an **estimate** (~3–10x an image crop).
-   Watch the per-clip `[rde] clip …` console line for frame counts and whether any
-   clip hit the `linear fallback`.
+1. **The three deferred cache/pipeline steps** (agreed design): split request
+   enumeration from the group (`sourcesFor(instances)`, with `groupSources` as one
+   caller) → put a `has/get/put` tier interface in front of the crop cache → add
+   an OPFS write-through behind it, and an optional **precompute-all-previews**
+   mode driving the same enumerator in media order. Estimated **~1.1 h
+   single-threaded / ~0.4 h at concurrency 3** for all 3,350 suspicious clips in
+   software; ~0.11 GB of crops. OPFS is origin-scoped, so the offline launcher
+   must use a **stable localhost port** or previous previews become invisible
+   (the same constraint applies to persisting the FSA directory handle).
 2. **Manual-test the FSA picker** on a real machine + folder (headless can't drive
    the native dialog): instant load, crops resolve per group, case-mismatch
    handled, genuinely-missing → "no image".
@@ -110,7 +134,15 @@ sample across the boundary; the demuxer choice is perf-irrelevant either way
    it's cheap + pure), review-session save/load, review stats chart. NB the default
    `occurrence_threshold` of 20 yields **0 groups** on the 574-media demo json, so
    sliders are what make that dataset reviewable at all.
-4. Optional: exclude/skip video in clustering, or video-aware clustering. Note
+4. **One clip in 36 still fails to decode** — `6089_gps2…IMG_0754.mp4` (targets
+   [0, 266, 532]) throws a bare "Decoding error." after the sync-flag repair. A
+   per-clip fallback to a linear pass on decoder error would make it robust, and
+   precompute mode must count and report such failures rather than silently
+   producing nothing.
+5. **Cold hover still re-reads the whole clip** (~42 MB for one frame); only
+   repeats are cached. Fix by generating previews from the frames the crop pass
+   already decodes, or with byte-range reads.
+6. Optional: exclude/skip video in clustering, or video-aware clustering. Note
    clustering counts **distinct media**, so N frames inside one clip are a single
    occurrence — yet each still becomes its own tile (on the demo doc, 76% of
    suspicious *instances* were video vs 34% of suspicious *media*).
