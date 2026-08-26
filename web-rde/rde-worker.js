@@ -36,7 +36,14 @@ self.onmessage = async (event) => {
           defaultOptions: default_options(),
           imageFiles: session.image_files(), // json paths, for path diagnostics + matching
           videoFrameRates: session.video_frame_rates(), // [[image_index, fps], …] (SPEC §2.2)
+          categoryNames: session.category_names(),     // {"1":"animal", …}, for preview labels
         });
+        break;
+      }
+      case "detections": {
+        requireSession();
+        // Cheap enough to fetch per preview; the review UI is idle here anyway.
+        reply(id, { detections: session.detections_of(event.data.imageIndex) });
         break;
       }
       case "find": {

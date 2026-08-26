@@ -11,7 +11,7 @@
 //! fields survive untouched — it never rebuilds the document from the projection.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,18 @@ pub struct Instance {
     /// presentation-order frame index from the start of the clip — ffmpeg's `n`,
     /// which is what our `run_md_video.py` selects on. `None` for stills, so the
     /// pixel provider knows which media need a frame decode (SPEC §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_number: Option<u32>,
+}
+
+/// One detection as the review UI needs it — every box on a media, not just the
+/// suspicious ones (see `MdDocument::detections_of`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetectionView {
+    pub detection_index: usize,
+    pub bbox: BBox,
+    pub conf: f32,
+    pub category: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_number: Option<u32>,
 }
@@ -179,6 +191,52 @@ impl MdDocument {
                 (rate > 0.0).then_some((index, rate))
             })
             .collect()
+    }
+
+    /// Every detection on one media, suspicious or not, so a review can show what
+    /// else the detector found there. A suspicious box that overlaps a real animal
+    /// is the case a reviewer most needs context for, and clustering alone never
+    /// surfaces the animal — it is in no group.
+    pub fn detections_of(&self, image_index: usize) -> Vec<DetectionView> {
+        let Some(image) = self.images().get(image_index) else {
+            return Vec::new();
+        };
+        let Some(detections) = image.get("detections").and_then(|d| d.as_array()) else {
+            return Vec::new();
+        };
+        detections
+            .iter()
+            .enumerate()
+            .filter_map(|(detection_index, det)| {
+                Some(DetectionView {
+                    detection_index,
+                    bbox: parse_bbox(det)?,
+                    conf: det.get("conf").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    category: det
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    frame_number: det
+                        .get("frame_number")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32),
+                })
+            })
+            .collect()
+    }
+
+    /// The document's `detection_categories` (`"1" -> "animal"`), for labelling.
+    pub fn category_names(&self) -> BTreeMap<String, String> {
+        self.root
+            .get("detection_categories")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The underlying document (read-only).

@@ -74,6 +74,18 @@ impl RdeSession {
         serde_json::to_string(&self.doc.video_frame_rates()).expect("rates serialize")
     }
 
+    /// Every detection on one media as JSON, suspicious or not, so the preview can
+    /// draw what else the detector found — a suspicious box overlapping a real
+    /// animal is exactly the call a reviewer needs help with.
+    pub fn detections_of(&self, image_index: usize) -> Result<String, JsValue> {
+        serde_json::to_string(&self.doc.detections_of(image_index)).map_err(to_js)
+    }
+
+    /// The document's `detection_categories` (`"1" -> "animal"`), for labelling.
+    pub fn category_names(&self) -> Result<String, JsValue> {
+        serde_json::to_string(&self.doc.category_names()).map_err(to_js)
+    }
+
     /// Cluster suspicious groups (SPEC §3). `options_json` is an `RdeOptions`;
     /// returns the groups as a JSON array (the review DTO, SPEC §5.1). Cheap and
     /// pure, so the UI can re-run it on every parameter change.

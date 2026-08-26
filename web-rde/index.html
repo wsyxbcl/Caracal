@@ -153,7 +153,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-26h";
+    const BUILD = "2026-08-26j";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -373,6 +373,7 @@
       imageFiles: null,                // image_index -> json `file` path (also the FSA lookup key)
       frameRateByImageIndex: new Map(),// image_index -> fps, video entries only (SPEC §2.2)
       instancesByMedia: new Map(),     // image_index -> all suspicious instances on that media
+      categoryNames: {},               // detection_categories: "1" -> "animal"
       fileByImageIndex: new Map(),     // image_index -> picked File (webkitdirectory fallback only)
       folderLoaded: false,
       folderMode: "files",             // "files" (webkitdirectory) | "fsa" (directory handle, lazy resolve)
@@ -414,6 +415,7 @@
         }
         state.imageFiles = loaded.imageFiles ? JSON.parse(loaded.imageFiles) : null;
         state.frameRateByImageIndex = new Map(JSON.parse(loaded.videoFrameRates || "[]"));
+        state.categoryNames = JSON.parse(loaded.categoryNames || "{}");
         status.textContent = `Clustering ${loaded.totalDetections.toLocaleString()} detections…`;
         const tFind = performance.now();
         state.groups = JSON.parse((await call("find", { options: state.options })).groups);
@@ -519,7 +521,7 @@
           `${matched.toLocaleString()} media ready` +
           (videos ? ` (${images.toLocaleString()} image, ${videos.toLocaleString()} video)` : "") +
           (missing ? `, ${missing.toLocaleString()} missing/ambiguous` : "") +
-          `. ← → to move, Space to keep, Enter for next group.`;
+          `. ← → to move, Space to keep, f for the exact frame, Enter for next group.`;
         goToGroup(currentIndex); // re-render current group, now with crops + prefetch
       } catch (err) {
         showError(err);
@@ -550,7 +552,7 @@
       status.textContent =
         `Linked ${rootHandle.name} — ${suspicious.length.toLocaleString()} media` +
         (nVid ? ` (${nImg.toLocaleString()} image, ${nVid.toLocaleString()} video)` : "") +
-        `. ← → to move, Space to keep, Enter for next group.`;
+        `. ← → to move, Space to keep, f for the exact frame, Enter for next group.`;
       goToGroup(currentIndex);
     }
 
@@ -936,6 +938,14 @@
         }
         case "Enter": case "n": markReviewedAndNext(); break;
         case "p": goToGroup(currentIndex - 1); break;
+        case "f": { // toggle between the clip's first frame and this detection's own
+          exactFrame = !exactFrame;
+          // Redraw whatever the panel is showing — that may be a hovered tile,
+          // and hovering does not move the keyboard focus.
+          const instance = previewInstance || currentGrid?.children[focusIndex]?._instance;
+          if (instance) drawPreview(instance);
+          break;
+        }
         case "k": setGroupDecision(currentGroup(), "Keep"); break;
         case "d": setGroupDecision(currentGroup(), "Remove"); break;
         default: return;
@@ -1009,7 +1019,7 @@
     const PREVIEW_CACHE_MAX = 16;
     const previewCache = new Map(); // "image_index:frame" -> ImageBitmap (LRU order)
     const previewKey = (instance) =>
-      instance.det_ref.image_index + ":" + (instance.frame_number ?? "still");
+      instance.det_ref.image_index + ":" + (previewFrameOf(instance) ?? "still");
     function previewGet(key) {
       const bitmap = previewCache.get(key);
       if (!bitmap) return null;
@@ -1031,6 +1041,19 @@
       previewCache.clear();
     }
 
+    // Which frame the panel shows for a video. Frame 0 is a keyframe, so it costs
+    // ONE decode; the detection's own frame can sit 160 frames past the last
+    // keyframe and cost ~40x more (measured 65 ms vs 2711 ms). The suspicious box
+    // is in the same place on every frame of a group by construction, so frame 0
+    // answers "what is this thing?" just as well. `x` loads the exact frame when
+    // the moment matters.
+    let exactFrame = false;
+    let previewInstance = null; // what the panel is currently showing
+    function previewFrameOf(instance) {
+      if (instance.frame_number === undefined) return undefined; // a still
+      return exactFrame ? instance.frame_number : 0;
+    }
+
     function setPreview(instance) {
       clearTimeout(previewTimer);
       // A cached frame needs no decode, so skip the settle delay entirely — that
@@ -1040,6 +1063,7 @@
     }
     async function drawPreview(instance) {
       const token = ++previewToken;
+      previewInstance = instance;
       const ctx = previewCanvas.getContext("2d");
       const src = sourceOf(instance.det_ref.image_index);
       const path = state.imageFiles?.[instance.det_ref.image_index] || "";
@@ -1052,11 +1076,13 @@
           : "This browser has no WebCodecs, so video frames can't be decoded.");
         return;
       }
-      // For video, decode just this detection's frame (SPEC §7).
+      // For video, decode a frame of this clip (SPEC §7) — frame 0 unless the
+      // reviewer asked for the exact one.
+      const frameNumber = previewFrameOf(instance);
       const key = previewKey(instance);
       let bitmap = previewGet(key);
       if (!bitmap) {
-        const res = await mediaDecode("frame", src, isVideo ? { frameNumber: instance.frame_number } : null);
+        const res = await mediaDecode("frame", src, isVideo ? { frameNumber } : null);
         if (!res || !res.bitmap) {
           if (token === previewToken) blank("Could not read this image.");
           return;
@@ -1071,11 +1097,58 @@
       const cw = Math.round(bitmap.width * scale), chh = Math.round(bitmap.height * scale);
       previewCanvas.width = cw; previewCanvas.height = chh;
       ctx.drawImage(bitmap, 0, 0, cw, chh);
+
+      // Everything the detector found on this frame, not just the box under
+      // review: a suspicious box sitting on top of a real animal is the case that
+      // is hardest to judge, and the animal's box is in no group so clustering
+      // never shows it.
+      const others = await detectionsOf(instance.det_ref.image_index);
+      if (token !== previewToken) return;
+      const line = Math.max(2, cw / 240);
+      ctx.font = `${Math.max(11, Math.round(cw / 46))}px system-ui, sans-serif`;
+      ctx.textBaseline = "bottom";
+      for (const det of others) {
+        if (det.detection_index === instance.det_ref.detection_index) continue;
+        // On a video only boxes from the frame on screen belong on it.
+        if (frameNumber !== undefined && det.frame_number !== frameNumber) continue;
+        const [dx, dy, dw, dh] = det.bbox;
+        ctx.lineWidth = line;
+        ctx.strokeStyle = "#3e7cb1";
+        ctx.strokeRect(dx * cw, dy * chh, dw * cw, dh * chh);
+        const label = `${state.categoryNames[det.category] || det.category} ${det.conf.toFixed(2)}`;
+        const pad = 3, tw = ctx.measureText(label).width + pad * 2;
+        const th = parseInt(ctx.font, 10) + pad;
+        ctx.fillStyle = "#3e7cb1";
+        ctx.fillRect(dx * cw, Math.max(th, dy * chh) - th, tw, th);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(label, dx * cw + pad, Math.max(th, dy * chh) - 1);
+      }
+
+      // The box under review, drawn last so it is never covered.
       const [x, y, w, h] = instance.bbox;
-      ctx.lineWidth = Math.max(2, cw / 240); ctx.strokeStyle = "#e23b2e";
+      ctx.lineWidth = line * 1.5; ctx.strokeStyle = "#e23b2e";
       ctx.strokeRect(x * cw, y * chh, w * cw, h * chh);
-      previewMeta.innerHTML = `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}<br>${path}`;
+
+      const shown = frameNumber === undefined ? ""
+        : frameNumber === instance.frame_number
+          ? ` · frame ${frameNumber} (this detection)`
+          : ` · frame ${frameNumber} — press f for this detection's frame ${instance.frame_number}`;
+      previewMeta.innerHTML =
+        `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}${escHtml(shown)}<br>${escHtml(path)}`;
     }
+
+    // Detections per media, memoised — the document is immutable, so this is
+    // asked once per media however often the panel redraws.
+    const detectionsCache = new Map();
+    async function detectionsOf(imageIndex) {
+      let entry = detectionsCache.get(imageIndex);
+      if (!entry) {
+        entry = call("detections", { imageIndex }).then((r) => JSON.parse(r.detections)).catch(() => []);
+        detectionsCache.set(imageIndex, entry);
+      }
+      return entry;
+    }
+    const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
     // ---- Decisions -----------------------------------------------------------
     function applyTileStyle(tile, decision) {
@@ -1140,6 +1213,8 @@
       currentGrid = null;
       clearCropCache();
       clearPreviewCache();
+      detectionsCache.clear();
+      exactFrame = false;
       tileByKey.clear();
       state.imageFiles = null;
       $("folder-fsa").classList.add("disabled");
