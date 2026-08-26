@@ -153,7 +153,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-26f";
+    const BUILD = "2026-08-26g";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -989,8 +989,41 @@
       clearTimeout(scrollIdle);
       scrollIdle = setTimeout(() => { scrolling = false; }, 160);
     }, { passive: true, capture: true });
+    // Decoded frames, keyed by media + frame. A preview costs a whole re-read and
+    // re-demux of the clip (~42 MB for one frame), so hovering back over a tile,
+    // or over a second box on the same frame — common, since a group is boxes that
+    // recur — should not pay it twice. Bitmaps are ~1.5 MB at this width, so the
+    // budget is deliberately small; eviction closes them.
+    const PREVIEW_CACHE_MAX = 16;
+    const previewCache = new Map(); // "image_index:frame" -> ImageBitmap (LRU order)
+    const previewKey = (instance) =>
+      instance.det_ref.image_index + ":" + (instance.frame_number ?? "still");
+    function previewGet(key) {
+      const bitmap = previewCache.get(key);
+      if (!bitmap) return null;
+      previewCache.delete(key);
+      previewCache.set(key, bitmap); // most recently used
+      return bitmap;
+    }
+    function previewPut(key, bitmap) {
+      if (previewCache.has(key)) previewCache.get(key).close();
+      previewCache.set(key, bitmap);
+      for (const oldest of previewCache.keys()) {
+        if (previewCache.size <= PREVIEW_CACHE_MAX) break;
+        previewCache.get(oldest).close();
+        previewCache.delete(oldest);
+      }
+    }
+    function clearPreviewCache() {
+      for (const bitmap of previewCache.values()) bitmap.close();
+      previewCache.clear();
+    }
+
     function setPreview(instance) {
       clearTimeout(previewTimer);
+      // A cached frame needs no decode, so skip the settle delay entirely — that
+      // is what makes hovering along a row feel immediate.
+      if (previewCache.has(previewKey(instance))) { drawPreview(instance); return; }
       previewTimer = setTimeout(() => { if (!scrolling) drawPreview(instance); }, 90); // settle + not mid-scroll
     }
     async function drawPreview(instance) {
@@ -1008,14 +1041,24 @@
         return;
       }
       // For video, decode just this detection's frame (SPEC §7).
-      const res = await mediaDecode("frame", src, isVideo ? { frameNumber: instance.frame_number } : null);
-      if (token !== previewToken) { res?.bitmap?.close(); return; } // a newer hover won
-      if (!res || !res.bitmap) { blank("Could not read this image."); return; }
-      const scale = Math.min(1, PREVIEW_W / res.width);
-      const cw = Math.round(res.width * scale), chh = Math.round(res.height * scale);
+      const key = previewKey(instance);
+      let bitmap = previewGet(key);
+      if (!bitmap) {
+        const res = await mediaDecode("frame", src, isVideo ? { frameNumber: instance.frame_number } : null);
+        if (!res || !res.bitmap) {
+          if (token === previewToken) blank("Could not read this image.");
+          return;
+        }
+        // Cache even if a newer hover won the race: the decode is already paid
+        // for, and the user is likely to come back to this tile.
+        previewPut(key, res.bitmap);
+        if (token !== previewToken) return;
+        bitmap = res.bitmap;
+      }
+      const scale = Math.min(1, PREVIEW_W / bitmap.width);
+      const cw = Math.round(bitmap.width * scale), chh = Math.round(bitmap.height * scale);
       previewCanvas.width = cw; previewCanvas.height = chh;
-      ctx.drawImage(res.bitmap, 0, 0, cw, chh);
-      res.bitmap.close();
+      ctx.drawImage(bitmap, 0, 0, cw, chh);
       const [x, y, w, h] = instance.bbox;
       ctx.lineWidth = Math.max(2, cw / 240); ctx.strokeStyle = "#e23b2e";
       ctx.strokeRect(x * cw, y * chh, w * cw, h * chh);
@@ -1084,6 +1127,7 @@
       focusIndex = 0;
       currentGrid = null;
       clearCropCache();
+      clearPreviewCache();
       tileByKey.clear();
       state.imageFiles = null;
       $("folder-fsa").classList.add("disabled");
