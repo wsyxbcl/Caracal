@@ -6,8 +6,8 @@
 //
 // Media-agnostic + batch-by-source: a "cropBatch" decodes ONE source once and
 // emits all of its crops. That halves disk reads (many tiles share a source
-// image) and is the shape video needs later — open a video once, extract all its
-// requested frames in one pass (SPEC §5, video is P3).
+// image) and is what makes video affordable — a clip is opened once and all of
+// its requested frames come out of a single demux + decode pass (SPEC §5/§7).
 //
 // File access (SPEC §6.2): two modes. In the File System Access mode the worker
 // holds the picked directory *handle* and resolves each media's known path
@@ -15,6 +15,11 @@
 // single parent directory only as a case-insensitive fallback. NO global file
 // index is ever built. In the fallback mode the main thread passes a File object
 // (from a <input webkitdirectory> pick) and the worker just decodes it.
+
+// Imported with this worker's own ?v= so bumping BUILD invalidates the whole
+// graph — a versioned worker holding a stale cached import is a silent trap.
+const BUILD = new URL(self.location.href).searchParams.get("v") || "dev";
+const videoReady = import(`./video-frames.js?v=${BUILD}`);
 
 const DECODE_W = 1000; // downscale cap: big camera images decode cheap + small
 const TILE = 92;
@@ -86,14 +91,17 @@ async function sourceFile(data) {
 }
 
 // ---- Decode + crop ---------------------------------------------------------
-async function cropBlob(src, bbox) {
+// `src` is anything drawImage accepts — an ImageBitmap (stills) or a VideoFrame
+// (video), whose intrinsic size is displayWidth/Height rather than width/height.
+async function cropBlob(src, bbox, srcW = src.width, srcH = src.height, timing = null) {
+  const tDraw = performance.now();
   const off = new OffscreenCanvas(TILE, TILE);
   const ctx = off.getContext("2d");
   const [x, y, w, h] = bbox;
-  const bx = x * src.width, by = y * src.height, bw = w * src.width, bh = h * src.height;
+  const bx = x * srcW, by = y * srcH, bw = w * srcW, bh = h * srcH;
   const cx = Math.max(0, bx - bw * PAD), cy = Math.max(0, by - bh * PAD);
-  const cw = Math.min(src.width - cx, bw * (1 + 2 * PAD));
-  const ch = Math.min(src.height - cy, bh * (1 + 2 * PAD));
+  const cw = Math.min(srcW - cx, bw * (1 + 2 * PAD));
+  const ch = Math.min(srcH - cy, bh * (1 + 2 * PAD));
   const scale = Math.min(TILE / cw, TILE / ch);
   const dw = cw * scale, dh = ch * scale, dx = (TILE - dw) / 2, dy = (TILE - dh) / 2;
   ctx.fillStyle = "#efe9df";
@@ -102,10 +110,61 @@ async function cropBlob(src, bbox) {
   ctx.strokeStyle = "#ffcc33";
   ctx.lineWidth = 2;
   ctx.strokeRect(dx + (bx - cx) * scale, dy + (by - cy) * scale, bw * scale, bh * scale);
-  return off.convertToBlob({ type: "image/png" });
+  const tEncode = performance.now();
+  const blob = await off.convertToBlob({ type: "image/png" });
+  if (timing) {
+    timing.drawMs += tEncode - tDraw;
+    timing.encodeMs += performance.now() - tEncode;
+    timing.bytes += blob.size;
+    timing.count++;
+  }
+  return blob;
 }
-function decodeSource(file) {
-  return createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: DECODE_W, resizeQuality: "medium" });
+
+const newTiming = () => ({ drawMs: 0, encodeMs: 0, bytes: 0, count: 0 });
+const roundTiming = (t) => ({
+  drawMs: +t.drawMs.toFixed(1), encodeMs: +t.encodeMs.toFixed(1),
+  thumbBytes: t.bytes, thumbs: t.count,
+});
+function decodeSource(file, width = DECODE_W) {
+  return createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: width, resizeQuality: "medium" });
+}
+
+// One whole video frame, as an ImageBitmap the preview can draw. The bitmap is
+// taken while the VideoFrame is still open, since extractFrames closes it.
+async function videoFrameBitmap(file, frameNumber, width = 0) {
+  const { extractFrames, DEMUXABLE } = await videoReady;
+  if (!DEMUXABLE.test(file.name)) throw new Error(`container not demuxable in-browser: ${file.name.split(".").pop()}`);
+  let bitmap = null;
+  await extractFrames(file, [frameNumber], async (_number, frame) => {
+    const shrink = width && frame.displayWidth > width; // never upscale
+    bitmap = await createImageBitmap(frame, shrink ? { resizeWidth: width, resizeQuality: "medium" } : undefined);
+  });
+  if (!bitmap) throw new Error(`frame ${frameNumber} not found`);
+  return bitmap;
+}
+
+// Crop several detections out of one clip (SPEC §7). Several boxes can sit on
+// the same frame, so requests are grouped by frame and that frame is decoded
+// once. Returns the crops plus decode stats for the caller to log.
+async function cropVideo(file, items) {
+  const { extractFrames, DEMUXABLE } = await videoReady;
+  if (!DEMUXABLE.test(file.name)) throw new Error(`container not demuxable in-browser: ${file.name.split(".").pop()}`);
+  const byFrame = new Map();
+  for (const it of items) {
+    const frame = it.frameNumber;
+    if (frame === undefined) continue; // a still's box on a video source: nothing to seek to
+    if (!byFrame.has(frame)) byFrame.set(frame, []);
+    byFrame.get(frame).push(it);
+  }
+  const results = [];
+  const timing = newTiming();
+  const stats = await extractFrames(file, [...byFrame.keys()], async (number, frame) => {
+    for (const it of byFrame.get(number) || []) {
+      results.push({ key: it.key, blob: await cropBlob(frame, it.bbox, frame.displayWidth, frame.displayHeight, timing) });
+    }
+  });
+  return { results, stats: { kind: "video", ...stats, ...roundTiming(timing) } };
 }
 
 self.onmessage = async (event) => {
@@ -119,16 +178,42 @@ self.onmessage = async (event) => {
       return;
     }
     if (kind === "frame") {
-      const src = await decodeSource(await sourceFile(event.data));
+      // Full frame for the "in context" preview — a still, or one video frame.
+      // Sized here rather than on the main thread: the caller only draws it a few
+      // hundred px wide, and a 5 MP bitmap is expensive to transfer and redraw.
+      const file = await sourceFile(event.data);
+      const width = event.data.maxWidth || DECODE_W;
+      const src = event.data.frameNumber === undefined
+        ? await decodeSource(file, width)
+        : await videoFrameBitmap(file, event.data.frameNumber, width);
       self.postMessage({ id, ok: true, bitmap: src, width: src.width, height: src.height }, [src]);
       return;
     }
     if (kind === "cropBatch") {
-      const src = await decodeSource(await sourceFile(event.data)); // one source open -> all its crops
+      const file = await sourceFile(event.data);
+      // Video: one demux + decode pass yields every requested frame's crops.
+      if (items.some((it) => it.frameNumber !== undefined)) {
+        self.postMessage({ id, ok: true, ...(await cropVideo(file, items)) });
+        return;
+      }
+      // Stills: same phase breakdown as video, so the two are comparable.
+      const tDecode = performance.now();
+      const src = await decodeSource(file); // one source open -> all its crops
+      const tCrop = performance.now();
       const results = [];
-      for (const it of items) results.push({ key: it.key, blob: await cropBlob(src, it.bbox) });
+      const timing = newTiming();
+      for (const it of items) results.push({ key: it.key, blob: await cropBlob(src, it.bbox, src.width, src.height, timing) });
       src.close();
-      self.postMessage({ id, ok: true, results });
+      self.postMessage({
+        id, ok: true, results,
+        stats: {
+          kind: "image", bytesTotal: file.size, bytesRead: file.size,
+          width: src.width, height: src.height, targets: items.length,
+          decodeMs: +(tCrop - tDecode).toFixed(1),
+          totalMs: +(performance.now() - tDecode).toFixed(1),
+          ...roundTiming(timing),
+        },
+      });
       return;
     }
     // single crop
