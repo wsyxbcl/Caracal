@@ -159,12 +159,22 @@ async function cropVideo(file, items) {
   }
   const results = [];
   const timing = newTiming();
-  const stats = await extractFrames(file, [...byFrame.keys()], async (number, frame) => {
+  const harvest = async (number, frame) => {
     for (const it of byFrame.get(number) || []) {
       results.push({ key: it.key, blob: await cropBlob(frame, it.bbox, frame.displayWidth, frame.displayHeight, timing) });
     }
-  });
-  return { results, stats: { kind: "video", ...stats, ...roundTiming(timing) } };
+  };
+  // Keep whatever decoded. Camera files do get damaged (ffmpeg reports e.g.
+  // "error while decoding MB 82 94" and carries on; WebCodecs just throws), and
+  // one bad frame should cost that frame's crops, not the whole clip's.
+  let failure = null;
+  let stats = {};
+  try {
+    stats = await extractFrames(file, [...byFrame.keys()], harvest);
+  } catch (err) {
+    failure = String(err?.message || err);
+  }
+  return { results, stats: { kind: "video", ...stats, failure, ...roundTiming(timing) } };
 }
 
 self.onmessage = async (event) => {
