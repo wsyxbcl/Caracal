@@ -67,6 +67,13 @@ impl RdeSession {
         serde_json::to_string(&files).expect("files serialize")
     }
 
+    /// `[[image_index, frame_rate], …]` for the document's video entries (SPEC
+    /// §2.2). Sparse — the frontend joins it to the paths from `image_files` to
+    /// decide which media need a frame decode, and at what rate (SPEC §7).
+    pub fn video_frame_rates(&self) -> String {
+        serde_json::to_string(&self.doc.video_frame_rates()).expect("rates serialize")
+    }
+
     /// Cluster suspicious groups (SPEC §3). `options_json` is an `RdeOptions`;
     /// returns the groups as a JSON array (the review DTO, SPEC §5.1). Cheap and
     /// pure, so the UI can re-run it on every parameter change.

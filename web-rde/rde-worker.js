@@ -3,15 +3,27 @@
 // request/response over structured-clone messages; only bytes and small JSON
 // DTOs cross the boundary (never shared pointers).
 
-import init, { RdeSession, default_options, match_paths } from "./pkg/web_rde.js";
+// Cache-busting has to reach the worker's *imports*, not just the worker: a
+// versioned worker URL paired with a stale cached wasm glue is how you get
+// "session.<new method> is not a function". Import dynamically with this
+// worker's own ?v=, so bumping BUILD in index.html invalidates the whole graph.
+const BUILD = new URL(self.location.href).searchParams.get("v") || "dev";
 
-const ready = init();
+const ready = (async () => {
+  const wasm = await import(`./pkg/web_rde.js?v=${BUILD}`);
+  // The binary needs the version too. Left to itself the glue resolves
+  // `new URL("web_rde_bg.wasm", import.meta.url)`, which DROPS the query — so a
+  // fresh glue would load a stale cached .wasm and every new export would fail
+  // as `wasm.<name> is not a function`. Hand it an explicit versioned URL.
+  await wasm.default({ module_or_path: new URL(`./pkg/web_rde_bg.wasm?v=${BUILD}`, self.location.href) });
+  return wasm;
+})();
 let session = null;
 
 self.onmessage = async (event) => {
   const { id, type } = event.data;
   try {
-    await ready;
+    const { RdeSession, default_options, match_paths } = await ready;
     switch (type) {
       case "load": {
         // `bytes` arrives as a transferred ArrayBuffer (zero-copy, SPEC §2.1).
@@ -23,6 +35,7 @@ self.onmessage = async (event) => {
           totalDetections: session.total_detections(),
           defaultOptions: default_options(),
           imageFiles: session.image_files(), // json paths, for path diagnostics + matching
+          videoFrameRates: session.video_frame_rates(), // [[image_index, fps], …] (SPEC §2.2)
         });
         break;
       }

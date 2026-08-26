@@ -78,6 +78,12 @@ pub struct Instance {
     pub bbox: BBox,
     pub conf: f32,
     pub decision: Decision,
+    /// For a detection on a video frame (SPEC §2.2), the 0-based
+    /// presentation-order frame index from the start of the clip — ffmpeg's `n`,
+    /// which is what our `run_md_video.py` selects on. `None` for stills, so the
+    /// pixel provider knows which media need a frame decode (SPEC §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_number: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,6 +165,20 @@ impl MdDocument {
             .filter_map(|image| image.get("detections").and_then(|d| d.as_array()))
             .map(|d| d.len())
             .sum()
+    }
+
+    /// `(image_index, frame_rate)` for every video entry (SPEC §2.2). Sparse on
+    /// purpose — only a minority of media are video, and the pixel provider needs
+    /// the rate only to sanity-check the frame index it seeks to (SPEC §7).
+    pub fn video_frame_rates(&self) -> Vec<(usize, f64)> {
+        self.images()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, image)| {
+                let rate = image.get("frame_rate").and_then(|v| v.as_f64())?;
+                (rate > 0.0).then_some((index, rate))
+            })
+            .collect()
     }
 
     /// The underlying document (read-only).
@@ -292,6 +312,10 @@ pub fn find_suspicious(doc: &MdDocument, opts: &RdeOptions) -> Vec<SuspiciousGro
                 bbox,
                 conf,
                 decision: Decision::default(),
+                frame_number: det
+                    .get("frame_number")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32),
             };
 
             // Greedy: the first same-camera (and, unless agnostic, same-category)
