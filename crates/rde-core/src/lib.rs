@@ -118,6 +118,11 @@ pub struct SuspiciousGroup {
     pub rep_bbox: BBox,
     pub instances: Vec<Instance>,
     pub stats: GroupStats,
+    /// Distinct media this location recurs across — the quantity
+    /// `occurrence_threshold` is compared against. Carried on the group so a
+    /// caller can re-apply a *higher* threshold without re-clustering: the
+    /// threshold is only ever a final filter, never an input to clustering.
+    pub media_count: usize,
 }
 
 /// Errors from parsing an MD document.
@@ -409,6 +414,7 @@ pub fn find_suspicious(doc: &MdDocument, opts: &RdeOptions) -> Vec<SuspiciousGro
             category: cluster.category,
             rep_bbox: cluster.rep,
             stats: group_stats(&cluster.members),
+            media_count: cluster.images.len(),
             instances: cluster.members,
         })
         .collect();

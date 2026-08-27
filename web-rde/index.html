@@ -73,6 +73,35 @@
     .tile.mark-failed { background: #f2e3dc; }
     button.mini.showmore { display: block; margin: 10px 0 0; }
 
+    /* Tuning panel. Kept dense and flat: it sits above the review list in an
+       app-shell layout, so every row it costs is a row the reviewer loses. */
+    .tune { padding: 14px 18px; }
+    .tune-head { display: flex; align-items: baseline; gap: 12px; }
+    .tune-head h2 { margin: 0; font-size: 0.95rem; }
+    .tune-head .mini { margin-left: auto; }
+    .tune-body { display: flex; gap: 28px; margin-top: 12px; flex-wrap: wrap; }
+    .tune-body[hidden] { display: none; }
+    .tune-col { flex: 1 1 320px; min-width: 280px; }
+    .tune-label { display: block; color: var(--muted); font-size: 0.8rem; margin-bottom: 6px; }
+    .tune-row { display: flex; align-items: center; gap: 10px; }
+    .tune-row input[type=range] { flex: 1; accent-color: var(--accent); }
+    .tune input[type=number] { font: inherit; font-size: 0.85rem; width: 5.5em; padding: 3px 6px;
+      border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+    .tune-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin-bottom: 10px; }
+    .tune-grid label { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 0.82rem; color: var(--muted); }
+    .tune-check { grid-column: 1 / -1; justify-content: flex-start !important; }
+    .ladder { width: 100%; border-collapse: collapse; margin: 10px 0 4px; font-size: 0.82rem; }
+    .ladder td { padding: 2px 6px 2px 0; color: var(--muted); white-space: nowrap; }
+    .ladder td.n { text-align: right; font-variant-numeric: tabular-nums; }
+    .ladder tr { cursor: pointer; }
+    .ladder tr:hover td { color: var(--ink); }
+    .ladder tr.at td { color: var(--ink); font-weight: 600; }
+    /* Bar length is the review cost at that threshold — the shape you are choosing a cut on. */
+    .ladder .bar { width: 100%; }
+    .ladder .bar i { display: block; height: 6px; background: var(--line); border-radius: 3px; }
+    .ladder tr.at .bar i { background: var(--accent); }
+
     .workspace { display: flex; gap: 20px; align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 18px; }
     .review { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 2px 6px 24px 0; }
     .preview { flex: 0 0 400px; overflow-y: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
@@ -113,11 +142,46 @@
       <div class="metrics" id="metrics" hidden>
         <div class="metric"><b id="m-images">–</b><span>media</span></div>
         <div class="metric"><b id="m-dets">–</b><span>detections</span></div>
-        <div class="metric"><b id="m-groups">–</b><span>suspicious groups</span></div>
+        <div class="metric"><b id="m-groups">–</b><span>candidate groups</span></div>
         <div class="metric"><b id="m-matched">–</b><span>media matched</span></div>
       </div>
       <p class="hint" id="decode-progress"></p>
       <p id="error"></p>
+    </div>
+
+    <div class="card tune" id="tune" hidden>
+      <div class="tune-head">
+        <h2>Tune candidates</h2>
+        <span class="hint" id="tune-summary"></span>
+        <button class="mini" id="tune-collapse">hide</button>
+      </div>
+      <div class="tune-body" id="tune-body">
+        <div class="tune-col">
+          <label class="tune-label" for="occ-range">Occurrence — distinct media a box must recur across</label>
+          <div class="tune-row">
+            <input type="range" id="occ-range" min="2" max="100" step="1" />
+            <input type="number" id="occ-number" min="2" step="1" />
+          </div>
+          <table class="ladder"><tbody id="ladder"></tbody></table>
+          <p class="hint">Instant — clustering does not depend on this.</p>
+        </div>
+        <div class="tune-col">
+          <label class="tune-label">Clustering — decides which detections are candidates at all</label>
+          <div class="tune-grid">
+            <label>confidence ≥<input type="number" id="opt-conf-min" step="0.05" min="0" max="1" /></label>
+            <label>confidence ≤<input type="number" id="opt-conf-max" step="0.05" min="0" max="1" /></label>
+            <label>same-box IoU ≥<input type="number" id="opt-iou" step="0.01" min="0" max="1" /></label>
+            <label>box area ≥<input type="number" id="opt-size-min" step="0.005" min="0" max="1" /></label>
+            <label>box area ≤<input type="number" id="opt-size-max" step="0.005" min="0" max="1" /></label>
+            <label class="tune-check"><input type="checkbox" id="opt-agnostic" /> ignore category</label>
+          </div>
+          <div class="tune-row">
+            <button class="mini primary" id="tune-apply">Apply &amp; re-cluster</button>
+            <span class="hint" id="tune-impact"></span>
+          </div>
+          <p class="hint" id="tune-cameras"></p>
+        </div>
+      </div>
     </div>
 
     <div class="workspace">
@@ -153,7 +217,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-27a";
+    const BUILD = "2026-08-27e";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -369,7 +433,10 @@
     const state = {
       fileName: null,
       options: null,
-      groups: [],                      // parsed groups; instances carry `decision`
+      allGroups: [],                   // clustering at MIN_THRESHOLD; the threshold is a view over it
+      groups: [],                      // allGroups filtered to state.threshold — what is reviewed
+      threshold: 20,                   // occurrence_threshold, applied client-side
+      decisions: new Map(),            // "img:det" -> explicit human Keep/Remove, durable
       imageFiles: null,                // image_index -> json `file` path (also the FSA lookup key)
       frameRateByImageIndex: new Map(),// image_index -> fps, video entries only (SPEC §2.2)
       instancesByMedia: new Map(),     // image_index -> all suspicious instances on that media
@@ -402,50 +469,223 @@
         const tParse = performance.now();
         const loaded = await call("load", { bytes: buffer }, [buffer]);
         console.log(`[rde] parse: ${Math.round(performance.now() - tParse)} ms (${loaded.imageCount} media, ${loaded.totalDetections} detections)`);
-        // ?threshold=N overrides occurrence_threshold. A small subset of a real
-        // document cannot re-form its groups at the default 20 distinct media, so
-        // this is what makes subsets reviewable — and it is the same knob P2's
-        // parameter sliders will drive.
-        state.options = loaded.defaultOptions;
+        state.options = JSON.parse(loaded.defaultOptions);
         const thresholdOverride = Number(new URLSearchParams(location.search).get("threshold"));
-        if (thresholdOverride >= 1) {
-          const opts = JSON.parse(state.options);
-          opts.occurrence_threshold = thresholdOverride;
-          state.options = JSON.stringify(opts);
-        }
+        state.threshold = thresholdOverride >= MIN_THRESHOLD
+          ? thresholdOverride
+          : state.options.occurrence_threshold;
         state.imageFiles = loaded.imageFiles ? JSON.parse(loaded.imageFiles) : null;
         state.frameRateByImageIndex = new Map(JSON.parse(loaded.videoFrameRates || "[]"));
         state.categoryNames = JSON.parse(loaded.categoryNames || "{}");
         status.textContent = `Clustering ${loaded.totalDetections.toLocaleString()} detections…`;
-        const tFind = performance.now();
-        state.groups = JSON.parse((await call("find", { options: state.options })).groups);
-        // media -> every suspicious instance on it, so opening any group can crop
-        // a media completely (see sourcesFor).
-        state.instancesByMedia = new Map();
-        for (const g of state.groups) {
-          for (const inst of g.instances) {
-            const list = state.instancesByMedia.get(inst.det_ref.image_index);
-            if (list) list.push(inst);
-            else state.instancesByMedia.set(inst.det_ref.image_index, [inst]);
-          }
-        }
-        console.log(`[rde] cluster: ${Math.round(performance.now() - tFind)} ms (${state.groups.length} groups)`);
-        logVideoPlumbing();
+        await recluster();
 
         $("m-images").textContent = loaded.imageCount.toLocaleString();
         $("m-dets").textContent = loaded.totalDetections.toLocaleString();
         $("m-groups").textContent = state.groups.length.toLocaleString();
         $("m-matched").textContent = "0";
         $("metrics").hidden = false;
+        showTuning();
         $("folder-fsa").classList.remove("disabled");
         $("folder-fsa").disabled = false;
-        status.textContent = `Loaded ${file.name}. ${state.groups.length} suspicious group(s). Load the image folder to review crops.`;
+        status.textContent = `Loaded ${file.name}. ${state.groups.length.toLocaleString()} candidate group(s). Load the image folder to review crops.`;
         goToGroup(0);
         updateExportBar();
       } catch (err) {
         showError(err);
       }
     });
+
+    // Clustering never depends on `occurrence_threshold` — it is applied as a
+    // final filter on distinct-media count (pinned by a native test,
+    // `threshold_is_only_a_final_filter`). So cluster ONCE at the lowest
+    // meaningful value and treat the threshold as a view over that result: the
+    // reviewer can scrub it with no recompute, and only the parameters that
+    // decide which detections enter clustering cost a re-run.
+    const MIN_THRESHOLD = 2;
+
+    async function recluster() {
+      const options = { ...state.options, occurrence_threshold: MIN_THRESHOLD };
+      const t = performance.now();
+      state.allGroups = JSON.parse((await call("find", { options: JSON.stringify(options) })).groups);
+      console.log(`[rde] cluster: ${Math.round(performance.now() - t)} ms` +
+        ` (${state.allGroups.length} candidate groups at threshold ${MIN_THRESHOLD})`);
+      applyThreshold();
+    }
+
+    // Re-derive the reviewable groups from the clustering. Decisions live in
+    // `state.decisions` keyed by DetRef, not on the instances, so a human
+    // judgement outlives any re-clustering or threshold change.
+    function applyThreshold() {
+      state.groups = state.allGroups.filter((g) => g.media_count >= state.threshold);
+      state.instancesByMedia = new Map();
+      for (const g of state.groups) {
+        for (const inst of g.instances) {
+          inst.decision = state.decisions.get(detKey(inst.det_ref)) || "Remove";
+          const list = state.instancesByMedia.get(inst.det_ref.image_index);
+          if (list) list.push(inst);
+          else state.instancesByMedia.set(inst.det_ref.image_index, [inst]);
+        }
+      }
+      logVideoPlumbing();
+    }
+
+    const detKey = (ref) => ref.image_index + ":" + ref.detection_index;
+
+    /// Totals for one threshold, without rebuilding anything — this is what makes
+    /// the tuning view answer "how much review work does this setting create?".
+    function thresholdTotals(threshold) {
+      let groups = 0, instances = 0;
+      const media = new Set(), cameras = new Set();
+      for (const g of state.allGroups) {
+        if (g.media_count < threshold) continue;
+        groups++;
+        instances += g.instances.length;
+        cameras.add(g.camera);
+        for (const i of g.instances) media.add(i.det_ref.image_index);
+      }
+      return { threshold, groups, instances, media: media.size, cameras: cameras.size };
+    }
+
+    // The tuning controller. Two kinds of parameter, because they cost different
+    // things: the occurrence threshold is a filter over an existing clustering
+    // (instant), while everything else decides which detections cluster at all and
+    // needs a re-run (~1 s on a 73k-media document).
+    const tuning = {
+      totals: (threshold = state.threshold) => thresholdTotals(threshold),
+
+      // The sensitivity ladder: what each threshold would cost to review. This is
+      // the point of the exercise — choosing a cut on a distribution you can see
+      // beats guessing whether 20 or 50 is sensible.
+      curve() {
+        const largest = state.allGroups.reduce((m, g) => Math.max(m, g.media_count), 0);
+        const ladder = [2, 3, 5, 10, 15, 20, 30, 50, 75, 100, 150, 250]
+          .filter((t) => t <= Math.max(largest, MIN_THRESHOLD));
+        if (!ladder.includes(state.threshold)) ladder.push(state.threshold);
+        return [...new Set(ladder)].sort((a, b) => a - b).map((t) => thresholdTotals(t));
+      },
+
+      setThreshold(value) {
+        const threshold = Math.max(MIN_THRESHOLD, Math.round(value) || MIN_THRESHOLD);
+        if (threshold === state.threshold) return tuning.totals();
+        state.threshold = threshold;
+        applyThreshold(); // same group objects, so "reviewed" marks survive
+        resumeReview(`Threshold ${threshold}: ${state.groups.length.toLocaleString()} candidate group(s).`);
+        return tuning.totals();
+      },
+
+      // Change a clustering parameter and re-run. Returns before/after totals so
+      // the caller can report what the change actually did.
+      async applyOptions(patch) {
+        const before = thresholdTotals(state.threshold);
+        Object.assign(state.options, patch);
+        status.textContent = "Re-clustering…";
+        await recluster();
+        const after = thresholdTotals(state.threshold);
+        resumeReview(`${after.groups.toLocaleString()} candidate group(s), ` +
+          `${after.instances.toLocaleString()} crop(s) to review.`);
+        return { before, after };
+      },
+    };
+    window.__rdeTune = tuning; // also the console handle for tuning without the UI
+
+    // ---- Tuning panel --------------------------------------------------------
+    // Built around impact rather than around the controls: the question a reviewer
+    // is actually asking is "how much work does this setting create, and am I
+    // starting to sweep up detections I would rather look at?".
+    const OPT_FIELDS = [
+      ["opt-conf-min", "confidence_min", parseFloat],
+      ["opt-conf-max", "confidence_max", parseFloat],
+      ["opt-iou", "iou_threshold", parseFloat],
+      ["opt-size-min", "min_suspicious_size", parseFloat],
+      ["opt-size-max", "max_suspicious_size", parseFloat],
+    ];
+
+    function showTuning() {
+      const largest = state.allGroups.reduce((m, g) => Math.max(m, g.media_count), MIN_THRESHOLD);
+      const range = $("occ-range");
+      range.max = String(Math.max(largest, MIN_THRESHOLD));
+      range.min = String(MIN_THRESHOLD);
+      range.value = String(state.threshold);
+      $("occ-number").value = String(state.threshold);
+      for (const [id, key] of OPT_FIELDS) $(id).value = String(state.options[key]);
+      $("opt-agnostic").checked = !!state.options.category_agnostic;
+      const cameras = [...new Set(state.allGroups.map((g) => g.camera))];
+      $("tune-cameras").textContent = cameras.length
+        ? `Cameras are folder level ${state.options.n_dir_levels_from_leaf} from the file, e.g. ${cameras.slice(0, 2).join(", ")} (${cameras.length} in all).`
+        : "";
+      $("tune").hidden = false;
+      renderTuning();
+    }
+
+    function renderTuning() {
+      const now = tuning.totals();
+      $("tune-summary").textContent =
+        `${now.groups.toLocaleString()} groups · ${now.instances.toLocaleString()} crops · ` +
+        `${now.media.toLocaleString()} media · ${now.cameras.toLocaleString()} camera${now.cameras === 1 ? "" : "s"}`;
+      const rows = tuning.curve();
+      const most = rows.reduce((m, r) => Math.max(m, r.instances), 1);
+      const body = $("ladder");
+      body.textContent = "";
+      for (const row of rows) {
+        const tr = document.createElement("tr");
+        if (row.threshold === state.threshold) tr.className = "at";
+        const cell = (text, cls) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
+        cell(`≥ ${row.threshold}`);
+        cell(row.groups.toLocaleString(), "n");
+        cell(`${row.instances.toLocaleString()} crops`, "n");
+        const bar = cell("", "bar");
+        const fill = document.createElement("i");
+        fill.style.width = `${Math.max(2, Math.round(100 * row.instances / most))}%`;
+        bar.appendChild(fill);
+        tr.addEventListener("click", () => setThresholdFromUi(row.threshold));
+        body.appendChild(tr);
+      }
+    }
+
+    function setThresholdFromUi(value) {
+      tuning.setThreshold(value);
+      $("occ-range").value = String(state.threshold);
+      $("occ-number").value = String(state.threshold);
+      renderTuning();
+      $("m-groups").textContent = state.groups.length.toLocaleString();
+    }
+
+    $("occ-range").addEventListener("input", (e) => setThresholdFromUi(Number(e.target.value)));
+    $("occ-number").addEventListener("change", (e) => setThresholdFromUi(Number(e.target.value)));
+    $("tune-collapse").addEventListener("click", () => {
+      const body = $("tune-body");
+      body.hidden = !body.hidden;
+      $("tune-collapse").textContent = body.hidden ? "tune" : "hide";
+    });
+    $("tune-apply").addEventListener("click", async () => {
+      const patch = { category_agnostic: $("opt-agnostic").checked };
+      for (const [id, key, parse] of OPT_FIELDS) {
+        const value = parse($(id).value);
+        if (Number.isFinite(value)) patch[key] = value;
+      }
+      $("tune-apply").disabled = true;
+      try {
+        const { before, after } = await tuning.applyOptions(patch);
+        const delta = (a, b) => (b === a ? "unchanged" : `${a.toLocaleString()} → ${b.toLocaleString()}`);
+        $("tune-impact").textContent =
+          `groups ${delta(before.groups, after.groups)}, crops ${delta(before.instances, after.instances)}`;
+        renderTuning();
+        $("m-groups").textContent = state.groups.length.toLocaleString();
+      } catch (err) {
+        showError(err);
+      } finally {
+        $("tune-apply").disabled = false;
+      }
+    });
+
+    // Re-enter the review at the first group not yet marked reviewed.
+    function resumeReview(note) {
+      const first = state.groups.findIndex((g) => !g.reviewed);
+      goToGroup(first < 0 ? 0 : first);
+      updateExportBar();
+      if (note) status.textContent = note;
+    }
 
     // How much of this document's review is video, and are those instances
     // decodable? Video crops need BOTH a per-clip frame_rate and a per-detection
@@ -870,7 +1110,7 @@
       const results = $("results");
       results.innerHTML = "";
       if (!state.groups.length) {
-        results.innerHTML = `<div class="card placeholder">No suspicious groups at the current parameters.</div>`;
+        results.innerHTML = `<div class="card placeholder">No candidate groups at these parameters — loosen the occurrence threshold or the clustering settings above.</div>`;
         return;
       }
       const g = currentGroup();
@@ -1161,14 +1401,21 @@
       tile.classList.toggle("remove", !keep);
       tile.querySelector(".badge").textContent = keep ? "keep" : "drop";
     }
+    // Every explicit judgement is recorded against its DetRef, which is stable
+    // across re-clustering (SPEC §6.1). Parameters are a way of *looking* at the
+    // document; a human decision about a detection outlives them.
+    function decide(instance, decision) {
+      instance.decision = decision;
+      state.decisions.set(detKey(instance.det_ref), decision);
+    }
     function toggleDecision(instance, tile) {
-      instance.decision = instance.decision === "Keep" ? "Remove" : "Keep";
+      decide(instance, instance.decision === "Keep" ? "Remove" : "Keep");
       applyTileStyle(tile, instance.decision);
       setPreview(instance);
       updateExportBar();
     }
     function setGroupDecision(group, decision) {
-      group.instances.forEach((i) => (i.decision = decision));
+      group.instances.forEach((i) => decide(i, decision));
       // Restyle tiles in place if this is the group on screen (no re-decode).
       if (group === currentGroup() && currentGrid) {
         [...currentGrid.children].forEach((tile) => applyTileStyle(tile, decision));
@@ -1177,9 +1424,25 @@
     }
 
     // ---- Export --------------------------------------------------------------
+    // What gets removed: every candidate the reviewer left at the default Remove,
+    // plus any detection they explicitly removed that a later parameter change
+    // pushed out of the candidate set. An explicit judgement stays authoritative —
+    // it should not evaporate because the clustering was retuned afterwards.
     function removalRefs() {
       const refs = [];
-      for (const g of state.groups) for (const i of g.instances) if (i.decision === "Remove") refs.push(i.det_ref);
+      const seen = new Set();
+      for (const g of state.groups) {
+        for (const i of g.instances) {
+          if (i.decision !== "Remove") continue;
+          refs.push(i.det_ref);
+          seen.add(detKey(i.det_ref));
+        }
+      }
+      for (const [key, decision] of state.decisions) {
+        if (decision !== "Remove" || seen.has(key)) continue;
+        const [image_index, detection_index] = key.split(":").map(Number);
+        refs.push({ image_index, detection_index });
+      }
       return refs;
     }
     function updateExportBar() {
@@ -1208,6 +1471,8 @@
     function resetForNewJson(name) {
       state.fileName = name;
       state.groups = [];
+      state.allGroups = [];
+      state.decisions.clear();
       state.fileByImageIndex.clear();
       state.frameRateByImageIndex.clear();
       state.folderLoaded = false;
@@ -1221,6 +1486,7 @@
       exactFrame = false;
       tileByKey.clear();
       state.imageFiles = null;
+      $("tune").hidden = true;
       $("folder-fsa").classList.add("disabled");
       $("folder-fsa").disabled = true;
       errorEl.textContent = "";

@@ -146,3 +146,50 @@ fn passthrough_export_is_identical() {
 fn near(a: [f32; 4], b: [f32; 4]) -> bool {
     a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.02)
 }
+
+/// `occurrence_threshold` is only ever a *final filter* — it never influences how
+/// detections are clustered. That is what lets the reviewer scrub the threshold
+/// with no re-clustering: cluster once at 2, then filter on `media_count`.
+/// If this ever stops holding, the tuning view silently shows the wrong groups.
+#[test]
+fn threshold_is_only_a_final_filter() {
+    let doc = demo();
+    let all = find_suspicious(
+        &doc,
+        &RdeOptions { occurrence_threshold: 2, ..RdeOptions::default() },
+    );
+
+    for threshold in [2, 3, 5, 10, 20, 25, 40] {
+        let direct = find_suspicious(
+            &doc,
+            &RdeOptions { occurrence_threshold: threshold, ..RdeOptions::default() },
+        );
+        let filtered: Vec<_> = all.iter().filter(|g| g.media_count >= threshold).collect();
+
+        assert_eq!(direct.len(), filtered.len(), "group count at threshold {threshold}");
+        for (a, b) in direct.iter().zip(&filtered) {
+            assert_eq!(a.camera, b.camera, "camera at threshold {threshold}");
+            assert_eq!(a.rep_bbox, b.rep_bbox, "rep box at threshold {threshold}");
+            assert_eq!(a.media_count, b.media_count, "media_count at threshold {threshold}");
+            assert_eq!(
+                a.instances.len(),
+                b.instances.len(),
+                "instance count at threshold {threshold}"
+            );
+        }
+    }
+}
+
+/// `media_count` is distinct media, not instance count — several detections on
+/// one image (or several frames of one clip) are one occurrence.
+#[test]
+fn media_count_counts_distinct_media() {
+    use std::collections::HashSet;
+    let doc = demo();
+    for group in find_suspicious(&doc, &RdeOptions::default()) {
+        let distinct: HashSet<usize> =
+            group.instances.iter().map(|i| i.det_ref.image_index).collect();
+        assert_eq!(group.media_count, distinct.len(), "group {}", group.id);
+        assert!(group.media_count <= group.instances.len());
+    }
+}
