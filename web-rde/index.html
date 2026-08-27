@@ -78,11 +78,16 @@
 
     /* Tuning panel. Kept dense and flat: it sits above the review list in an
        app-shell layout, so every row it costs is a row the reviewer loses. */
-    .tune { padding: 14px 18px; }
+    /* The panel yields space rather than pushing the review off the bottom: it may
+       shrink (min-height:0) and its body scrolls, while the workspace holds a floor.
+       A hard min-height here instead would overflow the app shell and hide tiles
+       behind the export bar. */
+    .tune { padding: 14px 18px; flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; }
     .tune-head { display: flex; align-items: baseline; gap: 12px; }
     .tune-head h2 { margin: 0; font-size: 0.95rem; }
     .tune-head .mini { margin-left: auto; }
-    .tune-body { display: flex; gap: 28px; margin-top: 12px; flex-wrap: wrap; }
+    .tune-body { display: flex; gap: 28px; margin-top: 12px; flex-wrap: wrap;
+      flex: 1 1 auto; min-height: 0; max-height: 45vh; overflow-y: auto; padding-right: 4px; }
     .tune-body[hidden] { display: none; }
     .tune-col { flex: 1 1 320px; min-width: 280px; }
     .tune-label { display: block; color: var(--muted); font-size: 0.8rem; margin-bottom: 6px; }
@@ -90,6 +95,22 @@
     .tune-row input[type=range] { flex: 1; accent-color: var(--accent); }
     .tune input[type=number] { font: inherit; font-size: 0.85rem; width: 5.5em; padding: 3px 6px;
       border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+    /* Two-handle range. Built from ordinary elements rather than two overlaid
+       <input type=range>, because that trick depends on pointer-events working on
+       the thumb pseudo-element, which is not dependable across browsers. */
+    .dual { margin: 2px 0 14px; }
+    .dual-head { display: flex; justify-content: space-between; align-items: baseline;
+      font-size: 0.82rem; color: var(--muted); margin-bottom: 8px; }
+    .dual-head b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .dual-track { position: relative; height: 20px; touch-action: none; }
+    .dual-track::before { content: ""; position: absolute; left: 0; right: 0; top: 8px; height: 4px;
+      background: var(--line); border-radius: 2px; }
+    .dual-fill { position: absolute; top: 8px; height: 4px; background: var(--accent); border-radius: 2px; }
+    .dual-thumb { position: absolute; top: 2px; width: 16px; height: 16px; margin-left: -8px; padding: 0;
+      border: 2px solid var(--accent); background: var(--card); border-radius: 50%; cursor: grab; }
+    .dual-thumb:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+    .dual-thumb:active { cursor: grabbing; }
+
     .tune-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin-bottom: 10px; }
     .tune-grid label { display: flex; align-items: center; justify-content: space-between; gap: 8px;
       font-size: 0.82rem; color: var(--muted); }
@@ -105,7 +126,8 @@
     .ladder .bar i { display: block; height: 6px; background: var(--line); border-radius: 3px; }
     .ladder tr.at .bar i { background: var(--accent); }
 
-    .workspace { display: flex; gap: 20px; align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 18px; }
+    /* The tuning panel is bounded above, so the review always keeps a usable share. */
+    .workspace { display: flex; gap: 20px; align-items: stretch; flex: 1 1 auto; min-height: 200px; margin-top: 18px; }
     .review { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 2px 6px 24px 0; }
     .preview { flex: 0 0 400px; overflow-y: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
     .preview h2 { font-size: 0.95rem; margin: 0 0 10px; }
@@ -170,12 +192,20 @@
         </div>
         <div class="tune-col">
           <label class="tune-label">Clustering — decides which detections are candidates at all</label>
+          <div class="dual" id="dual-conf">
+            <div class="dual-head"><span>confidence band</span><b class="dual-value"></b></div>
+            <div class="dual-track"><div class="dual-fill"></div>
+              <button class="dual-thumb lo" aria-label="minimum confidence"></button>
+              <button class="dual-thumb hi" aria-label="maximum confidence"></button></div>
+          </div>
+          <div class="dual" id="dual-size">
+            <div class="dual-head"><span>box area band (w × h)</span><b class="dual-value"></b></div>
+            <div class="dual-track"><div class="dual-fill"></div>
+              <button class="dual-thumb lo" aria-label="minimum box area"></button>
+              <button class="dual-thumb hi" aria-label="maximum box area"></button></div>
+          </div>
           <div class="tune-grid">
-            <label>confidence ≥<input type="number" id="opt-conf-min" step="0.05" min="0" max="1" /></label>
-            <label>confidence ≤<input type="number" id="opt-conf-max" step="0.05" min="0" max="1" /></label>
             <label>same-box IoU ≥<input type="number" id="opt-iou" step="0.01" min="0" max="1" /></label>
-            <label>box area ≥<input type="number" id="opt-size-min" step="0.005" min="0" max="1" /></label>
-            <label>box area ≤<input type="number" id="opt-size-max" step="0.005" min="0" max="1" /></label>
             <label class="tune-check"><input type="checkbox" id="opt-agnostic" /> ignore category</label>
           </div>
           <div class="tune-row">
@@ -222,7 +252,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-27p";
+    const BUILD = "2026-08-27r";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -662,13 +692,70 @@
     // Built around impact rather than around the controls: the question a reviewer
     // is actually asking is "how much work does this setting create, and am I
     // starting to sweep up detections I would rather look at?".
-    const OPT_FIELDS = [
-      ["opt-conf-min", "confidence_min", parseFloat],
-      ["opt-conf-max", "confidence_max", parseFloat],
-      ["opt-iou", "iou_threshold", parseFloat],
-      ["opt-size-min", "min_suspicious_size", parseFloat],
-      ["opt-size-max", "max_suspicious_size", parseFloat],
-    ];
+    const OPT_FIELDS = [["opt-iou", "iou_threshold", parseFloat]];
+
+    // A band is one thing, so it gets one control: two thumbs on a single track,
+    // showing the span rather than asking anyone to hold two numbers in their head.
+    function dualRange(id, { min, max, step, format }) {
+      const root = $(id);
+      const track = root.querySelector(".dual-track");
+      const fill = root.querySelector(".dual-fill");
+      const value = root.querySelector(".dual-value");
+      const thumbs = { lo: root.querySelector(".lo"), hi: root.querySelector(".hi") };
+      const state = { lo: min, hi: max };
+      const clamp = (v) => Math.min(max, Math.max(min, Math.round(v / step) * step));
+      const pct = (v) => ((v - min) / (max - min)) * 100;
+
+      function paint() {
+        thumbs.lo.style.left = `${pct(state.lo)}%`;
+        thumbs.hi.style.left = `${pct(state.hi)}%`;
+        fill.style.left = `${pct(state.lo)}%`;
+        fill.style.width = `${pct(state.hi) - pct(state.lo)}%`;
+        value.textContent = `${format(state.lo)} – ${format(state.hi)}`;
+      }
+      function set(which, raw) {
+        const v = clamp(raw);
+        // Thumbs may meet but never cross, so the band is always readable.
+        state[which] = which === "lo" ? Math.min(v, state.hi) : Math.max(v, state.lo);
+        paint();
+      }
+      function fromEvent(event) {
+        const box = track.getBoundingClientRect();
+        return min + ((event.clientX - box.left) / box.width) * (max - min);
+      }
+      for (const which of ["lo", "hi"]) {
+        thumbs[which].addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          thumbs[which].setPointerCapture(e.pointerId);
+          const move = (ev) => set(which, fromEvent(ev));
+          const up = () => {
+            thumbs[which].removeEventListener("pointermove", move);
+            thumbs[which].removeEventListener("pointerup", up);
+          };
+          thumbs[which].addEventListener("pointermove", move);
+          thumbs[which].addEventListener("pointerup", up);
+        });
+        thumbs[which].addEventListener("keydown", (e) => {
+          const delta = { ArrowLeft: -step, ArrowRight: step, ArrowDown: -step, ArrowUp: step }[e.key];
+          if (delta === undefined) return;
+          e.preventDefault();
+          set(which, state[which] + delta);
+        });
+      }
+      // Clicking the track moves whichever thumb is nearer.
+      track.addEventListener("pointerdown", (e) => {
+        if (e.target !== track && e.target !== fill) return;
+        const v = fromEvent(e);
+        set(Math.abs(v - state.lo) <= Math.abs(v - state.hi) ? "lo" : "hi", v);
+      });
+      return {
+        get: () => ({ lo: +state.lo.toFixed(4), hi: +state.hi.toFixed(4) }),
+        set: (lo, hi) => { state.lo = clamp(lo); state.hi = clamp(hi); paint(); },
+      };
+    }
+
+    const confBand = dualRange("dual-conf", { min: 0, max: 1, step: 0.05, format: (v) => v.toFixed(2) });
+    const sizeBand = dualRange("dual-size", { min: 0, max: 1, step: 0.01, format: (v) => v.toFixed(2) });
 
     function showTuning() {
       const largest = state.allGroups.reduce((m, g) => Math.max(m, g.media_count), MIN_THRESHOLD);
@@ -678,6 +765,8 @@
       range.value = String(state.threshold);
       $("occ-number").value = String(state.threshold);
       for (const [id, key] of OPT_FIELDS) $(id).value = String(state.options[key]);
+      confBand.set(state.options.confidence_min, state.options.confidence_max);
+      sizeBand.set(state.options.min_suspicious_size, state.options.max_suspicious_size);
       $("opt-agnostic").checked = !!state.options.category_agnostic;
       const cameras = [...new Set(state.allGroups.map((g) => g.camera))];
       $("tune-cameras").textContent = cameras.length
@@ -816,13 +905,25 @@
       catch (err) { showError(err); button.textContent = "Compute IoU sensitivity"; }
       finally { button.disabled = false; }
     });
+    // Loading the folder means tuning is done for now; give the room back.
+    function collapseTuning() {
+      if ($("tune").hidden || $("tune-body").hidden) return;
+      $("tune-body").hidden = true;
+      $("tune-collapse").textContent = "tune";
+    }
+
     $("tune-collapse").addEventListener("click", () => {
       const body = $("tune-body");
       body.hidden = !body.hidden;
       $("tune-collapse").textContent = body.hidden ? "tune" : "hide";
     });
     $("tune-apply").addEventListener("click", async () => {
-      const patch = { category_agnostic: $("opt-agnostic").checked };
+      const conf = confBand.get(), size = sizeBand.get();
+      const patch = {
+        category_agnostic: $("opt-agnostic").checked,
+        confidence_min: conf.lo, confidence_max: conf.hi,
+        min_suspicious_size: size.lo, max_suspicious_size: size.hi,
+      };
       for (const [id, key, parse] of OPT_FIELDS) {
         const value = parse($(id).value);
         if (Number.isFinite(value)) patch[key] = value;
@@ -917,6 +1018,7 @@
           if (state.fileByImageIndex.has(idx)) matched++;
           else missing++;
         }
+        collapseTuning();
         state.folderLoaded = true;
         const videos = [...suspicious].filter((idx) => { const f = state.fileByImageIndex.get(idx); return f && VIDEO_RE.test(f.name); }).length;
         const images = matched - videos;
@@ -957,6 +1059,7 @@
       if (!samples.length) throw new Error("no suspicious media to align");
       const res = await mediaSetRoot(rootHandle, samples);
       if (!res.ok) throw new Error(res.error || "could not align the folder to the json paths");
+      collapseTuning();
       state.folderMode = "fsa";
       state.folderLoaded = true;
       const nImg = suspicious.filter((i) => !VIDEO_RE.test(state.imageFiles[i] || "")).length;
