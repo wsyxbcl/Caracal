@@ -42,7 +42,6 @@
     button.mini { font: inherit; font-size: 0.82rem; border: 1px solid var(--line); background: #faf6ef; color: var(--ink); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
     button.mini:hover { border-color: var(--muted); }
     button.mini.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-    .reviewed-tag { color: var(--keep); font-weight: 600; font-size: 0.85rem; margin-right: 8px; }
     .group.done { opacity: 0.8; }
 
     .tiles { display: grid; grid-template-columns: repeat(auto-fill, 92px); gap: 8px; }
@@ -57,6 +56,10 @@
     .tile.keep { border-color: var(--keep); opacity: 1; box-shadow: 0 0 0 2px rgba(47,158,91,0.18); }
     .tile:hover { border-color: var(--muted); }
     .tile.focused { outline: 3px solid var(--accent); outline-offset: 1px; z-index: 1; }
+    /* Never judged. After a re-cluster the eye should go to what actually changed,
+       not re-read the crops whose decisions were inherited. */
+    .tile.fresh::after { content: ""; position: absolute; inset: 0; border-radius: 5px;
+      box-shadow: inset 0 0 0 2px var(--accent); pointer-events: none; }
 
     /* Buffer bar for the current group's crops (fades out once buffered). */
     .buffer { display: flex; align-items: center; gap: 10px; margin: 6px 0 14px; opacity: 1; transition: opacity 0.4s 0.3s; }
@@ -217,7 +220,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-27e";
+    const BUILD = "2026-08-27h";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -436,7 +439,9 @@
       allGroups: [],                   // clustering at MIN_THRESHOLD; the threshold is a view over it
       groups: [],                      // allGroups filtered to state.threshold — what is reviewed
       threshold: 20,                   // occurrence_threshold, applied client-side
-      decisions: new Map(),            // "img:det" -> explicit human Keep/Remove, durable
+      decisions: new Map(),            // "img:det" -> { decision, at, round } — durable, authoritative
+      round: 1,                        // parameterization round, provenance only
+      rounds: [],                      // history of parameterizations, for statistics
       imageFiles: null,                // image_index -> json `file` path (also the FSA lookup key)
       frameRateByImageIndex: new Map(),// image_index -> fps, video entries only (SPEC §2.2)
       instancesByMedia: new Map(),     // image_index -> all suspicious instances on that media
@@ -513,15 +518,23 @@
       applyThreshold();
     }
 
-    // Re-derive the reviewable groups from the clustering. Decisions live in
-    // `state.decisions` keyed by DetRef, not on the instances, so a human
-    // judgement outlives any re-clustering or threshold change.
+    // Re-derive the reviewable groups from the clustering.
+    //
+    // The model: one document, many parameterizations, ONE set of human decisions.
+    // Candidate membership is temporary; a judgement about a detection is not. So
+    // decisions are keyed by DetRef and groups are ephemeral views — a re-cluster
+    // can split, merge or dissolve a group, and there is no meaningful way to
+    // inherit "group A was reviewed" once group A no longer exists. Review state
+    // is therefore *derived* from the decisions of a group's current members, and
+    // never stored on the group.
     function applyThreshold() {
       state.groups = state.allGroups.filter((g) => g.media_count >= state.threshold);
       state.instancesByMedia = new Map();
       for (const g of state.groups) {
         for (const inst of g.instances) {
-          inst.decision = state.decisions.get(detKey(inst.det_ref)) || "Remove";
+          const past = state.decisions.get(detKey(inst.det_ref));
+          inst.decided = !!past;                            // false = never judged
+          inst.decision = past ? past.decision : "Remove";  // candidates default to Remove
           const list = state.instancesByMedia.get(inst.det_ref.image_index);
           if (list) list.push(inst);
           else state.instancesByMedia.set(inst.det_ref.image_index, [inst]);
@@ -531,6 +544,30 @@
     }
 
     const detKey = (ref) => ref.image_index + ":" + ref.detection_index;
+
+    // Review state of a group, derived from its current members:
+    // unreviewed (none judged) · partial (some) · reviewed (all).
+    function groupProgress(group) {
+      let decided = 0;
+      for (const inst of group.instances) if (inst.decided) decided++;
+      const total = group.instances.length;
+      return {
+        total, decided, pending: total - decided,
+        state: decided === 0 ? "unreviewed" : decided === total ? "reviewed" : "partial",
+      };
+    }
+
+    // Review progress across the whole current candidate view.
+    function reviewProgress() {
+      const totals = { decided: 0, pending: 0, reviewed: 0, partial: 0, unreviewed: 0 };
+      for (const g of state.groups) {
+        const p = groupProgress(g);
+        totals.decided += p.decided;
+        totals.pending += p.pending;
+        totals[p.state]++;
+      }
+      return { ...totals, groups: state.groups.length };
+    }
 
     /// Totals for one threshold, without rebuilding anything — this is what makes
     /// the tuning view answer "how much review work does this setting create?".
@@ -569,22 +606,36 @@
         const threshold = Math.max(MIN_THRESHOLD, Math.round(value) || MIN_THRESHOLD);
         if (threshold === state.threshold) return tuning.totals();
         state.threshold = threshold;
+        state.round++;
         applyThreshold(); // same group objects, so "reviewed" marks survive
         resumeReview(`Threshold ${threshold}: ${state.groups.length.toLocaleString()} candidate group(s).`);
         return tuning.totals();
       },
 
-      // Change a clustering parameter and re-run. Returns before/after totals so
-      // the caller can report what the change actually did.
+      // Change a clustering parameter and re-run. Returns before/after totals plus
+      // what carried over, so the caller can say whether the round was cumulative
+      // rather than a fresh start.
       async applyOptions(patch) {
         const before = thresholdTotals(state.threshold);
+        const wasCandidate = new Set();
+        for (const g of state.groups) for (const i of g.instances) wasCandidate.add(detKey(i.det_ref));
+
         Object.assign(state.options, patch);
+        state.round++;
+        state.rounds.push({ round: state.round, at: Date.now(), ...state.options, occurrence_threshold: state.threshold });
         status.textContent = "Re-clustering…";
         await recluster();
+
         const after = thresholdTotals(state.threshold);
-        resumeReview(`${after.groups.toLocaleString()} candidate group(s), ` +
-          `${after.instances.toLocaleString()} crop(s) to review.`);
-        return { before, after };
+        const progress = reviewProgress();
+        let dropped = 0;
+        const nowCandidate = new Set();
+        for (const g of state.groups) for (const i of g.instances) nowCandidate.add(detKey(i.det_ref));
+        for (const key of wasCandidate) if (!nowCandidate.has(key)) dropped++;
+
+        resumeReview(`${after.groups.toLocaleString()} candidate group(s) · ` +
+          `${progress.decided.toLocaleString()} inherited, ${progress.pending.toLocaleString()} need review.`);
+        return { before, after, inherited: progress.decided, needsReview: progress.pending, dropped };
       },
     };
     window.__rdeTune = tuning; // also the console handle for tuning without the UI
@@ -618,11 +669,21 @@
       renderTuning();
     }
 
-    function renderTuning() {
+    // Cheap enough to run on every decision — the ladder below is not, so it is
+    // rebuilt only when the candidate set actually changes.
+    function renderTuneSummary() {
+      if ($("tune").hidden) return;
       const now = tuning.totals();
+      const p = reviewProgress();
       $("tune-summary").textContent =
-        `${now.groups.toLocaleString()} groups · ${now.instances.toLocaleString()} crops · ` +
-        `${now.media.toLocaleString()} media · ${now.cameras.toLocaleString()} camera${now.cameras === 1 ? "" : "s"}`;
+        `${now.groups.toLocaleString()} groups · ${now.instances.toLocaleString()} candidates · ` +
+        `${now.media.toLocaleString()} media · ${now.cameras.toLocaleString()} camera${now.cameras === 1 ? "" : "s"}` +
+        `  —  reviewed ${p.decided.toLocaleString()}, needs review ${p.pending.toLocaleString()}` +
+        ` (${p.reviewed} ● ${p.partial} ◐ ${p.unreviewed} ○)`;
+    }
+
+    function renderTuning() {
+      renderTuneSummary();
       const rows = tuning.curve();
       const most = rows.reduce((m, r) => Math.max(m, r.instances), 1);
       const body = $("ladder");
@@ -666,10 +727,12 @@
       }
       $("tune-apply").disabled = true;
       try {
-        const { before, after } = await tuning.applyOptions(patch);
+        const r = await tuning.applyOptions(patch);
         const delta = (a, b) => (b === a ? "unchanged" : `${a.toLocaleString()} → ${b.toLocaleString()}`);
         $("tune-impact").textContent =
-          `groups ${delta(before.groups, after.groups)}, crops ${delta(before.instances, after.instances)}`;
+          `groups ${delta(r.before.groups, r.after.groups)} · candidates ${delta(r.before.instances, r.after.instances)}` +
+          ` · ${r.inherited.toLocaleString()} decisions inherited, ${r.needsReview.toLocaleString()} need review` +
+          (r.dropped ? ` · ${r.dropped.toLocaleString()} no longer candidates` : "");
         renderTuning();
         $("m-groups").textContent = state.groups.length.toLocaleString();
       } catch (err) {
@@ -679,9 +742,9 @@
       }
     });
 
-    // Re-enter the review at the first group not yet marked reviewed.
+    // Re-enter at the first group that still needs attention.
     function resumeReview(note) {
-      const first = state.groups.findIndex((g) => !g.reviewed);
+      const first = state.groups.findIndex((g) => groupProgress(g).state !== "reviewed");
       goToGroup(first < 0 ? 0 : first);
       updateExportBar();
       if (note) status.textContent = note;
@@ -1097,11 +1160,28 @@
       prefetchGroup(next);           // next: decoded ahead
     }
 
+    // "I have looked at this group": commit the standing decision for every crop
+    // still unjudged (the default is Remove, so this is the usual "the rest are
+    // all false positives"). That is what makes the group read as reviewed — the
+    // state is derived from its members, so there is nothing else to set.
     function markReviewedAndNext() {
       const g = currentGroup();
-      if (g) { g.reviewed = true; updateExportBar(); }
-      if (currentIndex < state.groups.length - 1) goToGroup(currentIndex + 1);
-      else renderCurrent(); // last group: stay, show it as reviewed
+      if (g) {
+        for (const inst of g.instances) if (!inst.decided) decide(inst, inst.decision);
+        updateExportBar();
+      }
+      const next = nextNeedingReview(currentIndex);
+      if (next >= 0) goToGroup(next);
+      else renderCurrent(); // nothing left needing review: stay put, now marked reviewed
+    }
+
+    // Prefer the next group that still needs attention over the next index —
+    // after a re-cluster, plenty of groups may already be fully inherited.
+    function nextNeedingReview(from) {
+      for (let i = from + 1; i < state.groups.length; i++) {
+        if (groupProgress(state.groups[i]).state !== "reviewed") return i;
+      }
+      return from + 1 < state.groups.length ? from + 1 : -1;
     }
 
     function renderCurrent() {
@@ -1114,19 +1194,15 @@
         return;
       }
       const g = currentGroup();
-      const box = g.rep_bbox.map((v) => v.toFixed(3)).join(", ");
-      const reviewed = state.groups.filter((x) => x.reviewed).length;
 
       const card = document.createElement("div");
-      card.className = "card group" + (g.reviewed ? " done" : "");
+      card.className = "card group";
 
       const head = document.createElement("div");
       head.className = "group-head";
       head.innerHTML =
-        `<h3>${g.camera} · category ${g.category}</h3>` +
-        `<span class="meta">Group ${currentIndex + 1}/${state.groups.length}` +
-        `${g.reviewed ? " · ✓ reviewed" : ""} · ${reviewed} done` +
-        ` · ${g.instances.length} crops · conf ${g.stats.conf_min.toFixed(2)}–${g.stats.conf_max.toFixed(2)} · box [${box}]</span>`;
+        `<h3>${escHtml(g.camera)} · category ${escHtml(g.category)}</h3>` +
+        `<span class="meta"></span>`;
       const actions = document.createElement("span");
       actions.className = "actions";
       actions.appendChild(mini("◀ Prev", () => goToGroup(currentIndex - 1)));
@@ -1146,8 +1222,34 @@
       for (const inst of g.instances) grid.appendChild(makeTile(inst));
       card.appendChild(grid);
       results.appendChild(card);
+      refreshGroupHeader();
       $("results").parentElement.scrollTop = 0; // top of the list on each group
       applyFocus();
+    }
+
+    const REVIEW_MARK = { reviewed: "●", partial: "◐", unreviewed: "○" };
+
+    // Review state is derived, so the header has to be recomputed whenever a
+    // decision lands — not only on navigation. Rewrites the meta line in place so
+    // judging a crop never re-renders (and re-decodes) the tiles.
+    function refreshGroupHeader() {
+      const g = currentGroup();
+      const meta = document.querySelector("#results .group-head .meta");
+      if (!g || !meta) return;
+      const progress = groupProgress(g);
+      const overall = reviewProgress();
+      // What a reviewer needs on re-entry is not "group 7 of 181" but how much of
+      // THIS group is inherited and how much is actually new.
+      const stateText = progress.state === "reviewed" ? "reviewed"
+        : progress.state === "partial" ? `${progress.decided}/${progress.total} reviewed · ${progress.pending} new`
+        : "unreviewed";
+      meta.textContent =
+        `${REVIEW_MARK[progress.state]} Group ${currentIndex + 1}/${state.groups.length} · ${stateText}` +
+        ` · ${overall.reviewed} done, ${overall.partial} partial, ${overall.unreviewed} to go` +
+        ` · conf ${g.stats.conf_min.toFixed(2)}–${g.stats.conf_max.toFixed(2)}` +
+        ` · box [${g.rep_bbox.map((v) => v.toFixed(3)).join(", ")}]`;
+      const card = meta.closest(".group");
+      if (card) card.classList.toggle("done", progress.state === "reviewed");
     }
 
     // ---- Focus + keyboard ----------------------------------------------------
@@ -1199,7 +1301,9 @@
 
     function makeTile(instance) {
       const tile = document.createElement("div");
-      tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove");
+      // "fresh" = never judged, so after a re-cluster the eye goes straight to
+      // what actually changed instead of re-reading inherited decisions.
+      tile.className = "tile " + (instance.decision === "Keep" ? "keep" : "remove") + (instance.decided ? "" : " fresh");
       tile._instance = instance;
       tile.title = state.imageFiles?.[instance.det_ref.image_index] || ""; // hover: source path
       const key = cropKey(instance.det_ref);
@@ -1230,12 +1334,6 @@
       b.addEventListener("mousedown", (e) => e.preventDefault()); // don't steal keyboard focus
       b.addEventListener("click", onClick);
       return b;
-    }
-    function tag(text) {
-      const s = document.createElement("span");
-      s.className = "reviewed-tag";
-      s.textContent = text;
-      return s;
     }
 
     // ---- Context preview: full frame + red box, decoded on demand ------------
@@ -1399,14 +1497,20 @@
       const keep = decision === "Keep";
       tile.classList.toggle("keep", keep);
       tile.classList.toggle("remove", !keep);
+      tile.classList.remove("fresh"); // judging it is what makes it no longer new
       tile.querySelector(".badge").textContent = keep ? "keep" : "drop";
     }
     // Every explicit judgement is recorded against its DetRef, which is stable
     // across re-clustering (SPEC §6.1). Parameters are a way of *looking* at the
     // document; a human decision about a detection outlives them.
+    // Group-level actions resolve to DetRef decisions too — nothing is ever
+    // recorded against a group, so the group is free to split, merge or vanish on
+    // the next re-cluster without losing the judgement. `round` is provenance for
+    // history and statistics; it plays no part in correctness.
     function decide(instance, decision) {
       instance.decision = decision;
-      state.decisions.set(detKey(instance.det_ref), decision);
+      instance.decided = true;
+      state.decisions.set(detKey(instance.det_ref), { decision, at: Date.now(), round: state.round });
     }
     function toggleDecision(instance, tile) {
       decide(instance, instance.decision === "Keep" ? "Remove" : "Keep");
@@ -1447,10 +1551,14 @@
     }
     function updateExportBar() {
       const n = removalRefs().length;
+      const p = reviewProgress();
       $("export-summary").textContent = state.fileName
-        ? `Will remove ${n} detection(s) from ${state.fileName}.`
+        ? `Will remove ${n.toLocaleString()} detection(s) from ${state.fileName}` +
+          (p.pending ? ` — ${p.pending.toLocaleString()} candidate(s) not yet reviewed.` : ".")
         : "No document loaded.";
       $("export-btn").disabled = !state.fileName;
+      renderTuneSummary();   // review progress moves with every decision
+      refreshGroupHeader();
     }
     $("export-btn").addEventListener("click", async () => {
       try {
@@ -1473,6 +1581,8 @@
       state.groups = [];
       state.allGroups = [];
       state.decisions.clear();
+      state.round = 1;
+      state.rounds = [];
       state.fileByImageIndex.clear();
       state.frameRateByImageIndex.clear();
       state.folderLoaded = false;
