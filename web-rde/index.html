@@ -153,7 +153,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-26j";
+    const BUILD = "2026-08-27a";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -420,7 +420,7 @@
         const tFind = performance.now();
         state.groups = JSON.parse((await call("find", { options: state.options })).groups);
         // media -> every suspicious instance on it, so opening any group can crop
-        // a media completely (see groupSources).
+        // a media completely (see sourcesFor).
         state.instancesByMedia = new Map();
         for (const g of state.groups) {
           for (const inst of g.instances) {
@@ -661,13 +661,17 @@
       }
     }
 
-    // A group's still-uncached instances, grouped by source media — one entry per
-    // media, so each is opened once (an image decoded once, a clip demuxed once).
-    // Video instances carry their frame_number; media in a container the browser
-    // can't demux are left to their tile placeholder (SPEC §7).
-    function groupSources(group) {
+    // The fetch plan for a set of instances: one entry per source media, so each
+    // is opened once (an image decoded once, a clip demuxed once). Video items
+    // carry their frame_number; media in a container the browser can't demux are
+    // left to their tile placeholder (SPEC §7).
+    //
+    // Takes instances rather than a group on purpose — which media to open is not
+    // a group concept. Reviewing passes one group's instances; a precompute pass
+    // would hand it the whole document's, and nothing else would need to change.
+    function sourcesFor(instances) {
       const bySource = new Map();
-      const media = new Set(group.instances.map((i) => i.det_ref.image_index));
+      const media = new Set(instances.map((i) => i.det_ref.image_index));
       for (const imageIndex of media) {
         const src = sourceOf(imageIndex);
         if (!src) continue; // missing: handled at tile creation / on failure
@@ -734,7 +738,7 @@
       // in-flight run keeps calling paintBuffer, so the bar tracks it from here.
       if (group._prefetched || group._prefetching) { paintBuffer(group); return; }
       group._prefetching = true;
-      const sources = groupSources(group);
+      const sources = sourcesFor(group.instances);
       const total = sources.length;
       let done = 0;
       const t0 = performance.now();
