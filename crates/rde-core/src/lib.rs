@@ -337,6 +337,14 @@ struct Cluster {
 /// categories. Groups are returned in a deterministic order with assigned ids.
 pub fn find_suspicious(doc: &MdDocument, opts: &RdeOptions) -> Vec<SuspiciousGroup> {
     let mut clusters: Vec<Cluster> = Vec::new();
+    // Candidates can only ever join a cluster from the same camera (and, unless
+    // agnostic, the same category), so scanning every cluster means comparing
+    // strings that cannot match: 72 cameras here, i.e. ~23/24 of the work wasted.
+    // Bucket cluster indices by that key instead. Indices stay in insertion order
+    // within a bucket, and a match is only possible inside one bucket, so the
+    // first hit is still the first hit globally — the greedy semantics are
+    // unchanged (`reproduces_reference_find` pins that).
+    let mut buckets: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
 
     for (image_index, image) in doc.images().iter().enumerate() {
         // Decode failures carry no RDE-relevant boxes.
@@ -361,11 +369,7 @@ pub fn find_suspicious(doc: &MdDocument, opts: &RdeOptions) -> Vec<SuspiciousGro
             if area < opts.min_suspicious_size || area > opts.max_suspicious_size {
                 continue;
             }
-            let category = det
-                .get("category")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let category = det.get("category").and_then(|v| v.as_str()).unwrap_or("");
 
             let instance = Instance {
                 det_ref: DetRef {
@@ -381,26 +385,30 @@ pub fn find_suspicious(doc: &MdDocument, opts: &RdeOptions) -> Vec<SuspiciousGro
                     .map(|n| n as u32),
             };
 
-            // Greedy: the first same-camera (and, unless agnostic, same-category)
-            // cluster whose fixed representative overlaps enough. Find the index
-            // first, then move `instance` exactly once.
-            let target = clusters.iter().position(|cluster| {
-                cluster.camera == camera
-                    && (opts.category_agnostic || cluster.category == category)
-                    && iou(&bbox, &cluster.rep) >= opts.iou_threshold
-            });
+            // Greedy: the first cluster in this bucket whose fixed representative
+            // overlaps enough. Find the index first, then move `instance` once.
+            let bucket = buckets
+                .entry((camera, if opts.category_agnostic { "" } else { category }))
+                .or_default();
+            let target = bucket
+                .iter()
+                .copied()
+                .find(|&index| iou(&bbox, &clusters[index].rep) >= opts.iou_threshold);
             match target {
                 Some(index) => {
                     clusters[index].images.insert(image_index);
                     clusters[index].members.push(instance);
                 }
-                None => clusters.push(Cluster {
-                    camera: camera.to_string(),
-                    category,
-                    rep: bbox,
-                    images: HashSet::from([image_index]),
-                    members: vec![instance],
-                }),
+                None => {
+                    bucket.push(clusters.len());
+                    clusters.push(Cluster {
+                        camera: camera.to_string(),
+                        category: category.to_string(),
+                        rep: bbox,
+                        images: HashSet::from([image_index]),
+                        members: vec![instance],
+                    });
+                }
             }
         }
     }
