@@ -110,7 +110,7 @@
     .preview { flex: 0 0 400px; overflow-y: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
     .preview h2 { font-size: 0.95rem; margin: 0 0 10px; }
     .preview canvas { width: 100%; height: auto; max-height: 62vh; object-fit: contain; border-radius: 6px; background: #efe9df; display: block; }
-    .preview-meta { color: var(--muted); font-size: 0.82rem; margin: 10px 0 0; word-break: break-all; }
+    .preview-meta { color: var(--muted); font-size: 0.82rem; margin: 10px 0 0; word-break: break-all; white-space: pre-line; }
     .preview-meta b { color: var(--ink); }
     @media (max-width: 980px) {
       /* Narrow: fall back to a normally-scrolling page (stack review over preview). */
@@ -220,7 +220,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-27h";
+    const BUILD = "2026-08-27j";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -541,9 +541,22 @@
         }
       }
       logVideoPlumbing();
+      updateMatchedMetric();
     }
 
     const detKey = (ref) => ref.image_index + ":" + ref.detection_index;
+
+    // The matched metric describes the candidates currently on screen, so it has
+    // to be recomputed whenever the threshold moves the candidate set.
+    function updateMatchedMetric() {
+      if (!state.folderLoaded) return;
+      const media = new Set(state.groups.flatMap((g) => g.instances.map((i) => i.det_ref.image_index)));
+      if (state.folderMode === "fsa") { $("m-matched").textContent = String(media.size); return; }
+      let matched = 0;
+      for (const idx of media) if (state.fileByImageIndex.has(idx)) matched++;
+      $("m-matched").textContent = `${matched}/${media.size}`;
+    }
+
 
     // Review state of a group, derived from its current members:
     // unreviewed (none judged) · partial (some) · reviewed (all).
@@ -797,13 +810,22 @@
         const matches = JSON.parse((await call("match", { pickedPaths })).matches);
         console.log(`[rde] folder read+match: ${files.length} files in ${Math.round(performance.now() - t0)} ms`);
 
-        // Which images are actually referenced by suspicious groups.
-        const suspicious = new Set(state.groups.flatMap((g) => g.instances.map((i) => i.det_ref.image_index)));
+        // Keep EVERY match, not just the media in the groups showing right now.
+        // The candidate set is no longer fixed after load — lowering the occurrence
+        // threshold reveals groups whose media would otherwise never have been
+        // matched, and they would render as "no image" as if the file were absent.
+        // Bounded by the number of picked files, not by the document.
         state.fileByImageIndex.clear();
+        for (let idx = 0; idx < matches.length; idx++) {
+          const m = matches[idx];
+          if (m && m.status === "matched") state.fileByImageIndex.set(idx, files[m.picked_index]);
+        }
+
+        // Counters describe the candidates on screen at the current threshold.
+        const suspicious = new Set(state.groups.flatMap((g) => g.instances.map((i) => i.det_ref.image_index)));
         let matched = 0, missing = 0;
         for (const idx of suspicious) {
-          const m = matches[idx];
-          if (m && m.status === "matched") { state.fileByImageIndex.set(idx, files[m.picked_index]); matched++; }
+          if (state.fileByImageIndex.has(idx)) matched++;
           else missing++;
         }
         state.folderLoaded = true;
@@ -1410,7 +1432,13 @@
       const src = sourceOf(instance.det_ref.image_index);
       const path = state.imageFiles?.[instance.det_ref.image_index] || "";
       const blank = (msg) => { previewCanvas.width = 400; previewCanvas.height = 220; ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, 400, 220); previewMeta.textContent = msg; };
-      if (!state.folderLoaded || !src) { blank("Media not loaded — load the folder to see the full frame."); return; }
+      // Distinguish "no folder yet" from "this media did not resolve" — conflating
+      // them sends the reviewer looking for the wrong problem.
+      if (!state.folderLoaded) { blank("Load the image folder to see the full frame."); return; }
+      if (!src) {
+        blank(`Not found in the picked folder:\n${path || "(no path in the json)"}`);
+        return;
+      }
       const isVideo = VIDEO_RE.test(path);
       if (isVideo && !decodableVideo(path, instance)) {
         blank(hasWebCodecs
