@@ -220,7 +220,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-27j";
+    const BUILD = "2026-08-27k";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -444,7 +444,8 @@
       rounds: [],                      // history of parameterizations, for statistics
       imageFiles: null,                // image_index -> json `file` path (also the FSA lookup key)
       frameRateByImageIndex: new Map(),// image_index -> fps, video entries only (SPEC §2.2)
-      instancesByMedia: new Map(),     // image_index -> all suspicious instances on that media
+      instancesByMedia: new Map(),     // image_index -> all candidate instances on that media
+      groupByDet: new Map(),           // "img:det" -> its group, so the preview can tell candidates from survivors
       categoryNames: {},               // detection_categories: "1" -> "animal"
       fileByImageIndex: new Map(),     // image_index -> picked File (webkitdirectory fallback only)
       folderLoaded: false,
@@ -530,8 +531,10 @@
     function applyThreshold() {
       state.groups = state.allGroups.filter((g) => g.media_count >= state.threshold);
       state.instancesByMedia = new Map();
+      state.groupByDet = new Map();
       for (const g of state.groups) {
         for (const inst of g.instances) {
+          state.groupByDet.set(detKey(inst.det_ref), g); // which candidates are under review, and where
           const past = state.decisions.get(detKey(inst.det_ref));
           inst.decided = !!past;                            // false = never judged
           inst.decision = past ? past.decision : "Remove";  // candidates default to Remove
@@ -1477,18 +1480,31 @@
       const line = Math.max(2, cw / 240);
       ctx.font = `${Math.max(11, Math.round(cw / 46))}px system-ui, sans-serif`;
       ctx.textBaseline = "bottom";
+      const group = state.groupByDet.get(detKey(instance.det_ref));
+      let safe = 0, elsewhere = 0;
       for (const det of others) {
         if (det.detection_index === instance.det_ref.detection_index) continue;
         // On a video only boxes from the frame on screen belong on it.
         if (frameNumber !== undefined && det.frame_number !== frameNumber) continue;
+        const owner = state.groupByDet.get(detKey({ image_index: instance.det_ref.image_index, detection_index: det.detection_index }));
+        // A sibling candidate in THIS group sits on the same location by
+        // construction — drawing it just doubles the box under review.
+        if (owner && owner === group) continue;
+        // The point of these boxes is to show what RDE will NOT remove, so a
+        // detection that is itself a candidate must not look like a survivor.
+        const candidate = !!owner;
+        if (candidate) elsewhere++; else safe++;
         const [dx, dy, dw, dh] = det.bbox;
         ctx.lineWidth = line;
-        ctx.strokeStyle = "#3e7cb1";
+        ctx.strokeStyle = candidate ? "#6b6459" : "#3e7cb1";
+        ctx.setLineDash(candidate ? [6, 4] : []);
         ctx.strokeRect(dx * cw, dy * chh, dw * cw, dh * chh);
-        const label = `${state.categoryNames[det.category] || det.category} ${det.conf.toFixed(2)}`;
+        ctx.setLineDash([]);
+        const label = `${state.categoryNames[det.category] || det.category} ${det.conf.toFixed(2)}`
+          + (candidate ? " · candidate" : "");
         const pad = 3, tw = ctx.measureText(label).width + pad * 2;
         const th = parseInt(ctx.font, 10) + pad;
-        ctx.fillStyle = "#3e7cb1";
+        ctx.fillStyle = candidate ? "#6b6459" : "#3e7cb1";
         ctx.fillRect(dx * cw, Math.max(th, dy * chh) - th, tw, th);
         ctx.fillStyle = "#fff";
         ctx.fillText(label, dx * cw + pad, Math.max(th, dy * chh) - 1);
@@ -1503,8 +1519,15 @@
         : frameNumber === instance.frame_number
           ? ` · frame ${frameNumber} (this detection)`
           : ` · frame ${frameNumber} — press f for this detection's frame ${instance.frame_number}`;
+      // Say what the other boxes mean, since that is the whole reason to draw them.
+      const context = safe || elsewhere
+        ? `\n${safe ? `${safe} other detection(s) here RDE will keep` : ""}` +
+          `${safe && elsewhere ? " · " : ""}` +
+          `${elsewhere ? `${elsewhere} candidate(s) under review in another group` : ""}`
+        : "\nNo other detections on this frame.";
       previewMeta.innerHTML =
-        `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}${escHtml(shown)}<br>${escHtml(path)}`;
+        `<b>${instance.decision === "Keep" ? "KEEP" : "will drop"}</b> · conf ${instance.conf.toFixed(2)}${escHtml(shown)}` +
+        `${escHtml(context)}<br>${escHtml(path)}`;
     }
 
     // Detections per media, memoised — the document is immutable, so this is
