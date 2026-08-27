@@ -183,6 +183,8 @@
             <span class="hint" id="tune-impact"></span>
           </div>
           <p class="hint" id="tune-cameras"></p>
+          <button class="mini" id="iou-compute">Compute IoU sensitivity</button>
+          <div id="iou-table"></div>
         </div>
       </div>
     </div>
@@ -220,7 +222,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-27k";
+    const BUILD = "2026-08-27o";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -685,6 +687,80 @@
       renderTuning();
     }
 
+    // IoU sensitivity. Unlike the occurrence threshold, IoU decides what *merges*,
+    // so no curve can be derived from an existing clustering — every point is a
+    // real re-cluster (~1 s on a 73k-media document). Estimating it by re-filtering
+    // instead was measured at up to 44% off at the far end, i.e. most wrong exactly
+    // where the decision is biggest. Hence: user-triggered, and exact.
+    //
+    // Each point keeps only (media_count, instance count) per group, which is all
+    // the table needs — so moving the occurrence threshold re-reads it for free.
+    const IOU_POINTS = [0.95, 0.9, 0.85, 0.8, 0.7];
+    let iouSensitivity = null; // { key, rows: [{ iou, groups: [[media_count, instances]] }] }
+
+    // Everything except IoU and the threshold; the table is stale if these change.
+    function sensitivityKey() {
+      const { iou_threshold, occurrence_threshold, ...rest } = state.options;
+      return JSON.stringify(rest);
+    }
+
+    async function computeIouSensitivity() {
+      const points = [...new Set([...IOU_POINTS, state.options.iou_threshold])].sort((a, b) => b - a);
+      const button = $("iou-compute");
+      const rows = [];
+      for (const [i, iou] of points.entries()) {
+        button.textContent = `Computing ${i + 1}/${points.length}…`;
+        const options = { ...state.options, iou_threshold: iou, occurrence_threshold: MIN_THRESHOLD };
+        const groups = JSON.parse((await call("find", { options: JSON.stringify(options) })).groups);
+        rows.push({ iou, groups: groups.map((g) => [g.media_count, g.instances.length]) });
+      }
+      iouSensitivity = { key: sensitivityKey(), rows };
+      button.textContent = "Recompute IoU sensitivity";
+      renderIouSensitivity();
+    }
+
+    function renderIouSensitivity() {
+      const host = $("iou-table");
+      host.textContent = "";
+      if (!iouSensitivity) return;
+      // Counted at the CURRENT occurrence threshold, so the two controls agree.
+      const counted = iouSensitivity.rows.map((row) => {
+        let groups = 0, candidates = 0;
+        for (const [media, instances] of row.groups) {
+          if (media < state.threshold) continue;
+          groups++; candidates += instances;
+        }
+        return { iou: row.iou, groups, candidates };
+      });
+      const most = counted.reduce((m, r) => Math.max(m, r.candidates), 1);
+      const table = document.createElement("table");
+      table.className = "ladder";
+      const body = document.createElement("tbody");
+      for (const row of counted) {
+        const tr = document.createElement("tr");
+        if (Math.abs(row.iou - state.options.iou_threshold) < 1e-6) tr.className = "at";
+        const cell = (text, cls) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
+        cell(row.iou.toFixed(2));
+        cell(row.groups.toLocaleString(), "n");
+        cell(`${row.candidates.toLocaleString()} candidates`, "n");
+        const bar = cell("", "bar");
+        const fill = document.createElement("i");
+        fill.style.width = `${Math.max(2, Math.round(100 * row.candidates / most))}%`;
+        bar.appendChild(fill);
+        tr.title = "Put this value in the IoU box (then Apply)";
+        tr.addEventListener("click", () => { $("opt-iou").value = String(row.iou); });
+        body.appendChild(tr);
+      }
+      table.appendChild(body);
+      host.appendChild(table);
+      const note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = iouSensitivity.key !== sensitivityKey()
+        ? "Other parameters changed since this was computed — recompute for current numbers."
+        : `Other parameters held constant · counted at occurrence ≥ ${state.threshold}`;
+      host.appendChild(note);
+    }
+
     // Cheap enough to run on every decision — the ladder below is not, so it is
     // rebuilt only when the candidate set actually changes.
     function renderTuneSummary() {
@@ -700,6 +776,7 @@
 
     function renderTuning() {
       renderTuneSummary();
+      renderIouSensitivity(); // no-op until computed; re-reads at the current threshold
       const rows = tuning.curve();
       const most = rows.reduce((m, r) => Math.max(m, r.instances), 1);
       const body = $("ladder");
@@ -730,6 +807,15 @@
 
     $("occ-range").addEventListener("input", (e) => setThresholdFromUi(Number(e.target.value)));
     $("occ-number").addEventListener("change", (e) => setThresholdFromUi(Number(e.target.value)));
+    // IoU is the one parameter whose effect cannot be derived, so it is measured
+    // on request: five real re-clusters, current value included and highlighted.
+    $("iou-compute").addEventListener("click", async () => {
+      const button = $("iou-compute");
+      button.disabled = true;
+      try { await computeIouSensitivity(); }
+      catch (err) { showError(err); button.textContent = "Compute IoU sensitivity"; }
+      finally { button.disabled = false; }
+    });
     $("tune-collapse").addEventListener("click", () => {
       const body = $("tune-body");
       body.hidden = !body.hidden;
@@ -1648,6 +1734,9 @@
       tileByKey.clear();
       state.imageFiles = null;
       $("tune").hidden = true;
+      iouSensitivity = null;
+      $("iou-table").textContent = "";
+      $("iou-compute").textContent = "Compute IoU sensitivity";
       $("folder-fsa").classList.add("disabled");
       $("folder-fsa").disabled = true;
       errorEl.textContent = "";
