@@ -117,35 +117,51 @@ numbers; the load-bearing conclusions:
   Microsoft Basic Render Driver via SwANGLE). Getting a real GPU driver active is
   probably a bigger lever than any code change.
 
+## Tuning (P2, partly done)
+Built around **parameter impact**, not controls. Two kinds of parameter, because
+they cost different things:
+- **Occurrence — instant.** `occurrence_threshold` is only ever a *final filter*
+  on `media_count` (pinned by `threshold_is_only_a_final_filter`), so the app
+  clusters ONCE at 2 and the threshold is a client-side view: a ladder of
+  groups/candidates per threshold, scrubbable with no recompute.
+- **IoU — exact, on demand.** IoU decides what *merges*, so nothing about it can
+  be derived; estimating it by re-filtering was measured up to **44% wrong**.
+  Five real re-clusters (~1 s total). Production shape: groups peak at 0.90
+  (180/227/203/209/194) while candidates climb 10,416 → 26,923 — loosening IoU
+  gives *bigger* groups, not more of them.
+- Confidence / box area / category stay ordinary Apply controls. No histograms.
+  A representative-sample UI was built and reverted (`4da967d`, `4bf4d5c`).
+
+**Review state is derived** (see the `rde-review-state-model` memory): decisions
+belong to stable DetRefs, groups are ephemeral views marked ● / ◐ / ○ from their
+current members, and a re-cluster inherits every decision. Explicit judgements stay
+authoritative at export even if the detection later stops being a candidate.
+
 ## Remaining / roadmap
-1. **The three deferred cache/pipeline steps** (agreed design): split request
-   enumeration from the group (`sourcesFor(instances)`, with `groupSources` as one
-   caller) → put a `has/get/put` tier interface in front of the crop cache → add
-   an OPFS write-through behind it, and an optional **precompute-all-previews**
-   mode driving the same enumerator in media order. Estimated **~1.1 h
-   single-threaded / ~0.4 h at concurrency 3** for all 3,350 suspicious clips in
-   software; ~0.11 GB of crops. OPFS is origin-scoped, so the offline launcher
-   must use a **stable localhost port** or previous previews become invisible
-   (the same constraint applies to persisting the FSA directory handle).
-2. **Manual-test the FSA picker** on a real machine + folder (headless can't drive
-   the native dialog): instant load, crops resolve per group, case-mismatch
-   handled, genuinely-missing → "no image".
-3. **P2 (SPEC §9):** live parameter sliders (re-run `find` on threshold change —
-   it's cheap + pure), review-session save/load, review stats chart. NB the default
-   `occurrence_threshold` of 20 yields **0 groups** on the 574-media demo json, so
-   sliders are what make that dataset reviewable at all.
-4. **One clip in 36 still fails to decode** — `6089_gps2…IMG_0754.mp4` (targets
-   [0, 266, 532]) throws a bare "Decoding error." after the sync-flag repair. A
-   per-clip fallback to a linear pass on decoder error would make it robust, and
-   precompute mode must count and report such failures rather than silently
-   producing nothing.
-5. **Cold hover still re-reads the whole clip** (~42 MB for one frame); only
-   repeats are cached. Fix by generating previews from the frames the crop pass
-   already decodes, or with byte-range reads.
-6. Optional: exclude/skip video in clustering, or video-aware clustering. Note
-   clustering counts **distinct media**, so N frames inside one clip are a single
-   occurrence — yet each still becomes its own tile (on the demo doc, 76% of
-   suspicious *instances* were video vs 34% of suspicious *media*).
+1. **Review-session save/load (P2, SPEC §9) — the blocking gap.** Decisions live
+   only in memory, so a refresh or crash loses hours of work on a document with
+   18,101 candidates. `state.decisions` is already exactly the right shape to
+   serialize (DetRef → `{decision, at, round}`), plus `state.options`/threshold and
+   the document identity to rebind against.
+2. **Decide the mid-review export semantic.** Export currently removes every
+   candidate left at the default Remove, *including ones never looked at* (the bar
+   says so). That matches upstream RDE, but an unfinished review silently removes
+   unreviewed candidates. The alternative — export only explicit decisions — makes
+   an unfinished review a no-op. Unresolved.
+3. **IoU "what merged" diff** — the one piece of visual tuning feedback still
+   wanted: match old groups to new by camera + box overlap and show what changed
+   between two IoU values.
+4. **OPFS / precompute** (with the `has/get/put` cache tier that waits with it).
+   `sourcesFor(instances)` is already the seam. ~0.4 h at concurrency 3 for all
+   3,350 clips; ~0.11 GB. OPFS is origin-scoped → the offline launcher needs a
+   **stable localhost port** (same constraint as persisting an FSA handle).
+5. **Manual-test the FSA picker** — Chromium/Edge only; Firefox has no File System
+   Access at all and always takes the `webkitdirectory` enumeration path, so this
+   is untested and unexercised by the current reviewer.
+6. Move `n_dir_levels_from_leaf` into dataset setup (it is camera grouping, not RDE
+   tuning; currently a read-only note showing real camera names).
+7. Optional: video-aware clustering. Clustering counts **distinct media**, so N
+   frames inside one clip are a single occurrence — yet each is its own tile.
 
 ## Perf lessons (don't re-learn)
 - Headless CDP **cannot** reproduce headed software-render compositor lag — ask
