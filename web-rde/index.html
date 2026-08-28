@@ -110,18 +110,23 @@
     .tune-row input[type=range] { flex: 1; accent-color: var(--accent); }
     .tune input[type=number] { font: inherit; font-size: 0.85rem; width: 5.5em; padding: 3px 6px;
       border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
-    /* Two-handle range. Built from ordinary elements rather than two overlaid
-       <input type=range>, because that trick depends on pointer-events working on
-       the thumb pseudo-element, which is not dependable across browsers. */
-    .dual .dual-track { margin-top: 2px; }
-    .dual-track { position: relative; height: 20px; touch-action: none; }
-    .dual-track::before { content: ""; position: absolute; left: 0; right: 0; top: 8px; height: 4px;
+    /* One range component for every slider. Native <input type=range> cannot be
+       styled consistently across browsers and cannot show ticks, and mixing it
+       with a custom control looked like two different products. */
+    .range { margin: 2px 0 4px; }
+    .range-track { position: relative; height: 20px; touch-action: none; }
+    .range-track::before { content: ""; position: absolute; left: 0; right: 0; top: 8px; height: 4px;
       background: var(--line); border-radius: 2px; }
-    .dual-fill { position: absolute; top: 8px; height: 4px; background: var(--accent); border-radius: 2px; }
-    .dual-thumb { position: absolute; top: 2px; width: 16px; height: 16px; margin-left: -8px; padding: 0;
+    .range-fill { position: absolute; top: 8px; height: 4px; background: var(--accent); border-radius: 2px; }
+    .range-thumb { position: absolute; top: 2px; width: 16px; height: 16px; margin-left: -8px; padding: 0;
       border: 2px solid var(--accent); background: var(--card); border-radius: 50%; cursor: grab; }
-    .dual-thumb:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
-    .dual-thumb:active { cursor: grabbing; }
+    .range-thumb:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+    .range-thumb:active { cursor: grabbing; }
+    /* Ticks say which values exist — on occurrence they are the only ones selectable. */
+    .range-ticks { position: relative; height: 14px; margin: 1px 0 8px; }
+    .range-ticks i { position: absolute; top: 0; width: 1px; height: 4px; background: var(--line); }
+    .range-ticks span { position: absolute; top: 5px; transform: translateX(-50%);
+      font-size: 0.68rem; color: var(--muted); white-space: nowrap; }
 
     /* Five rows then scroll, so a long ladder cannot push the actions off screen. */
     .ladder-wrap { max-height: 112px; overflow-y: auto; margin: 10px 0 4px;
@@ -200,13 +205,12 @@
       </div>
       <div class="tune-body" id="tune-body">
         <div class="tune-col">
-          <div class="field">
-            <div class="field-head"><label for="occ-range">Occurrence</label></div>
+          <div class="range field" id="occ-range">
+            <div class="field-head"><label>Occurrence</label><b class="range-value"></b></div>
             <p class="field-desc">Distinct media a box must recur across before it counts as a repeat. Several detections inside one clip are one occurrence, not several.</p>
-            <div class="tune-row">
-              <input type="range" id="occ-range" min="2" max="100" step="1" />
-              <input type="number" id="occ-number" min="2" step="1" />
-            </div>
+            <div class="range-track"><div class="range-fill"></div>
+              <button class="range-thumb v" aria-label="occurrence threshold"></button></div>
+            <div class="range-ticks"></div>
           </div>
           <p class="field-desc">Applies immediately — clustering does not depend on it, so this is the exact cost of each setting.</p>
           <div class="ladder-wrap"><table class="ladder"><tbody id="ladder"></tbody></table></div>
@@ -216,33 +220,38 @@
           <h3 class="field-group">Clustering</h3>
           <p class="field-desc">Decides which detections are candidates at all. Each change needs a re-cluster, so preview it first.</p>
 
-          <div class="dual field" id="dual-conf">
-            <div class="field-head"><label>Confidence band</label><b class="dual-value"></b></div>
+          <div class="range field" id="dual-conf">
+            <div class="field-head"><label>Confidence band</label><b class="range-value"></b></div>
             <p class="field-desc">Only detections inside this band are considered. Raising the lower edge drops the weakest — often the repeats, but also animals the detector was unsure about.</p>
-            <div class="dual-track"><div class="dual-fill"></div>
-              <button class="dual-thumb lo" aria-label="minimum confidence"></button>
-              <button class="dual-thumb hi" aria-label="maximum confidence"></button></div>
+            <div class="range-track"><div class="range-fill"></div>
+              <button class="range-thumb lo" aria-label="minimum confidence"></button>
+              <button class="range-thumb hi" aria-label="maximum confidence"></button></div>
+            <div class="range-ticks"></div>
           </div>
 
-          <div class="dual field" id="dual-size">
-            <div class="field-head"><label>Box area band</label><b class="dual-value"></b></div>
+          <div class="range field" id="dual-size">
+            <div class="field-head"><label>Box area band</label><b class="range-value"></b></div>
             <p class="field-desc">Box size as a fraction of the frame (w × h). The upper edge is the useful one: a repeat is usually something small and fixed, like a twig or a rock.</p>
-            <div class="dual-track"><div class="dual-fill"></div>
-              <button class="dual-thumb lo" aria-label="minimum box area"></button>
-              <button class="dual-thumb hi" aria-label="maximum box area"></button></div>
+            <div class="range-track"><div class="range-fill"></div>
+              <button class="range-thumb lo" aria-label="minimum box area"></button>
+              <button class="range-thumb hi" aria-label="maximum box area"></button></div>
+            <div class="range-ticks"></div>
           </div>
 
-          <div class="field-row">
-            <div class="field">
-              <div class="field-head"><label for="opt-iou">Same-box IoU</label>
-                <input type="number" id="opt-iou" step="0.01" min="0" max="1" /></div>
-              <p class="field-desc">How much two boxes must overlap to count as one location. Lowering it merges neighbours into fewer, larger groups.</p>
-            </div>
-            <div class="field">
-              <div class="field-head"><label for="opt-camlevel">Camera folder level</label>
-                <input type="number" id="opt-camlevel" step="1" min="0" max="6" /></div>
-              <p class="field-desc" id="tune-cameras">Which folder level names one camera. Boxes are only compared within a camera.</p>
-            </div>
+          <div class="range field" id="opt-iou">
+            <div class="field-head"><label>Same-box IoU</label><b class="range-value"></b></div>
+            <p class="field-desc">How much two boxes must overlap to count as one location. Lowering it merges neighbours into fewer, larger groups.</p>
+            <div class="range-track"><div class="range-fill"></div>
+              <button class="range-thumb v" aria-label="same-box IoU"></button></div>
+            <div class="range-ticks"></div>
+          </div>
+
+          <div class="range field" id="opt-camlevel">
+            <div class="field-head"><label>Camera folder level</label><b class="range-value"></b></div>
+            <p class="field-desc" id="tune-cameras">Which folder level names one camera. Boxes are only compared within a camera.</p>
+            <div class="range-track"><div class="range-fill"></div>
+              <button class="range-thumb v" aria-label="camera folder level"></button></div>
+            <div class="range-ticks"></div>
           </div>
 
           <div class="field">
@@ -300,7 +309,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-28f";
+    const BUILD = "2026-08-28i";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -592,6 +601,15 @@
     // reviewer can scrub it with no recompute, and only the parameters that
     // decide which detections enter clustering cost a re-run.
     const MIN_THRESHOLD = 2;
+    // The occurrence scale. These are the tick marks, the ladder rows and the only
+    // selectable values — one list, so the ladder never has to invent a row for an
+    // off-scale choice.
+    const OCCURRENCE_STEPS = [2, 3, 5, 10, 15, 20, 30, 50, 75, 100, 150, 250];
+    const occurrenceSteps = () => {
+      const largest = state.allGroups.reduce((m, g) => Math.max(m, g.media_count), MIN_THRESHOLD);
+      const steps = OCCURRENCE_STEPS.filter((t) => t <= Math.max(largest, MIN_THRESHOLD));
+      return steps.length ? steps : [MIN_THRESHOLD];
+    };
     let DEFAULT_OPTIONS = null; // as the wasm reports them, for "reset"
 
     async function recluster() {
@@ -695,11 +713,9 @@
       // the point of the exercise — choosing a cut on a distribution you can see
       // beats guessing whether 20 or 50 is sensible.
       curve() {
-        const largest = state.allGroups.reduce((m, g) => Math.max(m, g.media_count), 0);
-        const ladder = [2, 3, 5, 10, 15, 20, 30, 50, 75, 100, 150, 250]
-          .filter((t) => t <= Math.max(largest, MIN_THRESHOLD));
-        if (!ladder.includes(state.threshold)) ladder.push(state.threshold);
-        return [...new Set(ladder)].sort((a, b) => a - b).map((t) => thresholdTotals(t));
+        // Exactly the selectable values — no row is invented for an off-scale
+        // choice, because there is no way to make one.
+        return occurrenceSteps().map((t) => thresholdTotals(t));
       },
 
       setThreshold(value) {
@@ -775,82 +791,119 @@
     // Built around impact rather than around the controls: the question a reviewer
     // is actually asking is "how much work does this setting create, and am I
     // starting to sweep up detections I would rather look at?".
-    const OPT_FIELDS = [
-      ["opt-iou", "iou_threshold", parseFloat],
-      ["opt-camlevel", "n_dir_levels_from_leaf", (v) => parseInt(v, 10)],
-    ];
 
-    // A band is one thing, so it gets one control: two thumbs on a single track,
-    // showing the span rather than asking anyone to hold two numbers in their head.
-    function dualRange(id, { min, max, step, format }) {
+
+    // One slider implementation, single- or two-thumb. `values` restricts the
+    // control to a fixed set of steps, which is what keeps the occurrence ladder
+    // honest: every selectable value is a row in it, so it never grows one.
+    function rangeControl(id, { min, max, step = 1, values = null, ticks = null,
+                                format = String, onChange = null, single = false }) {
       const root = $(id);
-      const track = root.querySelector(".dual-track");
-      const fill = root.querySelector(".dual-fill");
-      const value = root.querySelector(".dual-value");
-      const thumbs = { lo: root.querySelector(".lo"), hi: root.querySelector(".hi") };
-      const state = { lo: min, hi: max };
-      const clamp = (v) => Math.min(max, Math.max(min, Math.round(v / step) * step));
+      const track = root.querySelector(".range-track");
+      const fill = root.querySelector(".range-fill");
+      const readout = root.querySelector(".range-value");
+      const names = single ? ["v"] : ["lo", "hi"];
+      const thumbs = Object.fromEntries(names.map((n) => [n, root.querySelector("." + n)]));
+      const state = single ? { v: min } : { lo: min, hi: max };
+
+      const snap = (raw) => {
+        const v = Math.min(max, Math.max(min, raw));
+        if (!values) return Math.round(v / step) * step;
+        return values.reduce((best, c) => (Math.abs(c - v) < Math.abs(best - v) ? c : best), values[0]);
+      };
       const pct = (v) => ((v - min) / (max - min)) * 100;
 
       function paint() {
-        thumbs.lo.style.left = `${pct(state.lo)}%`;
-        thumbs.hi.style.left = `${pct(state.hi)}%`;
-        fill.style.left = `${pct(state.lo)}%`;
-        fill.style.width = `${pct(state.hi) - pct(state.lo)}%`;
-        value.textContent = `${format(state.lo)} – ${format(state.hi)}`;
+        for (const n of names) thumbs[n].style.left = `${pct(state[n])}%`;
+        fill.style.left = single ? "0%" : `${pct(state.lo)}%`;
+        fill.style.width = single ? `${pct(state.v)}%` : `${pct(state.hi) - pct(state.lo)}%`;
+        if (readout) readout.textContent = single ? format(state.v) : `${format(state.lo)} – ${format(state.hi)}`;
       }
-      function set(which, raw) {
-        const v = clamp(raw);
-        // Thumbs may meet but never cross, so the band is always readable.
-        state[which] = which === "lo" ? Math.min(v, state.hi) : Math.max(v, state.lo);
+      function set(which, raw, notify = true) {
+        const v = snap(raw);
+        // Thumbs may meet but never cross, so the band stays readable.
+        state[which] = single ? v : which === "lo" ? Math.min(v, state.hi) : Math.max(v, state.lo);
         paint();
+        if (notify && onChange) onChange(single ? state.v : { lo: state.lo, hi: state.hi });
       }
-      function fromEvent(event) {
+      const valueAt = (event) => {
         const box = track.getBoundingClientRect();
         return min + ((event.clientX - box.left) / box.width) * (max - min);
-      }
-      for (const which of ["lo", "hi"]) {
-        thumbs[which].addEventListener("pointerdown", (e) => {
+      };
+      for (const n of names) {
+        thumbs[n].addEventListener("pointerdown", (e) => {
           e.preventDefault();
-          thumbs[which].setPointerCapture(e.pointerId);
-          const move = (ev) => set(which, fromEvent(ev));
-          const up = () => {
-            thumbs[which].removeEventListener("pointermove", move);
-            thumbs[which].removeEventListener("pointerup", up);
-          };
-          thumbs[which].addEventListener("pointermove", move);
-          thumbs[which].addEventListener("pointerup", up);
+          thumbs[n].setPointerCapture(e.pointerId);
+          const move = (ev) => set(n, valueAt(ev));
+          const up = () => { thumbs[n].removeEventListener("pointermove", move); thumbs[n].removeEventListener("pointerup", up); };
+          thumbs[n].addEventListener("pointermove", move);
+          thumbs[n].addEventListener("pointerup", up);
         });
-        thumbs[which].addEventListener("keydown", (e) => {
-          const delta = { ArrowLeft: -step, ArrowRight: step, ArrowDown: -step, ArrowUp: step }[e.key];
-          if (delta === undefined) return;
+        thumbs[n].addEventListener("keydown", (e) => {
+          const dir = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[e.key];
+          if (!dir) return;
           e.preventDefault();
-          set(which, state[which] + delta);
+          if (values) {
+            const i = values.indexOf(state[n]);
+            set(n, values[Math.min(values.length - 1, Math.max(0, (i < 0 ? 0 : i) + dir))]);
+          } else set(n, state[n] + dir * step);
         });
       }
-      // Clicking the track moves whichever thumb is nearer.
       track.addEventListener("pointerdown", (e) => {
         if (e.target !== track && e.target !== fill) return;
-        const v = fromEvent(e);
-        set(Math.abs(v - state.lo) <= Math.abs(v - state.hi) ? "lo" : "hi", v);
+        const v = valueAt(e);
+        set(single ? "v" : Math.abs(v - state.lo) <= Math.abs(v - state.hi) ? "lo" : "hi", v);
       });
+
+      // Tick marks, with labels on as many as fit without crowding.
+      function drawTicks(at) {
+        const host = root.querySelector(".range-ticks");
+        if (!host) return;
+        host.textContent = "";
+        const every = Math.ceil(at.length / 6);
+        at.forEach((v, i) => {
+          const mark = document.createElement("i");
+          mark.style.left = `${pct(v)}%`;
+          host.appendChild(mark);
+          if (i % every && i !== at.length - 1) return;
+          const label = document.createElement("span");
+          label.style.left = `${pct(v)}%`;
+          label.textContent = format(v);
+          host.appendChild(label);
+        });
+      }
+      if (ticks || values) drawTicks(ticks || values);
+
       return {
-        get: () => ({ lo: +state.lo.toFixed(4), hi: +state.hi.toFixed(4) }),
-        set: (lo, hi) => { state.lo = clamp(lo); state.hi = clamp(hi); paint(); },
+        get: () => (single ? state.v : { lo: +state.lo.toFixed(4), hi: +state.hi.toFixed(4) }),
+        set: (a, b) => { if (single) state.v = snap(a); else { state.lo = snap(a); state.hi = snap(b); } paint(); },
+        setScale: (newMax, newValues) => {
+          max = newMax;
+          if (newValues) values = newValues;
+          drawTicks(newValues || ticks || values);
+          paint();
+        },
       };
     }
 
-    const confBand = dualRange("dual-conf", { min: 0, max: 1, step: 0.05, format: (v) => v.toFixed(2) });
-    const sizeBand = dualRange("dual-size", { min: 0, max: 1, step: 0.01, format: (v) => v.toFixed(2) });
+    const pctFmt = (v) => v.toFixed(2);
+    const confBand = rangeControl("dual-conf", { min: 0, max: 1, step: 0.05, format: pctFmt,
+      ticks: [0, 0.25, 0.5, 0.75, 1] });
+    const sizeBand = rangeControl("dual-size", { min: 0, max: 1, step: 0.01, format: pctFmt,
+      ticks: [0, 0.25, 0.5, 0.75, 1] });
+    const iouSlider = rangeControl("opt-iou", { min: 0.5, max: 1, step: 0.01, single: true, format: pctFmt,
+      ticks: [0.5, 0.6, 0.7, 0.8, 0.9, 1] });
+    const cameraLevel = rangeControl("opt-camlevel", { min: 0, max: 6, single: true, format: String,
+      values: [0, 1, 2, 3, 4, 5, 6] });
+    const occurrence = rangeControl("occ-range", { min: 2, max: 250, single: true, format: String,
+      values: OCCURRENCE_STEPS, onChange: (v) => setThresholdFromUi(v) });
 
     function showTuning() {
-      const largest = state.allGroups.reduce((m, g) => Math.max(m, g.media_count), MIN_THRESHOLD);
-      const range = $("occ-range");
-      range.max = String(Math.max(largest, MIN_THRESHOLD));
-      range.min = String(MIN_THRESHOLD);
-      range.value = String(state.threshold);
-      $("occ-number").value = String(state.threshold);
-      for (const [id, key] of OPT_FIELDS) $(id).value = String(state.options[key]);
+      const steps = occurrenceSteps();
+      occurrence.setScale(steps[steps.length - 1], steps);
+      occurrence.set(state.threshold);
+      iouSlider.set(state.options.iou_threshold);
+      cameraLevel.set(state.options.n_dir_levels_from_leaf);
       confBand.set(state.options.confidence_min, state.options.confidence_max);
       sizeBand.set(state.options.min_suspicious_size, state.options.max_suspicious_size);
       $("opt-agnostic").checked = !!state.options.category_agnostic;
@@ -925,7 +978,7 @@
         fill.style.width = `${Math.max(2, Math.round(100 * row.candidates / most))}%`;
         bar.appendChild(fill);
         tr.title = "Put this value in the IoU box (then Apply)";
-        tr.addEventListener("click", () => { $("opt-iou").value = String(row.iou); });
+        tr.addEventListener("click", () => iouSlider.set(row.iou));
         body.appendChild(tr);
       }
       table.appendChild(body);
@@ -980,13 +1033,9 @@
 
     function setThresholdFromUi(value) {
       tuning.setThreshold(value);
-      $("occ-range").value = String(state.threshold);
-      $("occ-number").value = String(state.threshold);
+      occurrence.set(state.threshold);
       renderTuning();
     }
-
-    $("occ-range").addEventListener("input", (e) => setThresholdFromUi(Number(e.target.value)));
-    $("occ-number").addEventListener("change", (e) => setThresholdFromUi(Number(e.target.value)));
     // IoU is the one parameter whose effect cannot be derived, so it is measured
     // on request: five real re-clusters, current value included and highlighted.
     $("iou-compute").addEventListener("click", async () => {
@@ -1011,16 +1060,13 @@
     // reset cannot drift apart.
     function pendingOptions() {
       const conf = confBand.get(), size = sizeBand.get();
-      const patch = {
+      return {
         category_agnostic: $("opt-agnostic").checked,
         confidence_min: conf.lo, confidence_max: conf.hi,
         min_suspicious_size: size.lo, max_suspicious_size: size.hi,
+        iou_threshold: iouSlider.get(),
+        n_dir_levels_from_leaf: cameraLevel.get(),
       };
-      for (const [id, key, parse] of OPT_FIELDS) {
-        const value = parse($(id).value);
-        if (Number.isFinite(value)) patch[key] = value;
-      }
-      return patch;
     }
 
     function showPreviewButtons(previewing) {
@@ -1065,8 +1111,8 @@
     $("tune-reset").addEventListener("click", () => {
       confBand.set(DEFAULT_OPTIONS.confidence_min, DEFAULT_OPTIONS.confidence_max);
       sizeBand.set(DEFAULT_OPTIONS.min_suspicious_size, DEFAULT_OPTIONS.max_suspicious_size);
-      $("opt-iou").value = String(DEFAULT_OPTIONS.iou_threshold);
-      $("opt-camlevel").value = String(DEFAULT_OPTIONS.n_dir_levels_from_leaf);
+      iouSlider.set(DEFAULT_OPTIONS.iou_threshold);
+      cameraLevel.set(DEFAULT_OPTIONS.n_dir_levels_from_leaf);
       $("opt-agnostic").checked = !!DEFAULT_OPTIONS.category_agnostic;
       setThresholdFromUi(DEFAULT_OPTIONS.occurrence_threshold);
       $("tune-impact").textContent = "Controls reset to defaults — preview to apply them.";
