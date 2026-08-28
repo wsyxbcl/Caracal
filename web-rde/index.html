@@ -84,6 +84,10 @@
     .tune-head .mini { margin-left: auto; }
     .tune-body { display: flex; gap: 28px; margin-top: 12px; flex-wrap: wrap; }
     .tune-body[hidden] { display: none; }
+    .tune-foot { display: flex; align-items: center; gap: 10px; margin-top: 14px;
+      padding-top: 12px; border-top: 1px solid var(--line); }
+    .tune-foot[hidden] { display: none; }
+    .tune-foot .hint { flex: 1; }
     .tune-col { flex: 1 1 320px; min-width: 280px; }
     .tune-label { display: block; color: var(--muted); font-size: 0.8rem; margin-bottom: 6px; }
     .tune-row { display: flex; align-items: center; gap: 10px; }
@@ -110,7 +114,9 @@
     .tune-grid label { display: flex; align-items: center; justify-content: space-between; gap: 8px;
       font-size: 0.82rem; color: var(--muted); }
     .tune-check { grid-column: 1 / -1; justify-content: flex-start !important; }
-    .ladder { width: 100%; border-collapse: collapse; margin: 10px 0 4px; font-size: 0.82rem; }
+    /* Five rows then scroll, so a long ladder cannot push the actions off screen. */
+    .ladder-wrap { max-height: 112px; overflow-y: auto; margin: 10px 0 4px; }
+    .ladder { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
     .ladder td { padding: 2px 6px 2px 0; color: var(--muted); white-space: nowrap; }
     .ladder td.n { text-align: right; font-variant-numeric: tabular-nums; }
     .ladder tr { cursor: pointer; }
@@ -166,7 +172,9 @@
         <div class="metric"><b id="m-images">–</b><span>media</span></div>
         <div class="metric"><b id="m-dets">–</b><span>detections</span></div>
         <div class="metric"><b id="m-groups">–</b><span>candidate groups</span></div>
+        <div class="metric"><b id="m-candidates">–</b><span>candidates</span></div>
         <div class="metric"><b id="m-matched">–</b><span>media matched</span></div>
+        <div class="metric"><b id="m-reviewed">–</b><span>reviewed</span></div>
       </div>
       <p class="hint" id="decode-progress"></p>
       <p id="error"></p>
@@ -175,7 +183,7 @@
     <div class="card tune" id="tune" hidden>
       <div class="tune-head">
         <h2>Tune candidates</h2>
-        <span class="hint" id="tune-summary"></span>
+        <span class="hint" id="tune-note">Changes are previewed before they touch the review.</span>
         <button class="mini" id="tune-collapse">hide</button>
       </div>
       <div class="tune-body" id="tune-body">
@@ -185,8 +193,8 @@
             <input type="range" id="occ-range" min="2" max="100" step="1" />
             <input type="number" id="occ-number" min="2" step="1" />
           </div>
-          <table class="ladder"><tbody id="ladder"></tbody></table>
-          <p class="hint">Instant — clustering does not depend on this.</p>
+          <div class="ladder-wrap"><table class="ladder"><tbody id="ladder"></tbody></table></div>
+          <p class="hint">Applies immediately — clustering does not depend on it.</p>
         </div>
         <div class="tune-col">
           <label class="tune-label">Clustering — decides which detections are candidates at all</label>
@@ -204,16 +212,21 @@
           </div>
           <div class="tune-grid">
             <label>same-box IoU ≥<input type="number" id="opt-iou" step="0.01" min="0" max="1" /></label>
-            <label class="tune-check"><input type="checkbox" id="opt-agnostic" /> ignore category</label>
+            <label>camera = folder level<input type="number" id="opt-camlevel" step="1" min="0" max="6" /></label>
           </div>
-          <div class="tune-row">
-            <button class="mini primary" id="tune-apply">Apply &amp; re-cluster</button>
-            <span class="hint" id="tune-impact"></span>
-          </div>
+          <label class="tune-check"><input type="checkbox" id="opt-agnostic" /> ignore category</label>
+          <p class="hint">Off, a box only ever groups with boxes of the same class. On, an animal and a vehicle box in the same spot can share a group — useful when the detector is inconsistent about what a static object is.</p>
           <p class="hint" id="tune-cameras"></p>
           <button class="mini" id="iou-compute">Compute IoU sensitivity</button>
-          <div id="iou-table"></div>
+          <div class="ladder-wrap" id="iou-table"></div>
         </div>
+      </div>
+      <div class="tune-foot">
+        <span class="hint" id="tune-impact"></span>
+        <button class="mini" id="tune-reset">Reset to defaults</button>
+        <button class="mini primary" id="tune-preview">Preview changes</button>
+        <button class="mini primary" id="tune-confirm" hidden>Apply to review</button>
+        <button class="mini" id="tune-discard" hidden>Discard</button>
       </div>
     </div>
 
@@ -253,7 +266,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-28a";
+    const BUILD = "2026-08-28b";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -473,6 +486,7 @@
       groups: [],                      // allGroups filtered to state.threshold — what is reviewed
       threshold: 20,                   // occurrence_threshold, applied client-side
       decisions: new Map(),            // "img:det" -> { decision, at, round } — durable, authoritative
+      preview: null,                   // a clustering proposed but not yet applied
       round: 1,                        // parameterization round, provenance only
       rounds: [],                      // history of parameterizations, for statistics
       imageFiles: null,                // image_index -> json `file` path (also the FSA lookup key)
@@ -509,6 +523,7 @@
         const loaded = await call("load", { bytes: buffer }, [buffer]);
         console.log(`[rde] parse: ${Math.round(performance.now() - tParse)} ms (${loaded.imageCount} media, ${loaded.totalDetections} detections)`);
         state.options = JSON.parse(loaded.defaultOptions);
+        DEFAULT_OPTIONS = JSON.parse(loaded.defaultOptions);
         const thresholdOverride = Number(new URLSearchParams(location.search).get("threshold"));
         state.threshold = thresholdOverride >= MIN_THRESHOLD
           ? thresholdOverride
@@ -521,10 +536,10 @@
 
         $("m-images").textContent = loaded.imageCount.toLocaleString();
         $("m-dets").textContent = loaded.totalDetections.toLocaleString();
-        $("m-groups").textContent = state.groups.length.toLocaleString();
         $("m-matched").textContent = "0";
         $("metrics").hidden = false;
         showTuning();
+        renderStats();
         $("folder-fsa").classList.remove("disabled");
         $("folder-fsa").disabled = false;
         status.textContent = `Loaded ${file.name}. ${state.groups.length.toLocaleString()} candidate group(s). Load the image folder to review crops.`;
@@ -542,6 +557,7 @@
     // reviewer can scrub it with no recompute, and only the parameters that
     // decide which detections enter clustering cost a re-run.
     const MIN_THRESHOLD = 2;
+    let DEFAULT_OPTIONS = null; // as the wasm reports them, for "reset"
 
     async function recluster() {
       const options = { ...state.options, occurrence_threshold: MIN_THRESHOLD };
@@ -661,30 +677,61 @@
         return tuning.totals();
       },
 
-      // Change a clustering parameter and re-run. Returns before/after totals plus
-      // what carried over, so the caller can say whether the round was cumulative
-      // rather than a fresh start.
-      async applyOptions(patch) {
+      // Cluster with the proposed parameters and report what they would cost,
+      // WITHOUT touching the review. Rebuilding the review is what makes a
+      // parameter change expensive — it re-renders and re-decodes crops — and none
+      // of that is needed to answer "is this setting sensible?".
+      async previewOptions(patch) {
+        const proposed = { ...state.options, ...patch };
         const before = thresholdTotals(state.threshold);
-        const wasCandidate = new Set();
-        for (const g of state.groups) for (const i of g.instances) wasCandidate.add(detKey(i.det_ref));
+        status.textContent = "Clustering with the proposed parameters…";
+        const options = JSON.stringify({ ...proposed, occurrence_threshold: MIN_THRESHOLD });
+        const groups = JSON.parse((await call("find", { options })).groups);
 
-        Object.assign(state.options, patch);
+        const kept = groups.filter((g) => g.media_count >= state.threshold);
+        const media = new Set(), cameras = new Set(), nowCandidate = new Set();
+        let instances = 0, inherited = 0;
+        for (const g of kept) {
+          instances += g.instances.length;
+          cameras.add(g.camera);
+          for (const i of g.instances) {
+            media.add(i.det_ref.image_index);
+            nowCandidate.add(detKey(i.det_ref));
+            if (state.decisions.has(detKey(i.det_ref))) inherited++;
+          }
+        }
+        let dropped = 0;
+        for (const g of state.groups) {
+          for (const i of g.instances) if (!nowCandidate.has(detKey(i.det_ref))) dropped++;
+        }
+        state.preview = { options: proposed, groups };
+        status.textContent = "Previewing — apply it to the review, or discard.";
+        return {
+          before,
+          after: { groups: kept.length, instances, media: media.size, cameras: cameras.size },
+          inherited, needsReview: instances - inherited, dropped,
+        };
+      },
+
+      // Commit the previewed clustering. Only now does the review rebuild.
+      applyPreview() {
+        if (!state.preview) return null;
+        state.options = state.preview.options;
+        state.allGroups = state.preview.groups;
+        state.preview = null;
         state.round++;
         state.rounds.push({ round: state.round, at: Date.now(), ...state.options, occurrence_threshold: state.threshold });
-        status.textContent = "Re-clustering…";
-        await recluster();
-
-        const after = thresholdTotals(state.threshold);
+        applyThreshold();
         const progress = reviewProgress();
-        let dropped = 0;
-        const nowCandidate = new Set();
-        for (const g of state.groups) for (const i of g.instances) nowCandidate.add(detKey(i.det_ref));
-        for (const key of wasCandidate) if (!nowCandidate.has(key)) dropped++;
-
+        const after = thresholdTotals(state.threshold);
         resumeReview(`${after.groups.toLocaleString()} candidate group(s) · ` +
           `${progress.decided.toLocaleString()} inherited, ${progress.pending.toLocaleString()} need review.`);
-        return { before, after, inherited: progress.decided, needsReview: progress.pending, dropped };
+        return after;
+      },
+
+      discardPreview() {
+        state.preview = null;
+        status.textContent = "";
       },
     };
     window.__rdeTune = tuning; // also the console handle for tuning without the UI
@@ -693,7 +740,10 @@
     // Built around impact rather than around the controls: the question a reviewer
     // is actually asking is "how much work does this setting create, and am I
     // starting to sweep up detections I would rather look at?".
-    const OPT_FIELDS = [["opt-iou", "iou_threshold", parseFloat]];
+    const OPT_FIELDS = [
+      ["opt-iou", "iou_threshold", parseFloat],
+      ["opt-camlevel", "n_dir_levels_from_leaf", (v) => parseInt(v, 10)],
+    ];
 
     // A band is one thing, so it gets one control: two thumbs on a single track,
     // showing the span rather than asking anyone to hold two numbers in their head.
@@ -853,19 +903,23 @@
 
     // Cheap enough to run on every decision — the ladder below is not, so it is
     // rebuilt only when the candidate set actually changes.
-    function renderTuneSummary() {
-      if ($("tune").hidden) return;
+    // Every count the reviewer sees, in one place. The tuning panel used to carry
+    // a second, differently-worded copy of the same numbers.
+    function renderStats() {
+      if (!state.allGroups.length && !state.groups.length) return;
       const now = tuning.totals();
       const p = reviewProgress();
-      $("tune-summary").textContent =
-        `${now.groups.toLocaleString()} groups · ${now.instances.toLocaleString()} candidates · ` +
-        `${now.media.toLocaleString()} media · ${now.cameras.toLocaleString()} camera${now.cameras === 1 ? "" : "s"}` +
-        `  —  reviewed ${p.decided.toLocaleString()}, needs review ${p.pending.toLocaleString()}` +
-        ` (${p.reviewed} ● ${p.partial} ◐ ${p.unreviewed} ○)`;
+      $("m-groups").textContent = now.groups.toLocaleString();
+      $("m-candidates").textContent = now.instances.toLocaleString();
+      $("m-reviewed").textContent = p.decided + p.pending
+        ? `${p.decided.toLocaleString()}/${(p.decided + p.pending).toLocaleString()}`
+        : "–";
+      $("m-reviewed").title = `${p.reviewed} groups done · ${p.partial} partial · ${p.unreviewed} untouched`;
+      updateMatchedMetric();
     }
 
     function renderTuning() {
-      renderTuneSummary();
+      renderStats();
       renderIouSensitivity(); // no-op until computed; re-reads at the current threshold
       const rows = tuning.curve();
       const most = rows.reduce((m, r) => Math.max(m, r.instances), 1);
@@ -892,7 +946,6 @@
       $("occ-range").value = String(state.threshold);
       $("occ-number").value = String(state.threshold);
       renderTuning();
-      $("m-groups").textContent = state.groups.length.toLocaleString();
     }
 
     $("occ-range").addEventListener("input", (e) => setThresholdFromUi(Number(e.target.value)));
@@ -918,7 +971,9 @@
       body.hidden = !body.hidden;
       $("tune-collapse").textContent = body.hidden ? "tune" : "hide";
     });
-    $("tune-apply").addEventListener("click", async () => {
+    // What the controls currently say. Read in one place so preview, apply and
+    // reset cannot drift apart.
+    function pendingOptions() {
       const conf = confBand.get(), size = sizeBand.get();
       const patch = {
         category_agnostic: $("opt-agnostic").checked,
@@ -929,21 +984,56 @@
         const value = parse($(id).value);
         if (Number.isFinite(value)) patch[key] = value;
       }
-      $("tune-apply").disabled = true;
+      return patch;
+    }
+
+    function showPreviewButtons(previewing) {
+      $("tune-preview").hidden = previewing;
+      $("tune-confirm").hidden = !previewing;
+      $("tune-discard").hidden = !previewing;
+    }
+
+    $("tune-preview").addEventListener("click", async () => {
+      $("tune-preview").disabled = true;
       try {
-        const r = await tuning.applyOptions(patch);
+        const r = await tuning.previewOptions(pendingOptions());
         const delta = (a, b) => (b === a ? "unchanged" : `${a.toLocaleString()} → ${b.toLocaleString()}`);
         $("tune-impact").textContent =
-          `groups ${delta(r.before.groups, r.after.groups)} · candidates ${delta(r.before.instances, r.after.instances)}` +
-          ` · ${r.inherited.toLocaleString()} decisions inherited, ${r.needsReview.toLocaleString()} need review` +
+          `Preview · groups ${delta(r.before.groups, r.after.groups)} · candidates ${delta(r.before.instances, r.after.instances)}` +
+          ` · ${r.inherited.toLocaleString()} decisions would carry over, ${r.needsReview.toLocaleString()} would need review` +
           (r.dropped ? ` · ${r.dropped.toLocaleString()} no longer candidates` : "");
-        renderTuning();
-        $("m-groups").textContent = state.groups.length.toLocaleString();
+        showPreviewButtons(true);
       } catch (err) {
         showError(err);
       } finally {
-        $("tune-apply").disabled = false;
+        $("tune-preview").disabled = false;
       }
+    });
+
+    $("tune-confirm").addEventListener("click", () => {
+      tuning.applyPreview();
+      showPreviewButtons(false);
+      $("tune-impact").textContent = "";
+      renderTuning();
+      renderStats();
+      collapseTuning(); // tuning is settled; give the room back to the crops
+    });
+
+    $("tune-discard").addEventListener("click", () => {
+      tuning.discardPreview();
+      showPreviewButtons(false);
+      $("tune-impact").textContent = "";
+      showTuning(); // put the controls back to what is actually in effect
+    });
+
+    $("tune-reset").addEventListener("click", () => {
+      confBand.set(DEFAULT_OPTIONS.confidence_min, DEFAULT_OPTIONS.confidence_max);
+      sizeBand.set(DEFAULT_OPTIONS.min_suspicious_size, DEFAULT_OPTIONS.max_suspicious_size);
+      $("opt-iou").value = String(DEFAULT_OPTIONS.iou_threshold);
+      $("opt-camlevel").value = String(DEFAULT_OPTIONS.n_dir_levels_from_leaf);
+      $("opt-agnostic").checked = !!DEFAULT_OPTIONS.category_agnostic;
+      setThresholdFromUi(DEFAULT_OPTIONS.occurrence_threshold);
+      $("tune-impact").textContent = "Controls reset to defaults — preview to apply them.";
     });
 
     // Re-enter at the first group that still needs attention.
@@ -1807,7 +1897,7 @@
         : "No document loaded.";
       $("export-btn").disabled = !state.fileName;
       $("session-save").disabled = !state.fileName;
-      renderTuneSummary();   // review progress moves with every decision
+      renderStats();         // review progress moves with every decision
       refreshGroupHeader();
     }
     $("export-btn").addEventListener("click", async () => {
@@ -1935,6 +2025,7 @@
       state.decisions.clear();
       state.round = 1;
       state.rounds = [];
+      state.preview = null;
       state.fileByImageIndex.clear();
       state.frameRateByImageIndex.clear();
       state.folderLoaded = false;
