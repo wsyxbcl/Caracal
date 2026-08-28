@@ -28,6 +28,18 @@
     .file.disabled, .file:disabled { opacity: 0.4; pointer-events: none; }
     label.file input { display: none; }
     .metrics { display: flex; gap: 22px; margin-top: 14px; flex-wrap: wrap; }
+    /* Which folder is a camera is a property of the dataset, settled once — so it
+       sits with loading, not with the parameters you keep revisiting. */
+    .camera-setup { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    .camera-setup > label { font-size: 0.82rem; font-weight: 600; }
+    .camera-setup[hidden] { display: none; }
+    .camera-setup .warn { color: var(--accent); font-weight: 600; }
+    #camera-all { font-size: 0.8rem; color: var(--muted); }
+    #camera-all summary { cursor: pointer; }
+    #camera-list { max-height: 130px; overflow-y: auto; margin-top: 6px; padding-right: 6px;
+      columns: 3; font-size: 0.76rem; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+    .camera-setup select { font: inherit; font-size: 0.82rem; padding: 3px 6px; max-width: 220px;
+      border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
     /* The card had a large empty right half; put the current parameters there and
        make the whole block the way in to tuning. */
     .loadcard { display: flex; gap: 24px; align-items: stretch; }
@@ -154,10 +166,12 @@
     .range-ticks span { position: absolute; top: 0; transform: translateX(-50%);
       font-size: 0.68rem; color: var(--muted); white-space: nowrap; }
 
-    /* Five rows then scroll, so a long ladder cannot push the actions off screen. */
+    /* The IoU table is computed on demand and can run long, so it scrolls after
+       five rows. The occurrence ladder is short and fixed — it shows in full. */
     .ladder-wrap { max-height: 112px; overflow-y: auto; margin: 10px 0 4px;
       scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
-    .ladder { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .ladder { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin: 10px 0 4px; }
+    .ladder-wrap .ladder { margin: 0; } /* the wrapper already carries the spacing */
     .ladder td { padding: 2px 6px 2px 0; color: var(--muted); white-space: nowrap; }
     .ladder td.n { text-align: right; font-variant-numeric: tabular-nums; }
     .ladder tr { cursor: pointer; }
@@ -222,11 +236,17 @@
         <div class="metric"><b id="m-matched">–</b><span>media matched</span></div>
         <div class="metric"><b id="m-reviewed">–</b><span>reviewed</span></div>
       </div>
+      <div class="camera-setup" id="camera-setup" hidden>
+        <label for="opt-camlevel">Camera folder</label>
+        <select id="opt-camlevel"></select>
+        <span class="hint" id="camera-summary"></span>
+        <details id="camera-all"><summary>show all</summary><div id="camera-list"></div></details>
+      </div>
       <p class="hint" id="decode-progress"></p>
       <p id="error"></p>
       </div>
-      <button class="params" id="tune-open" hidden>
-        <span class="params-head">Parameters<span class="params-edit">Tune ▸</span></span>
+      <button class="params" id="tune-open" hidden aria-expanded="false">
+        <span class="params-head">Parameters<span class="params-edit"></span></span>
         <dl id="params-list"></dl>
       </button>
     </div>
@@ -248,7 +268,7 @@
             <div class="range-ticks"></div>
           </div>
           <p class="field-desc">Instant: clustering does not depend on it.</p>
-          <div class="ladder-wrap"><table class="ladder"><tbody id="ladder"></tbody></table></div>
+          <table class="ladder"><tbody id="ladder"></tbody></table>
         </div>
 
         <div class="tune-col">
@@ -281,12 +301,6 @@
             <div class="range-ticks"></div>
             <button class="mini" id="iou-compute">Compute IoU sensitivity</button>
             <div class="ladder-wrap" id="iou-table"></div>
-          </div>
-
-          <div class="field">
-            <div class="field-head"><label for="opt-camlevel">Camera folder</label>
-              <select id="opt-camlevel"></select></div>
-            <p class="field-desc" id="tune-cameras">Which folder names one camera. Boxes are only compared within a camera.</p>
           </div>
 
           <div class="field">
@@ -342,7 +356,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-28o";
+    const BUILD = "2026-08-28p";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -615,7 +629,12 @@
         $("m-matched").textContent = "0";
         $("metrics").hidden = false;
         $("tune-open").hidden = false;
-        showTuning();
+        // Camera folder is dataset setup, not tuning: it is decided here, once,
+        // against the real folder names. The tuning panel stays shut — the
+        // parameter list in this card is the way in when someone wants it.
+        fillCameraLevels();
+        syncTuningControls();
+        syncTuneToggle();
         renderStats();
         $("folder-fsa").classList.remove("disabled");
         $("folder-fsa").disabled = false;
@@ -922,7 +941,7 @@
     }
 
     const pctFmt = (v) => v.toFixed(2);
-    const confBand = rangeControl("dual-conf", { min: 0, max: 1, step: 0.05, format: pctFmt,
+    const confBand = rangeControl("dual-conf", { min: 0, max: 1, step: 0.01, format: pctFmt,
       ticks: [0, 0.25, 0.5, 0.75, 1] });
     const sizeBand = rangeControl("dual-size", { min: 0, max: 1, step: 0.01, format: pctFmt,
       ticks: [0, 0.25, 0.5, 0.75, 1] });
@@ -930,6 +949,49 @@
       ticks: [0.5, 0.6, 0.7, 0.8, 0.9, 1] });
     const occurrence = rangeControl("occ-range", { min: 2, max: 250, single: true, format: String,
       values: OCCURRENCE_STEPS, onChange: (v) => setThresholdFromUi(v) });
+
+    // Cameras for a candidate level, straight from the paths — no clustering
+    // needed, so the consequence of a choice is visible before committing to it.
+    function camerasAtLevel(level) {
+      const counts = new Map();
+      for (const path of state.imageFiles || []) {
+        const parts = String(path).split(/[\\/]/).filter(Boolean);
+        const name = parts[parts.length - 2 - level];
+        if (name) counts.set(name, (counts.get(name) || 0) + 1);
+      }
+      return counts;
+    }
+
+    // The two ways this goes wrong are silent: one camera means boxes from
+    // different sites get compared, and one camera per file means nothing can
+    // ever recur. Both look like a working setting until the results are wrong.
+    function renderCameraCheck() {
+      const level = Number($("opt-camlevel").value) || 0;
+      const counts = camerasAtLevel(level);
+      const names = [...counts.keys()].sort();
+      const media = (state.imageFiles || []).length;
+      const sizes = [...counts.values()].sort((a, b) => a - b);
+      const summary = $("camera-summary");
+      let note = `${names.length.toLocaleString()} camera(s)`;
+      if (sizes.length) note += ` · median ${sizes[sizes.length >> 1].toLocaleString()} media each`;
+      summary.textContent = note;
+      summary.classList.remove("warn");
+      if (names.length <= 1 && media > 1) {
+        summary.textContent = `${note} — every file counts as one camera, so boxes from different sites will be compared`;
+        summary.classList.add("warn");
+      } else if (media && names.length > media * 0.5) {
+        summary.textContent = `${note} — almost one camera per file, so nothing can recur`;
+        summary.classList.add("warn");
+      }
+      const list = $("camera-list");
+      list.textContent = "";
+      for (const name of names) {
+        const row = document.createElement("div");
+        row.textContent = `${name} · ${counts.get(name).toLocaleString()}`;
+        list.appendChild(row);
+      }
+      $("camera-all").hidden = names.length <= 1;
+    }
 
     // Offer the real folder names rather than a depth number: "which of these is
     // the camera?" is a question about this dataset, and the answer is legible
@@ -950,22 +1012,34 @@
       }
       select.value = String(state.options.n_dir_levels_from_leaf);
       if (!select.value) select.value = "0";
+      $("camera-setup").hidden = false;
+      renderCameraCheck();
     }
 
-    function showTuning() {
+    // Keep the block's affordance honest about what pressing it will do.
+    function syncTuneToggle() {
+      const open = !$("tune").hidden;
+      $("tune-open").setAttribute("aria-expanded", String(open));
+      const edit = document.querySelector(".params-edit");
+      if (edit) edit.textContent = open ? "Close ▴" : "Tune ▸";
+    }
+
+    // The controls always mirror the options actually in effect, whether or not
+    // anyone is looking at them — so opening the panel never shows stale values.
+    function syncTuningControls() {
       const steps = occurrenceSteps();
       occurrence.setScale(steps[steps.length - 1], steps);
       occurrence.set(state.threshold);
       iouSlider.set(state.options.iou_threshold);
       confBand.set(state.options.confidence_min, state.options.confidence_max);
       sizeBand.set(state.options.min_suspicious_size, state.options.max_suspicious_size);
-      fillCameraLevels();
       $("opt-agnostic").checked = !!state.options.category_agnostic;
-      const cameras = [...new Set(state.allGroups.map((g) => g.camera))];
-      $("tune-cameras").textContent = cameras.length
-        ? `${cameras.length} camera(s): ${cameras.slice(0, 2).join(", ")}${cameras.length > 2 ? "…" : ""}`
-        : "Which folder names one camera. Boxes are only compared within a camera.";
+    }
+
+    function showTuning() {
+      syncTuningControls();
       $("tune").hidden = false;
+      syncTuneToggle();
       renderTuning();
     }
 
@@ -1140,11 +1214,26 @@
     // over the tiles is still in the way.
     function collapseTuning() {
       $("tune").hidden = true;
+      syncTuneToggle();
     }
 
     $("tune-collapse").addEventListener("click", collapseTuning);
+    $("opt-camlevel").addEventListener("change", async () => {
+      renderCameraCheck();
+      state.options.n_dir_levels_from_leaf = Number($("opt-camlevel").value) || 0;
+      status.textContent = "Re-clustering for the new camera folder…";
+      try {
+        await recluster();
+        resumeReview(`${state.groups.length.toLocaleString()} candidate group(s).`);
+        renderStats();
+        if (!$("tune").hidden) renderTuning();
+      } catch (err) { showError(err); }
+    });
+
+    // The same control opens and closes it: the block shows the parameters, so it
+    // is also the obvious place to press to stop looking at them.
     $("tune-open").addEventListener("click", () => {
-      $("tune").hidden = false;
+      if (!$("tune").hidden) { collapseTuning(); return; }
       showTuning();
     });
     // What the controls currently say. Read in one place so preview, apply and
@@ -2156,7 +2245,10 @@
 
       // Re-cluster only if the session was tuned differently from what is loaded.
       if (sameOptions) applyThreshold(); else await recluster();
-      showTuning();
+      fillCameraLevels();
+      syncTuningControls();
+      syncTuneToggle();
+      renderStats();
       resumeReview("");
       const progress = reviewProgress();
       status.textContent =
