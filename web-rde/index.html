@@ -142,6 +142,10 @@
     .exportbar button { font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; }
     .exportbar button:disabled { opacity: 0.4; cursor: default; }
     .exportbar .summary { color: var(--muted); font-size: 0.9rem; }
+    .exportbar .exportopt { color: var(--muted); font-size: 0.82rem; display: flex; align-items: center; gap: 5px; cursor: pointer; }
+    .file-mini { font: inherit; font-size: 0.82rem; border: 1px solid var(--line); background: #faf6ef; color: var(--ink);
+      border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+    .file-mini:hover { border-color: var(--muted); }
     .placeholder { color: var(--muted); font-size: 0.85rem; padding: 14px 0; }
   </style>
 </head>
@@ -225,6 +229,9 @@
 
   <div class="exportbar">
     <span class="summary" id="export-summary">No document loaded.</span>
+    <label class="exportopt" title="Candidates you never looked at are removed by default, as upstream RDE does. Untick to remove only what you judged."><input type="checkbox" id="export-unreviewed" checked /> include unreviewed</label>
+    <button class="mini" id="session-save" disabled>Save session</button>
+    <label class="mini file-mini">Load session<input id="session-input" type="file" accept=".json,application/json" hidden /></label>
     <button id="export-btn" disabled>Export filtered .json</button>
   </div>
 
@@ -246,7 +253,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-27s";
+    const BUILD = "2026-08-28a";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -1769,9 +1776,14 @@
     function removalRefs() {
       const refs = [];
       const seen = new Set();
+      // Upstream RDE removes every flagged detection unless it is rescued, so
+      // "include unreviewed" defaults on — but a half-finished review then removes
+      // candidates nobody looked at, which should be a choice, not a surprise.
+      const includeUnreviewed = $("export-unreviewed").checked;
       for (const g of state.groups) {
         for (const i of g.instances) {
           if (i.decision !== "Remove") continue;
+          if (!i.decided && !includeUnreviewed) continue;
           refs.push(i.det_ref);
           seen.add(detKey(i.det_ref));
         }
@@ -1788,9 +1800,13 @@
       const p = reviewProgress();
       $("export-summary").textContent = state.fileName
         ? `Will remove ${n.toLocaleString()} detection(s) from ${state.fileName}` +
-          (p.pending ? ` — ${p.pending.toLocaleString()} candidate(s) not yet reviewed.` : ".")
+          (p.pending
+            ? ` — ${p.pending.toLocaleString()} candidate(s) not yet reviewed` +
+              ($("export-unreviewed").checked ? ", included." : ", excluded.")
+            : ".")
         : "No document loaded.";
       $("export-btn").disabled = !state.fileName;
+      $("session-save").disabled = !state.fileName;
       renderTuneSummary();   // review progress moves with every decision
       refreshGroupHeader();
     }
@@ -1808,6 +1824,108 @@
         showError(err);
       }
     });
+
+    // ---- Review session ------------------------------------------------------
+    // SPEC §2.5/§6.1: the session file is just the set of DetRef + decision, so it
+    // round-trips against the same original document later. A review of 18,000
+    // candidates is hours of work that until now existed only in memory.
+    //
+    // Decisions are keyed by *index* into the document, so restoring them onto a
+    // different document would silently mislabel detections. The identity check
+    // below is the whole safety story — it refuses rather than guesses.
+    const SESSION_FORMAT = 1;
+
+    function documentIdentity() {
+      return {
+        name: state.fileName,
+        images: Number($("m-images").textContent.replace(/,/g, "")) || 0,
+        detections: Number($("m-dets").textContent.replace(/,/g, "")) || 0,
+      };
+    }
+
+    function sessionJson() {
+      const decisions = [];
+      for (const [key, value] of state.decisions) {
+        const [image_index, detection_index] = key.split(":").map(Number);
+        decisions.push({ image_index, detection_index, ...value });
+      }
+      return JSON.stringify({
+        tool: "caracal-rde",
+        format: SESSION_FORMAT,
+        saved_at: new Date().toISOString(),
+        document: documentIdentity(),
+        options: state.options,
+        threshold: state.threshold,
+        round: state.round,
+        rounds: state.rounds,
+        decisions,
+      }, null, 1);
+    }
+
+    async function loadSession(text) {
+      const session = JSON.parse(text);
+      if (session.tool !== "caracal-rde" || !Array.isArray(session.decisions)) {
+        throw new Error("not a Caracal RDE review session");
+      }
+      if (session.format > SESSION_FORMAT) {
+        throw new Error(`session was written by a newer version (format ${session.format})`);
+      }
+      if (!state.fileName) throw new Error("load the MegaDetector .json first, then the session");
+      const here = documentIdentity(), there = session.document || {};
+      // Counts are the cheap proxy for "same document"; the indices mean nothing
+      // without it, so a mismatch is refused outright rather than guessed at.
+      if (there.images !== here.images || there.detections !== here.detections) {
+        throw new Error(
+          `this session belongs to a different document — it has ${(there.images ?? 0).toLocaleString()} media / ` +
+          `${(there.detections ?? 0).toLocaleString()} detections, this one has ${here.images.toLocaleString()} / ` +
+          `${here.detections.toLocaleString()}`);
+      }
+
+      state.decisions = new Map(session.decisions.map((d) => [
+        d.image_index + ":" + d.detection_index,
+        { decision: d.decision === "Keep" ? "Keep" : "Remove", at: d.at, round: d.round },
+      ]));
+      state.rounds = session.rounds || [];
+      state.round = session.round || 1;
+      if (session.threshold >= MIN_THRESHOLD) state.threshold = session.threshold;
+      const sameOptions = JSON.stringify(session.options) === JSON.stringify(state.options);
+      if (session.options) state.options = { ...state.options, ...session.options };
+
+      // Re-cluster only if the session was tuned differently from what is loaded.
+      if (sameOptions) applyThreshold(); else await recluster();
+      showTuning();
+      resumeReview("");
+      const progress = reviewProgress();
+      status.textContent =
+        `Restored ${state.decisions.size.toLocaleString()} decision(s)` +
+        (there.name && there.name !== here.name ? ` saved from ${there.name}` : "") +
+        ` — ${progress.decided.toLocaleString()} of the current candidates are judged, ` +
+        `${progress.pending.toLocaleString()} still need review.`;
+    }
+
+    $("session-save").addEventListener("click", () => {
+      const blob = new Blob([sessionJson()], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = (state.fileName?.replace(/\.json$/i, "") || "rde") + "_session.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    $("session-input").addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      event.target.value = ""; // so the same file can be picked twice
+      if (!file) return;
+      try {
+        await loadSession(await file.text());
+        updateExportBar();
+      } catch (err) {
+        showError(err);
+      }
+    });
+
+    $("export-unreviewed").addEventListener("change", updateExportBar);
 
     // ---- Helpers -------------------------------------------------------------
     function resetForNewJson(name) {
