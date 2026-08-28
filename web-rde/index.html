@@ -129,21 +129,29 @@
     .tune input[type=number] { font: inherit; font-size: 0.85rem; width: 5.5em; padding: 3px 6px;
       border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
     /* One range component for every slider. Native <input type=range> cannot be
-       styled consistently across browsers and cannot show ticks, and mixing it
-       with a custom control looked like two different products. */
+       styled consistently across browsers and cannot show ticks at all.
+       Proportions follow cursor.com's slider: ticks are dots ON the track rather
+       than lines under it, and the thumb is filled with the accent and ringed in
+       the panel colour, which reads as a handle rather than an outline. */
     .range { margin: 2px 0 4px; }
-    .range-track { position: relative; height: 20px; touch-action: none; }
-    .range-track::before { content: ""; position: absolute; left: 0; right: 0; top: 8px; height: 4px;
-      background: var(--line); border-radius: 2px; }
-    .range-fill { position: absolute; top: 8px; height: 4px; background: var(--accent); border-radius: 2px; }
-    .range-thumb { position: absolute; top: 2px; width: 16px; height: 16px; margin-left: -8px; padding: 0;
-      border: 2px solid var(--accent); background: var(--card); border-radius: 50%; cursor: grab; }
-    .range-thumb:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+    .range-track { position: relative; height: 22px; touch-action: none; cursor: pointer;
+      -webkit-user-select: none; user-select: none; }
+    .range-track::before { content: ""; position: absolute; left: 0; right: 0; top: 50%;
+      transform: translateY(-50%); height: 6px; border-radius: 999px;
+      border: 1px solid var(--line); background: color-mix(in srgb, var(--line) 55%, transparent); }
+    .range-fill { position: absolute; top: 50%; transform: translateY(-50%); height: 6px;
+      background: var(--accent); border-radius: 999px; }
+    .range-mark { position: absolute; top: 50%; transform: translate(-50%, -50%);
+      width: 5px; height: 5px; border-radius: 999px; border: 1px solid var(--card);
+      background: var(--muted); opacity: 0.55; pointer-events: none; }
+    .range-thumb { position: absolute; top: 50%; transform: translate(-50%, -50%); padding: 0;
+      width: 15px; height: 15px; border-radius: 999px; border: 2px solid var(--card);
+      background: var(--accent); box-shadow: 0 1px 4px rgba(36, 32, 27, 0.22); cursor: grab; }
     .range-thumb:active { cursor: grabbing; }
-    /* Ticks say which values exist — on occurrence they are the only ones selectable. */
-    .range-ticks { position: relative; height: 14px; margin: 1px 0 8px; }
-    .range-ticks i { position: absolute; top: 0; width: 1px; height: 4px; background: var(--line); }
-    .range-ticks span { position: absolute; top: 5px; transform: translateX(-50%);
+    .range-thumb:focus-visible { outline: none;
+      box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--accent); }
+    .range-ticks { position: relative; height: 12px; margin: 0 0 8px; }
+    .range-ticks span { position: absolute; top: 0; transform: translateX(-50%);
       font-size: 0.68rem; color: var(--muted); white-space: nowrap; }
 
     /* Five rows then scroll, so a long ladder cannot push the actions off screen. */
@@ -334,7 +342,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-28n";
+    const BUILD = "2026-08-28o";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -880,21 +888,23 @@
         set(single ? "v" : Math.abs(v - state.lo) <= Math.abs(v - state.hi) ? "lo" : "hi", v);
       });
 
-      // Tick marks, with labels on as many as fit without crowding.
+      // Dots sit on the track itself; labels go underneath, on as many as fit
+      // without crowding.
       function drawTicks(at) {
-        const host = root.querySelector(".range-ticks");
-        if (!host) return;
-        host.textContent = "";
+        const labels = root.querySelector(".range-ticks");
+        for (const old of track.querySelectorAll(".range-mark")) old.remove();
+        if (labels) labels.textContent = "";
         const every = Math.ceil(at.length / 6);
         at.forEach((v, i) => {
           const mark = document.createElement("i");
+          mark.className = "range-mark";
           mark.style.left = `${pct(v)}%`;
-          host.appendChild(mark);
-          if (i % every && i !== at.length - 1) return;
+          track.appendChild(mark);
+          if (!labels || (i % every && i !== at.length - 1)) return;
           const label = document.createElement("span");
           label.style.left = `${pct(v)}%`;
           label.textContent = format(v);
-          host.appendChild(label);
+          labels.appendChild(label);
         });
       }
       if (ticks || values) drawTicks(ticks || values);
