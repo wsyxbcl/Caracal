@@ -354,14 +354,19 @@
     // throughput is FLAT from 2 to 6 (the disk saturates at ~242 MB/s either way),
     // but 6 inflates per-clip latency 6.6x (200 -> 1331 ms) and holds six ~50 MB
     // reads in flight. 3 keeps the disk busy without either cost.
-    // Overridable as ?concurrency=N to re-run the sweep without a rebuild.
-    const DECODE_CONCURRENCY = Number(new URLSearchParams(location.search).get("concurrency")) || 3;
+    // Overridable as ?concurrency=N, which also turns the tuner off.
+    //
+    // That measurement was one machine off one disk; it does not transfer. The
+    // background tier now finds its own level per device (see the tuner below),
+    // and this stays only as the starting point and the interactive ceiling.
+    const MANUAL_CONCURRENCY = Number(new URLSearchParams(location.search).get("concurrency")) || 0;
+    const DECODE_CONCURRENCY = MANUAL_CONCURRENCY || 3;
     const PAGE = 200;             // tiles rendered per group at a time (a group can have thousands)
 
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-29c";
+    const BUILD = "2026-08-29d";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -475,6 +480,7 @@
       get rows() { return bench.rows; },
       get groups() { return bench.groups; },
       reset: () => bench.reset(),
+      get concurrency() { return { background: bgLimit, cap: CONCURRENCY_CAP, windows: tuner.history }; },
       get cache() { return { crops: cropCache.size, mb: +(cropCache.bytes / 1e6).toFixed(1) }; },
       /** Drop cached crops down to `mb`, already-judged ones first. Returns MB freed. */
       evict: (mb = 0) => +(cropCache.evictTo(mb * 1e6) / 1e6).toFixed(1),
@@ -1554,9 +1560,18 @@
     // capped one slot below the limit, so a slot frees for an interactive job
     // within one source rather than after the whole backlog. Throughput was
     // measured flat past 2, so the reserved slot costs the background pass ~nothing.
-    const BG_CONCURRENCY = Math.max(1, DECODE_CONCURRENCY - 1);
+    // How many background decodes may run at once. Not a constant: the right
+    // number depends on cores, storage and whether the decoder is in hardware,
+    // none of which we can read, so the precompute pass measures it (`tuner`).
+    let bgLimit = Math.max(1, DECODE_CONCURRENCY - 1);
     let activeSrc = 0, activeBg = 0;
     const srcQueue = [], bgQueue = [];
+    // How long interactive decodes TAKE, so the tuner can tell when background
+    // work is degrading review. Deliberately not queue wait: review has its own
+    // reserved slots, so it never queues behind background — a deep interactive
+    // queue is just a big group, and charging that to the tuner made it back off
+    // from a concurrency that was doing no harm.
+    const interactiveService = [];
     function decodeSourceLimited(src, items, background = false) {
       return new Promise((resolve) => {
         (background ? bgQueue : srcQueue).push({ src, items, resolve, background });
@@ -1564,14 +1579,32 @@
       });
     }
     function pumpSrc() {
-      while (activeSrc < DECODE_CONCURRENCY) {
-        const j = srcQueue.shift() || (activeBg < BG_CONCURRENCY ? bgQueue.shift() : null);
+      // Two separate budgets rather than one shared pool: review always has its
+      // own DECODE_CONCURRENCY slots, so a background backlog can never queue in
+      // front of it, and the tuner's number is purely about background work.
+      while (activeSrc < DECODE_CONCURRENCY + bgLimit) {
+        const interactive = activeSrc - activeBg < DECODE_CONCURRENCY ? srcQueue.shift() : null;
+        const j = interactive || (activeBg < bgLimit ? bgQueue.shift() : null);
         if (!j) break;
         activeSrc++; if (j.background) activeBg++;
+        const started = performance.now();
         mediaCropBatch(j.src, j.items).then(j.resolve).finally(() => {
-          activeSrc--; if (j.background) activeBg--; pumpSrc();
+          activeSrc--; if (j.background) activeBg--;
+          if (!j.background) {
+            // Stamped: each window is judged on what happened *in* it, so one
+            // stale spike cannot cap the tuner for the rest of the run.
+            interactiveService.push({ at: performance.now(), ms: performance.now() - started });
+            if (interactiveService.length > 64) interactiveService.shift();
+          }
+          pumpSrc();
         });
       }
+    }
+    function interactiveServiceP90(since = 0) {
+      const recent = interactiveService.filter((w) => w.at >= since).map((w) => w.ms);
+      if (recent.length < 4) return 0; // too few to say anything
+      recent.sort((a, b) => a - b);
+      return recent[Math.floor(recent.length * 0.9)];
     }
 
     // The fetch plan for a set of instances: one entry per source media, so each
@@ -1720,6 +1753,103 @@
       paintBuffer(group);
     }
 
+    // ---- Background concurrency, found by measurement ------------------------
+    // Cores say nothing about storage speed or whether the decoder is in
+    // hardware, and a number tuned on one machine is wrong on the next. So the
+    // precompute pass hill-climbs its own: run a window of sources, compare
+    // throughput with the last window, keep climbing while it improves, fall
+    // back to the best when it stops. It re-opens the search periodically —
+    // thermal state and competing load are not constants either.
+    //
+    // Measured in crops per second over VIDEO sources only. Clips and stills
+    // differ by ~100x in cost, so a window that happened to catch a run of jpgs
+    // would report a throughput spike that has nothing to do with concurrency.
+    const CONCURRENCY_CAP = Math.max(2, Math.min(
+      12, navigator.hardwareConcurrency || 4,
+      navigator.deviceMemory ? Math.max(2, navigator.deviceMemory) : 12,
+    ));
+    const WINDOW_SOURCES = 12;   // video sources per measurement window
+    const IMPROVE = 0.08;        // below this, two windows are the same window
+    const SERVICE_TOLERANCE = 2;   // review decodes may not take twice their best
+    const SERVICE_FLOOR_MS = 400;  // ...and below this nobody notices anyway
+    const RECHECK_WINDOWS = 20;  // settled is not the same as permanent
+    const TUNE_KEY = "rde.bgConcurrency.v1";
+
+    const tuner = {
+      on: false, sources: 0, crops: 0, t0: 0, quietest: null,
+      best: null, settled: false, sinceRecheck: 0, history: [],
+
+      /// Last session's answer is a starting point, never a conclusion: storage,
+      /// thermals and competing load all move between runs.
+      remembered() {
+        try {
+          const saved = JSON.parse(localStorage.getItem(TUNE_KEY) || "null");
+          if (saved && saved.build === BUILD) return saved.limit;
+        } catch { /* private mode, or someone else's value */ }
+        return null;
+      },
+      remember(limit) {
+        try { localStorage.setItem(TUNE_KEY, JSON.stringify({ limit, build: BUILD, at: Date.now() })); }
+        catch { /* nothing to do about it */ }
+      },
+
+      start() {
+        this.on = !MANUAL_CONCURRENCY;
+        if (!this.on) return;
+        Object.assign(this, { sources: 0, crops: 0, t0: performance.now(), best: null, settled: false, sinceRecheck: 0 });
+        this.set(this.remembered() || Math.max(1, Math.min(CONCURRENCY_CAP, Math.floor(CONCURRENCY_CAP / 2))));
+      },
+      set(limit) {
+        bgLimit = Math.max(1, Math.min(CONCURRENCY_CAP, limit));
+        pumpSrc(); // a raise only takes effect if something goes looking for work
+      },
+      credit(crops, isVideo) {
+        if (!this.on || !isVideo) return;
+        this.crops += crops;
+        if (++this.sources >= WINDOW_SOURCES) this.closeWindow();
+      },
+      closeWindow() {
+        const seconds = (performance.now() - this.t0) / 1000;
+        const rate = seconds > 0 ? this.crops / seconds : 0;
+        // Review comes first: a faster backlog that makes the reviewer wait is
+        // not a faster anything. Judged against the quietest window seen rather
+        // than an absolute — clips differ far too much for a fixed budget.
+        const service = interactiveServiceP90(this.t0);
+        if (service) this.quietest = Math.min(this.quietest ?? service, service);
+        const degraded = service && this.quietest && service > Math.max(SERVICE_FLOOR_MS, this.quietest * SERVICE_TOLERANCE);
+        this.history.push({ limit: bgLimit, rate: +rate.toFixed(2), serviceMs: Math.round(service) });
+        const at = bgLimit;
+        if (degraded && bgLimit > 1) {
+          this.set(bgLimit - 1);
+          this.best = { limit: bgLimit, rate };
+          this.settled = true;
+          console.log(`[rde] background concurrency down to ${bgLimit}:` +
+            ` review decodes slowed to ${Math.round(service)} ms (quietest ${Math.round(this.quietest)} ms)`);
+        } else if (this.settled) {
+          if (++this.sinceRecheck >= RECHECK_WINDOWS) { this.settled = false; this.best = null; this.sinceRecheck = 0; }
+        } else if (!this.best) {
+          this.best = { limit: at, rate };
+          this.set(at + 2);
+        } else if (rate > this.best.rate * (1 + IMPROVE)) {
+          this.best = { limit: at, rate };
+          // Still improving but out of room: stay here rather than falling back
+          // to the second-best, which is what "take the best" would have meant.
+          if (at >= CONCURRENCY_CAP) this.finish();
+          else this.set(at + 2);
+        } else {
+          this.set(this.best.limit); // the climb stopped paying; take the best
+          this.finish();
+        }
+        Object.assign(this, { sources: 0, crops: 0, t0: performance.now() });
+      },
+      finish() {
+        this.settled = true;
+        this.remember(this.best.limit);
+        console.log(`[rde] background concurrency settled at ${this.best.limit}` +
+          ` (${this.best.rate.toFixed(1)} crops/s)`, this.history);
+      },
+    };
+
     // ---- Precompute: make every crop before anyone asks for one --------------
     // Decoding is the only slow thing left in review, and the reviewer only ever
     // needs the group on screen — so the rest can be built ahead of time, while
@@ -1767,6 +1897,7 @@
       // the reviewer is asked to wait for something they did not ask for, so it
       // is the only moment we say anything about it.
       renderPrecompute(state.frameRateByImageIndex.size ? "Optimizing for this device…" : undefined);
+      tuner.start();
 
       let cursor = 0, stopped = null, reclaimed = 0;
       const drain = async () => {
@@ -1784,19 +1915,24 @@
           const items = s.items.filter((it) => !cropCache.has(it.key));
           if (items.length) {
             const results = await decodeSourceLimited(s.src, items, true);
+            let made = 0;
             for (const r of results || []) {
               if (!r.blob) continue;
               const url = URL.createObjectURL(r.blob);
               cropCache.set(r.key, url, r.blob.size);
               fillTile(r.key, url); // a no-op unless that tile happens to be on screen
-              precompute.crops++;
+              precompute.crops++; made++;
             }
+            tuner.credit(made, VIDEO_RE.test(s.src.name));
           }
           precompute.done++;
           renderPrecompute();  // takes over from the "optimizing" note
         }
       };
-      await Promise.all(Array.from({ length: BG_CONCURRENCY }, drain));
+      // One drain per possible slot; the limiter decides how many actually run,
+      // so the tuner can raise bgLimit mid-pass without respawning anything.
+      await Promise.all(Array.from({ length: CONCURRENCY_CAP }, drain));
+      tuner.on = false;
 
       const mins = (performance.now() - precompute.t0) / 60000;
       const { done, total, crops } = precompute;
@@ -1810,7 +1946,8 @@
           : precompute.cancelled
             ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media · ${cached}.`
             : `All ${total.toLocaleString()} media done in ${mins.toFixed(1)} min · ${cached}. Review will not wait for decoding.`);
-      console.log(`[rde] precompute: ${done}/${total} media, ${crops} crops, ` +
+      console.log(`[rde] precompute: bg concurrency ${bgLimit}/${CONCURRENCY_CAP}, ` +
+        `${done}/${total} media, ${crops} crops, ` +
         `${(cropCache.bytes / 1e6).toFixed(1)} MB in ${mins.toFixed(2)} min` +
         (reclaimed ? `, reclaimed ${(reclaimed / 1e6).toFixed(1)} MB` : "") +
         (stopped ? ` (stopped: ${stopped})` : precompute.cancelled ? " (cancelled)" : ""));
