@@ -31,9 +31,18 @@ const LINEAR_COVERAGE = 0.7;
 // Keep the decoder fed without queueing the whole range at once.
 const QUEUE_HIGH_WATER = 24;
 
-// Header reads walk box by box; 256 KB covers ftyp plus most moov boxes.
-const HEADER_CHUNK = 256 * 1024;
-const MAX_HEADER_STEPS = 32;
+// Measured on the production set: a read costs ~79 ms whatever its size, while
+// large reads move ~89 MB/s. So requests, not bytes, are the currency — the
+// first byte-range build fetched 9x less data in 4.3 requests per clip and came
+// out SLOWER than reading whole files. Everything below is sized to keep the
+// count near two: one to find the layout, one to take what we need.
+const HEADER_PROBE = 1024 * 1024; // ftyp + a fast-start moov in a single read
+const HEADER_STEP = 2 * 1024 * 1024; // moov median is 0.53 MB; one read after the jump
+const TAIL_PROBE = 2 * 1024 * 1024; // covers a trailing moov and the scan for it
+const MAX_HEADER_STEPS = 8;
+// Two sample ranges closer than this are fetched as one: the bytes in between
+// cost less than the extra request would.
+const COALESCE_BYTES = 2 * 1024 * 1024;
 // Samples fetched per backwards verification step. One read of ~64 samples
 // beats 64 reads of one, and a GOP is rarely longer.
 const VERIFY_WINDOW = 64;
@@ -112,20 +121,65 @@ class RangeReader {
 /// file to reach the tables. mp4box's `appendBuffer` returns the position it
 /// wants next, and that skips over `mdat`, so following it lands on the moov in
 /// a couple of reads wherever it lives.
+/// A `moov` box in `bytes` whose extent ends exactly at EOF, or null. Boxes are
+/// [u32 size][u32 type], and there is no trailing index in MP4, so the exact-fit
+/// check is what makes scanning backwards safe rather than a guess.
+function findTrailingMoov(bytes, tailStart, fileSize) {
+  for (let p = bytes.length - 8; p >= 0; p--) {
+    if (bytes[p + 4] !== 0x6d || bytes[p + 5] !== 0x6f || bytes[p + 6] !== 0x6f || bytes[p + 7] !== 0x76) continue;
+    const size = ((bytes[p] << 24) | (bytes[p + 1] << 16) | (bytes[p + 2] << 8) | bytes[p + 3]) >>> 0;
+    if (size >= 8 && tailStart + p + size === fileSize) return tailStart + p;
+  }
+  return null;
+}
+
 async function readHeader(reader, file) {
   const mp4 = createFile();
   let info = null, failure = null;
   mp4.onReady = (parsed) => { info = parsed; };
   mp4.onError = (error) => { failure = error; };
   let position = 0;
+  let shortcut = false;
   for (let step = 0; step < MAX_HEADER_STEPS && !info && !failure; step++) {
-    const end = Math.min(file.size, position + HEADER_CHUNK);
+    const end = Math.min(file.size, position + (step ? HEADER_STEP : HEADER_PROBE));
     if (position >= end) break;
     await reader.ensure(position, end);
     const window = reader.bytes(position, end - position).slice(); // mp4box keeps it
     const next = mp4.appendBuffer(MP4BoxBuffer.fromArrayBuffer(window.buffer, position));
     if (info || failure) break;
     position = typeof next === "number" && next > position ? next : end;
+
+    // The parser advances one box at a time, and reaching `moov` past two `mdat`
+    // boxes costs a whole request per header — 2 MB read to learn 16 bytes. The
+    // moov is the last box in every camera file seen here, so find it directly
+    // and bridge the gap with a synthetic `free` box, which is all the parser
+    // needs to skip payload it was never going to read. Tried once; if the moov
+    // is not at EOF the walk simply carries on.
+    if (!shortcut && position < file.size) {
+      shortcut = true;
+      const tailStart = Math.max(position, file.size - TAIL_PROBE);
+      await reader.ensure(tailStart, file.size);
+      const moovStart = findTrailingMoov(
+        reader.bytes(tailStart, file.size - tailStart), tailStart, file.size,
+      );
+      const gap = moovStart === null ? -1 : moovStart - position;
+      if (gap >= 8 && gap < 0xffffffff) {
+        // Specifically `mdat`, not `free`: mp4box reads the payload of every box
+        // it parses except mdat (`if (this.type !== "mdat") this.data = …`), so
+        // any other type would make it wait for tens of MB we deliberately never
+        // fetched. We read sample bytes ourselves, so a synthetic mdat costs
+        // nothing — it exists only to move the parser forward.
+        const skip = new Uint8Array(8);
+        new DataView(skip.buffer).setUint32(0, gap);
+        skip.set([0x6d, 0x64, 0x61, 0x74], 4); // "mdat"
+        mp4.appendBuffer(MP4BoxBuffer.fromArrayBuffer(skip.buffer, position));
+        const tail = reader.bytes(moovStart, file.size - moovStart).slice();
+        mp4.appendBuffer(MP4BoxBuffer.fromArrayBuffer(tail.buffer, moovStart));
+        if (info) break;
+      } else if (gap === 0) {
+        continue; // already sitting on the moov; the normal read handles it
+      }
+    }
   }
   return { mp4, info, failure };
 }
@@ -342,6 +396,7 @@ export async function extractFrames(file, targets, onFrame) {
   }
 
   const tPlan = performance.now();
+  const ioBeforePlan = reader.ioMs;
   const sync = new SyncTable(samples, config, reader);
   const isSync = sync.flags;
   const timescale = track.timescale;
@@ -360,20 +415,37 @@ export async function extractFrames(file, targets, onFrame) {
   async function preparePlan(wanted) {
     let plan = planRanges(samples, wanted, isSync);
     if (sync.suspect) {
-      for (const index of [...plan.wanted.keys()].sort((a, b) => a - b)) {
-        await sync.lastRandomAccessAtOrBefore(index);
-      }
+      const indices = [...plan.wanted.keys()].sort((a, b) => a - b);
+      // Fetch everything the walks are about to read, in one go. Walking each
+      // target separately asks for adjacent spans in sequence, and each one is
+      // another round trip — the dominant cost. Targets in a clip are usually
+      // close, so this is a single request that also covers the decode range.
+      await fetchSpans(indices.map((i) => [Math.max(0, i - VERIFY_WINDOW), i]));
+      for (const index of indices) await sync.lastRandomAccessAtOrBefore(index);
       plan = planRanges(samples, wanted, isSync);
       // Range starts are now real random-access points and can only move earlier,
       // never later, so this needs no further re-plan — but the samples a merge
       // swallowed between two targets still need honest key/delta labels.
       for (const [from, to] of plan.ranges) await sync.verifyRange(from, to);
     }
-    // Everything the decoder will read, in as few requests as the ranges allow.
-    for (const [from, to] of plan.ranges) {
-      await reader.ensure(samples[from].offset, samples[to].offset + samples[to].size);
-    }
+    await fetchSpans(plan.ranges);
     return plan;
+  }
+
+  /// Fetch the bytes for sample ranges in as few requests as possible: ranges
+  /// whose gap is smaller than COALESCE_BYTES are taken together, because the
+  /// bytes in between cost less than another round trip.
+  async function fetchSpans(ranges) {
+    const spans = ranges
+      .map(([from, to]) => [samples[from].offset, samples[to].offset + samples[to].size])
+      .sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const span of spans) {
+      const last = merged[merged.length - 1];
+      if (last && span[0] - last[1] <= COALESCE_BYTES) last[1] = Math.max(last[1], span[1]);
+      else merged.push(span);
+    }
+    for (const [from, to] of merged) await reader.ensure(from, to);
   }
 
   const firstPlan = await preparePlan(targets);
@@ -499,7 +571,9 @@ export async function extractFrames(file, targets, onFrame) {
     readMs: +reader.ioMs.toFixed(1), // all I/O: header + sample ranges
     headerMs: +headerMs.toFixed(1),  // of which, reaching the sample table
     configMs: +(tPlan - tConfig).toFixed(1),
-    planMs: +(tDecodeStart - tPlan).toFixed(1),
+    // Plan + verify, with the fetching taken out: readMs already owns that, and
+    // an overlapping phase table cannot be read as a budget.
+    planMs: +Math.max(0, tDecodeStart - tPlan - (reader.ioMs - ioBeforePlan)).toFixed(1),
     decodeMs: +(tDecodeEnd - tDecodeStart).toFixed(1),
     onFrameMs: +onFrameMs.toFixed(1),
     totalMs: +(performance.now() - tStart).toFixed(1),
@@ -515,7 +589,10 @@ export async function extractFrames(file, targets, onFrame) {
 //
 // Keyed by codec fingerprint rather than by machine: one document can hold
 // several profiles, and the answer can differ between them.
-const PROBE_FRAMES = 12;   // one GOP-ish; enough to out-measure configure() noise
+// Hardware decoders cost far more to configure than software ones, so a short
+// probe measures setup and picks software every time. The production clips decode
+// a median of 35 frames, so the probe uses a comparable run.
+const PROBE_FRAMES = 40;
 const HW_TIE_MARGIN = 1.1; // hardware wins ties: it also frees CPU for other clips
 const preferences = new Map(); // fingerprint -> { mode, hwMs, swMs, demoted }
 const probing = new Map();     // fingerprint -> in-flight probe, so clips don't race
@@ -592,9 +669,10 @@ function noteHardwareFailure(config) {
     ` (${failures}/${HW_FAILURE_LIMIT})` + (demoted ? " — switching this codec to software" : ""));
 }
 
-/// What the probe decided, for the benchmark dump.
+/// What the probe decided and what it measured, for the benchmark dump — the
+/// numbers behind a surprising choice matter more than the choice.
 export function decodePreferences() {
-  return [...preferences].map(([codec, v]) => ({ codec, ...v }));
+  return [...preferences].map(([codec, v]) => ({ codec, frames: PROBE_FRAMES, ...v }));
 }
 
 /// Wait for the decoder to work through its backlog.
