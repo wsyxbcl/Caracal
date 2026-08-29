@@ -38,6 +38,8 @@
     #camera-all summary { cursor: pointer; }
     #camera-list { max-height: 130px; overflow-y: auto; margin-top: 6px; padding-right: 6px;
       columns: 3; font-size: 0.76rem; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+    .precompute { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .precompute[hidden] { display: none; }
     .camera-setup select { font: inherit; font-size: 0.82rem; padding: 3px 6px; max-width: 220px;
       border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
     /* The card had a large empty right half; put the current parameters there and
@@ -242,7 +244,10 @@
         <span class="hint" id="camera-summary"></span>
         <details id="camera-all"><summary>show all</summary><div id="camera-list"></div></details>
       </div>
-      <p class="hint" id="decode-progress"></p>
+      <div class="precompute" id="precompute" hidden>
+        <button class="mini" id="precompute-run">Precompute all crops</button>
+        <span class="hint" id="precompute-status">Decode every crop now, in the background, so review never waits.</span>
+      </div>
       <p id="error"></p>
       </div>
       <button class="params" id="tune-open" hidden aria-expanded="false">
@@ -1217,6 +1222,7 @@
       syncTuneToggle();
     }
 
+    $("precompute-run").addEventListener("click", () => { runPrecompute().catch(showError); });
     $("tune-collapse").addEventListener("click", collapseTuning);
     $("opt-camlevel").addEventListener("change", async () => {
       renderCameraCheck();
@@ -1390,7 +1396,8 @@
           `${matched.toLocaleString()} media ready` +
           (videos ? ` (${images.toLocaleString()} image, ${videos.toLocaleString()} video)` : "") +
           (missing ? `, ${missing.toLocaleString()} missing/ambiguous` : "") +
-          `. ← → to move, Space to keep, f for the exact frame, Enter for next group.`;
+          `. ← → to move, Space to keep, f for the exact frame, [ ] for prev/next group, Enter when done with one.`;
+        $("precompute").hidden = false;
         goToGroup(currentIndex); // re-render current group, now with crops + prefetch
       } catch (err) {
         showError(err);
@@ -1422,7 +1429,8 @@
       status.textContent =
         `Linked ${rootHandle.name} — ${suspicious.length.toLocaleString()} media` +
         (nVid ? ` (${nImg.toLocaleString()} image, ${nVid.toLocaleString()} video)` : "") +
-        `. ← → to move, Space to keep, f for the exact frame, Enter for next group.`;
+        `. ← → to move, Space to keep, f for the exact frame, [ ] for prev/next group, Enter when done with one.`;
+      $("precompute").hidden = false;
       goToGroup(currentIndex);
     }
 
@@ -1520,14 +1528,28 @@
     // Shared decode limiter: at most DECODE_CONCURRENCY source reads in flight
     // across the current group AND the prefetched-next group, so advancing is
     // instant without ever seek-storming the HDD.
-    let activeSrc = 0; const srcQueue = [];
-    function decodeSourceLimited(src, items) {
-      return new Promise((resolve) => { srcQueue.push({ src, items, resolve }); pumpSrc(); });
+    //
+    // Two tiers. Review always jumps the queue, and precompute is additionally
+    // capped one slot below the limit, so a slot frees for an interactive job
+    // within one source rather than after the whole backlog. Throughput was
+    // measured flat past 2, so the reserved slot costs the background pass ~nothing.
+    const BG_CONCURRENCY = Math.max(1, DECODE_CONCURRENCY - 1);
+    let activeSrc = 0, activeBg = 0;
+    const srcQueue = [], bgQueue = [];
+    function decodeSourceLimited(src, items, background = false) {
+      return new Promise((resolve) => {
+        (background ? bgQueue : srcQueue).push({ src, items, resolve, background });
+        pumpSrc();
+      });
     }
     function pumpSrc() {
-      while (activeSrc < DECODE_CONCURRENCY && srcQueue.length) {
-        const j = srcQueue.shift(); activeSrc++;
-        mediaCropBatch(j.src, j.items).then(j.resolve).finally(() => { activeSrc--; pumpSrc(); });
+      while (activeSrc < DECODE_CONCURRENCY) {
+        const j = srcQueue.shift() || (activeBg < BG_CONCURRENCY ? bgQueue.shift() : null);
+        if (!j) break;
+        activeSrc++; if (j.background) activeBg++;
+        mediaCropBatch(j.src, j.items).then(j.resolve).finally(() => {
+          activeSrc--; if (j.background) activeBg--; pumpSrc();
+        });
       }
     }
 
@@ -1672,6 +1694,91 @@
       paintBuffer(group);
     }
 
+    // ---- Precompute: make every crop before anyone asks for one --------------
+    // Decoding is the only slow thing left in review, and the reviewer only ever
+    // needs the group on screen — so the rest can be built ahead of time, while
+    // they work. Media-ordered rather than group-ordered: each clip is opened once
+    // for every crop anywhere in the document, which is where the measured 1.77x
+    // of cross-group re-reads goes.
+    const precompute = { running: false, cancelled: false, done: 0, total: 0, crops: 0, t0: 0 };
+    const CACHE_HIGH_WATER = CROP_CACHE_BYTES * 0.9;
+
+    // "0 MB" for a cache that holds something reads as broken.
+    const fmtMB = (bytes) => (bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0);
+
+    function fmtLeft(seconds) {
+      if (!isFinite(seconds) || seconds <= 0) return "";
+      if (seconds < 90) return `${Math.ceil(seconds)}s left`;
+      return `${Math.ceil(seconds / 60)} min left`;
+    }
+
+    function renderPrecompute(note) {
+      const btn = $("precompute-run"), out = $("precompute-status");
+      if (!btn) return;
+      btn.textContent = precompute.running ? "Stop" : "Precompute all crops";
+      if (note !== undefined) { out.textContent = note; return; }
+      if (!precompute.running) return;
+      const { done, total, crops, t0 } = precompute;
+      const elapsed = (performance.now() - t0) / 1000;
+      const left = done ? fmtLeft((total - done) * (elapsed / done)) : "";
+      out.textContent = `${done.toLocaleString()}/${total.toLocaleString()} media · `
+        + `${crops.toLocaleString()} crops · ${fmtMB(cropCache.bytes)} MB`
+        + (left ? ` · ${left}` : "");
+    }
+
+    async function runPrecompute() {
+      if (precompute.running) { precompute.cancelled = true; return; } // the button is also Stop
+      // Everything clustered at MIN_THRESHOLD, not just the groups the current
+      // threshold shows: the threshold is a view, so raising it later must not
+      // strand crops that were never made.
+      const sources = sourcesFor(state.allGroups.flatMap((g) => g.instances));
+      if (!sources.length) { renderPrecompute("Every crop is already cached."); return; }
+      Object.assign(precompute, {
+        running: true, cancelled: false, done: 0, crops: 0,
+        total: sources.length, t0: performance.now(),
+      });
+      renderPrecompute();
+
+      let cursor = 0, stopped = null;
+      const drain = async () => {
+        while (cursor < sources.length && !precompute.cancelled) {
+          // Cache pressure is a stop, not a slowdown: past this the pass would be
+          // evicting its own earlier results and the work would be wasted.
+          if (cropCache.bytes > CACHE_HIGH_WATER) { stopped = "cache"; break; }
+          const s = sources[cursor++];
+          // Review may have decoded this source in the meantime.
+          const items = s.items.filter((it) => !cropCache.has(it.key));
+          if (items.length) {
+            const results = await decodeSourceLimited(s.src, items, true);
+            for (const r of results || []) {
+              if (!r.blob) continue;
+              const url = URL.createObjectURL(r.blob);
+              cropCache.set(r.key, url, r.blob.size);
+              fillTile(r.key, url); // a no-op unless that tile happens to be on screen
+              precompute.crops++;
+            }
+          }
+          precompute.done++;
+          renderPrecompute();
+        }
+      };
+      await Promise.all(Array.from({ length: BG_CONCURRENCY }, drain));
+
+      const mins = (performance.now() - precompute.t0) / 60000;
+      const { done, total, crops } = precompute;
+      precompute.running = false;
+      const cached = `${crops.toLocaleString()} crops · ${fmtMB(cropCache.bytes)} MB`;
+      renderPrecompute(
+        stopped === "cache"
+          ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media — the crop cache is full (${cached}). Review is instant up to there.`
+          : precompute.cancelled
+            ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media · ${cached}.`
+            : `All ${total.toLocaleString()} media done in ${mins.toFixed(1)} min · ${cached}. Review will not wait for decoding.`);
+      console.log(`[rde] precompute: ${done}/${total} media, ${crops} crops, ` +
+        `${(cropCache.bytes / 1e6).toFixed(1)} MB in ${mins.toFixed(2)} min` +
+        (stopped ? ` (stopped: ${stopped})` : precompute.cancelled ? " (cancelled)" : ""));
+    }
+
     // Mark which groups may still decode. Crops are NOT dropped here — the LRU
     // owns memory now, so a revisited group (37% of clips recur across groups)
     // repaints from cache instead of re-decoding. `_prefetched` is cleared so a
@@ -1731,6 +1838,10 @@
     // still unjudged (the default is Remove, so this is the usual "the rest are
     // all false positives"). That is what makes the group read as reviewed — the
     // state is derived from its members, so there is nothing else to set.
+    //
+    // Deliberately NOT what Prev/Next do. Those are literal movement, so you can
+    // look around without your looking being recorded as a judgement; this is the
+    // review loop, and committing is the whole point of pressing it.
     function markReviewedAndNext() {
       const g = currentGroup();
       if (g) {
@@ -1738,17 +1849,23 @@
         updateExportBar();
       }
       const next = nextNeedingReview(currentIndex);
-      if (next >= 0) goToGroup(next);
-      else renderCurrent(); // nothing left needing review: stay put, now marked reviewed
+      if (next >= 0) { goToGroup(next); return; }
+      // Nothing further needs review. Stay put — silently jumping to the next
+      // index would look identical to "there was more to do".
+      renderCurrent();
+      const behind = state.groups.findIndex((x) => groupProgress(x).state !== "reviewed");
+      status.textContent = behind >= 0
+        ? `Nothing after this one needs review — ${state.groups.length - behind} group(s) earlier still do.`
+        : "Every group is reviewed.";
     }
 
-    // Prefer the next group that still needs attention over the next index —
-    // after a re-cluster, plenty of groups may already be fully inherited.
+    // Only ever forwards, and only groups that still need attention: after a
+    // re-cluster plenty of groups arrive already decided by inheritance.
     function nextNeedingReview(from) {
       for (let i = from + 1; i < state.groups.length; i++) {
         if (groupProgress(state.groups[i]).state !== "reviewed") return i;
       }
-      return from + 1 < state.groups.length ? from + 1 : -1;
+      return -1;
     }
 
     function renderCurrent() {
@@ -1772,10 +1889,19 @@
         `<span class="meta"></span>`;
       const actions = document.createElement("span");
       actions.className = "actions";
-      actions.appendChild(mini("◀ Prev", () => goToGroup(currentIndex - 1)));
+      // Prev/Next are literal — group n-1 and n+1, no decisions recorded — so
+      // looking around is free. The review loop is its own button.
+      const prev = mini("◀ Prev", () => goToGroup(currentIndex - 1));
+      prev.disabled = currentIndex === 0;
+      const next = mini("Next ▶", () => goToGroup(currentIndex + 1));
+      next.disabled = currentIndex >= state.groups.length - 1;
+      actions.append(prev, next);
       actions.appendChild(mini("Keep all", () => setGroupDecision(g, "Keep")));
       actions.appendChild(mini("Remove all", () => setGroupDecision(g, "Remove")));
-      actions.appendChild(mini("Next ▶", markReviewedAndNext, "primary"));
+      const loop = mini("Done · next unreviewed ▶", markReviewedAndNext, "primary");
+      loop.title = "Commit the standing decision for every crop still unjudged here, "
+        + "then go to the next group that needs review (Enter)";
+      actions.appendChild(loop);
       head.appendChild(actions);
       card.appendChild(head);
 
@@ -1850,7 +1976,8 @@
           break;
         }
         case "Enter": case "n": markReviewedAndNext(); break;
-        case "p": goToGroup(currentIndex - 1); break;
+        case "[": case "p": goToGroup(currentIndex - 1); break;
+        case "]": goToGroup(currentIndex + 1); break;
         case "f": { // toggle between the clip's first frame and this detection's own
           exactFrame = !exactFrame;
           // Redraw whatever the panel is showing — that may be a hovered tile,
@@ -2295,6 +2422,10 @@
       state.frameRateByImageIndex.clear();
       state.folderLoaded = false;
       state.folderMode = "files";
+      // A pass over the previous document's media is worse than useless now.
+      if (precompute.running) precompute.cancelled = true;
+      $("precompute").hidden = true;
+      renderPrecompute("Decode every crop now, in the background, so review never waits.");
       currentIndex = 0;
       focusIndex = 0;
       currentGrid = null;
