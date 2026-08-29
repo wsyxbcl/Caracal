@@ -24,6 +24,13 @@ const videoReady = import(`./video-frames.js?v=${BUILD}`);
 const DECODE_W = 1000; // downscale cap: big camera images decode cheap + small
 const TILE = 92;
 const PAD = 0.6; // context padding around the box in a crop
+// A 92px crop as lossless PNG measured 15 KB on the production document — 242 MB
+// for 15,677 crops, which hit the cache ceiling two thirds of the way through a
+// precompute pass. At this size the format is pure cache budget: nobody is
+// pixel-peeping a 92px thumbnail, and the box outline is drawn by us, not
+// recovered from the image.
+const CROP_TYPE = "image/webp";
+const CROP_QUALITY = 0.85;
 
 // ---- File System Access resolution ----------------------------------------
 let rootHandle = null;
@@ -111,7 +118,9 @@ async function cropBlob(src, bbox, srcW = src.width, srcH = src.height, timing =
   ctx.lineWidth = 2;
   ctx.strokeRect(dx + (bx - cx) * scale, dy + (by - cy) * scale, bw * scale, bh * scale);
   const tEncode = performance.now();
-  const blob = await off.convertToBlob({ type: "image/png" });
+  // convertToBlob silently falls back to png for an unsupported type, so the
+  // result is correct either way — just bigger.
+  const blob = await off.convertToBlob({ type: CROP_TYPE, quality: CROP_QUALITY });
   if (timing) {
     timing.drawMs += tEncode - tDraw;
     timing.encodeMs += performance.now() - tEncode;

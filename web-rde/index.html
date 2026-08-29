@@ -361,7 +361,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-28p";
+    const BUILD = "2026-08-29a";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -475,6 +475,9 @@
       get rows() { return bench.rows; },
       get groups() { return bench.groups; },
       reset: () => bench.reset(),
+      get cache() { return { crops: cropCache.size, mb: +(cropCache.bytes / 1e6).toFixed(1) }; },
+      /** Drop cached crops down to `mb`, already-judged ones first. Returns MB freed. */
+      evict: (mb = 0) => +(cropCache.evictTo(mb * 1e6) / 1e6).toFixed(1),
       /** Phase table + totals. `kind` filters to "video" / "image". */
       summary(kind) {
         const rows = kind ? bench.rows.filter((r) => r.kind === kind) : bench.rows;
@@ -1467,7 +1470,7 @@
     // across re-clustering (SPEC §6.1), so entries survive a parameter change; the
     // version prefix is what invalidates them when crop *rendering* changes.
     const VIDEO_RE = /\.(mp4|avi|mov|mkv|webm|m4v)$/i;
-    const RENDER_VERSION = "r1"; // bump when crop size/padding/box styling changes
+    const RENDER_VERSION = "r2"; // bump when crop size/padding/box styling/format changes
     const CROP_CACHE_BYTES = 256 * 1024 * 1024;
     const cropKey = (ref) => RENDER_VERSION + ":" + ref.image_index + ":" + ref.detection_index;
     const tileByKey = new Map(); // key -> tile element for the current render
@@ -1487,10 +1490,25 @@
         if (this.entries.has(key)) this.drop(key);
         this.entries.set(key, { url, bytes });
         this.bytes += bytes;
-        for (const oldest of this.entries.keys()) {
-          if (this.bytes <= CROP_CACHE_BYTES) break;
-          if (oldest !== key) this.drop(oldest);
+        this.evictTo(CROP_CACHE_BYTES, { protect: key });
+      },
+      // Reclaim in order of how unlikely a crop is to be wanted again: ones whose
+      // detection has already been judged first (oldest of those first), then
+      // plain LRU. Never the group on screen — tileByKey holds exactly its keys,
+      // and those tiles are displaying their object URL right now, so revoking one
+      // is how a reviewed group turns into blank squares.
+      evictTo(limit, { decidedOnly = false, protect = null } = {}) {
+        const before = this.bytes;
+        for (const decided of decidedOnly ? [true] : [true, false]) {
+          if (this.bytes <= limit) break;
+          for (const key of [...this.entries.keys()]) {
+            if (this.bytes <= limit) break;
+            if (key === protect || tileByKey.has(key)) continue;
+            if (decided !== state.decisions.has(key.slice(key.indexOf(":") + 1))) continue;
+            this.drop(key);
+          }
         }
+        return before - this.bytes;
       },
       drop(key) {
         const e = this.entries.get(key);
@@ -1626,9 +1644,15 @@
       // Wait for the folder: before it loads there are no files, and marking a
       // group "prefetched" with 0 sources would skip it once files arrive.
       if (!group || !state.folderLoaded) { paintBuffer(group); return; }
-      // Already done, or already running: just reflect its real progress. The
-      // in-flight run keeps calling paintBuffer, so the bar tracks it from here.
-      if (group._prefetched || group._prefetching) { paintBuffer(group); return; }
+      // Already running: just reflect its real progress. The in-flight run keeps
+      // calling paintBuffer, so the bar tracks it from here.
+      //
+      // Deliberately does NOT short-circuit on "this group was already fetched".
+      // Crops can be evicted after the fact — precompute filling the cache is
+      // exactly when that happens — and a group trusted as done never refetches
+      // them, so its tiles stay blank for good. sourcesFor() already skips what is
+      // cached, so asking it every time is both cheap and the only honest answer.
+      if (group._prefetching) { paintBuffer(group); return; }
       group._prefetching = true;
       const sources = sourcesFor(group.instances);
       const total = sources.length;
@@ -1672,7 +1696,6 @@
       group._prefetching = false;
       const bufferedMs = performance.now() - t0;
       if (group._active && done >= total) {
-        group._prefetched = true;
         if (total) {
           // Wall clock to "crops produced" vs to "crops on screen" — the second
           // is what the eye actually waits for.
@@ -1739,12 +1762,17 @@
       });
       renderPrecompute();
 
-      let cursor = 0, stopped = null;
+      let cursor = 0, stopped = null, reclaimed = 0;
       const drain = async () => {
         while (cursor < sources.length && !precompute.cancelled) {
-          // Cache pressure is a stop, not a slowdown: past this the pass would be
-          // evicting its own earlier results and the work would be wasted.
-          if (cropCache.bytes > CACHE_HIGH_WATER) { stopped = "cache"; break; }
+          // Cache pressure: first reclaim crops whose detection has already been
+          // judged. Those have done their job, so a review running alongside the
+          // pass keeps making room for it. Only give up when that frees nothing —
+          // past there the pass would evict results nobody has looked at yet.
+          if (cropCache.bytes > CACHE_HIGH_WATER) {
+            reclaimed += cropCache.evictTo(CACHE_HIGH_WATER * 0.8, { decidedOnly: true });
+            if (cropCache.bytes > CACHE_HIGH_WATER) { stopped = "cache"; break; }
+          }
           const s = sources[cursor++];
           // Review may have decoded this source in the meantime.
           const items = s.items.filter((it) => !cropCache.has(it.key));
@@ -1767,28 +1795,27 @@
       const mins = (performance.now() - precompute.t0) / 60000;
       const { done, total, crops } = precompute;
       precompute.running = false;
-      const cached = `${crops.toLocaleString()} crops · ${fmtMB(cropCache.bytes)} MB`;
+      const cached = `${crops.toLocaleString()} crops · ${fmtMB(cropCache.bytes)} MB`
+        + (reclaimed ? `, ${fmtMB(reclaimed)} MB of reviewed crops reclaimed` : "");
       renderPrecompute(
         stopped === "cache"
-          ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media — the crop cache is full (${cached}). Review is instant up to there.`
+          ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media — the crop cache is full (${cached}). `
+            + `Review more groups and run it again: judged crops are dropped first.`
           : precompute.cancelled
             ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media · ${cached}.`
             : `All ${total.toLocaleString()} media done in ${mins.toFixed(1)} min · ${cached}. Review will not wait for decoding.`);
       console.log(`[rde] precompute: ${done}/${total} media, ${crops} crops, ` +
         `${(cropCache.bytes / 1e6).toFixed(1)} MB in ${mins.toFixed(2)} min` +
+        (reclaimed ? `, reclaimed ${(reclaimed / 1e6).toFixed(1)} MB` : "") +
         (stopped ? ` (stopped: ${stopped})` : precompute.cancelled ? " (cancelled)" : ""));
     }
 
     // Mark which groups may still decode. Crops are NOT dropped here — the LRU
     // owns memory now, so a revisited group (37% of clips recur across groups)
-    // repaints from cache instead of re-decoding. `_prefetched` is cleared so a
-    // group whose crops were later evicted re-fetches just the missing ones.
+    // repaints from cache instead of re-decoding.
     function setActiveGroups(keep) {
       const keepSet = new Set(keep.filter(Boolean));
-      for (const g of state.groups) {
-        g._active = keepSet.has(g);
-        if (!g._active) g._prefetched = false;
-      }
+      for (const g of state.groups) g._active = keepSet.has(g);
     }
 
     function setBuffering(done, total) {
