@@ -189,74 +189,106 @@ export async function extractFrames(file, targets, onFrame) {
     description: codecDescription(mp4, track.id),
     optimizeForLatency: true,
   };
-  const support = await VideoDecoder.isConfigSupported(config);
-  if (!support.supported) throw new Error(`codec not supported: ${track.codec}`);
+  if (!(await VideoDecoder.isConfigSupported(config)).supported) {
+    throw new Error(`codec not supported: ${track.codec}`);
+  }
 
   const tPlan = performance.now();
   const { flags: isSync, repaired } = randomAccessFlags(buffer, samples, config);
-  const plan = planRanges(samples, targets, isSync);
-  const tDecodeStart = performance.now();
   const timescale = track.timescale;
   const stamp = (sample) => Math.round((sample.cts * 1e6) / timescale);
-
-  // Timestamp -> frame number, so output order never has to be trusted.
-  const byTimestamp = new Map();
-  for (const [index, frame] of plan.wanted) byTimestamp.set(stamp(samples[index]), frame);
-
-  const cropping = [];
-  let decoded = 0;
-  let onFrameMs = 0;
-  let failure = null;
-  const decoder = new VideoDecoder({
-    output: (frame) => {
-      decoded++;
-      const number = byTimestamp.get(frame.timestamp);
-      if (number === undefined) {
-        frame.close(); // decoded only to reach a target
-        return;
-      }
-      byTimestamp.delete(frame.timestamp);
-      // Crop before closing; VideoFrames hold scarce decoder-pool memory.
-      cropping.push(
-        (async () => {
-          const t = performance.now();
-          try {
-            await onFrame(number, frame);
-          } finally {
-            frame.close();
-            // Overlaps decode, so it is NOT additive with decodeMs — recorded
-            // separately so the two can be told apart.
-            onFrameMs += performance.now() - t;
-          }
-        })(),
-      );
-    },
-    error: (error) => {
-      failure = error;
-    },
+  const chunkFor = (index) => new EncodedVideoChunk({
+    type: isSync[index] ? "key" : "delta",
+    timestamp: stamp(samples[index]),
+    duration: Math.round((samples[index].duration * 1e6) / timescale),
+    data: new Uint8Array(buffer, samples[index].offset, samples[index].size),
   });
-  decoder.configure(config);
 
-  for (const [start, end] of plan.ranges) {
-    for (let index = start; index <= end && !failure; index++) {
-      const sample = samples[index];
-      decoder.decode(
-        new EncodedVideoChunk({
-          type: isSync[index] ? "key" : "delta",
-          timestamp: stamp(sample),
-          duration: Math.round((sample.duration * 1e6) / timescale),
-          data: new Uint8Array(buffer, sample.offset, sample.size),
-        }),
-      );
-      if (decoder.decodeQueueSize >= QUEUE_HIGH_WATER) await drain(decoder);
+  // Measured once per codec, on the head of this clip's own plan — real frames
+  // from the file we are about to decode, so the answer is about this footage
+  // rather than a synthetic sample.
+  const firstPlan = planRanges(samples, targets, isSync);
+  const mode = await preferredMode(config, () => {
+    // From the first random-access point, running PAST the planned range: a
+    // range can be a single sample, and one frame measures configure() rather
+    // than decode. The samples are contiguous, so the extra ones decode cleanly.
+    const start = firstPlan.ranges[0]?.[0];
+    if (start === undefined) return [];
+    const chunks = [];
+    for (let i = start; i < Math.min(samples.length, start + PROBE_FRAMES); i++) chunks.push(chunkFor(i));
+    return chunks;
+  });
+
+  const tDecodeStart = performance.now();
+  const delivered = new Set();
+  let decoded = 0, onFrameMs = 0, plan = firstPlan;
+
+  // One decode attempt, over whatever targets are still outstanding. Separated
+  // so a hardware failure can be retried in software without re-delivering the
+  // frames that already made it through.
+  async function attempt(acceleration, wanted) {
+    plan = planRanges(samples, wanted, isSync);
+    const byTimestamp = new Map();
+    for (const [index, frame] of plan.wanted) byTimestamp.set(stamp(samples[index]), frame);
+    const cropping = [];
+    let failure = null;
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        decoded++;
+        const number = byTimestamp.get(frame.timestamp);
+        if (number === undefined) {
+          frame.close(); // decoded only to reach a target
+          return;
+        }
+        byTimestamp.delete(frame.timestamp);
+        // Crop before closing; VideoFrames hold scarce decoder-pool memory.
+        cropping.push(
+          (async () => {
+            const t = performance.now();
+            try {
+              await onFrame(number, frame);
+              delivered.add(number);
+            } finally {
+              frame.close();
+              // Overlaps decode, so it is NOT additive with decodeMs — recorded
+              // separately so the two can be told apart.
+              onFrameMs += performance.now() - t;
+            }
+          })(),
+        );
+      },
+      error: (error) => { failure = error; },
+    });
+    decoder.configure({ ...config, hardwareAcceleration: acceleration });
+
+    for (const [start, end] of plan.ranges) {
+      for (let index = start; index <= end && !failure; index++) {
+        decoder.decode(chunkFor(index));
+        if (decoder.decodeQueueSize >= QUEUE_HIGH_WATER) await drain(decoder);
+      }
     }
+    if (!failure) await decoder.flush().catch((err) => { failure = err; });
+    if (decoder.state !== "closed") decoder.close();
+    await Promise.all(cropping);
+    return { failure, undelivered: [...byTimestamp.values()] };
   }
 
-  if (!failure) await decoder.flush();
-  if (decoder.state !== "closed") decoder.close();
-  await Promise.all(cropping);
+  let accel = mode;
+  let result = await attempt(accel, targets);
+  if (result.failure && accel !== "prefer-software") {
+    // Retry only what never arrived, so partial progress is not re-cropped.
+    const remaining = targets.filter((t) => !delivered.has(t));
+    if (!remaining.length) {
+      result = { failure: null, undelivered: [] };
+    } else {
+      accel = "prefer-software";
+      const retry = await attempt(accel, remaining);
+      if (!retry.failure) noteHardwareFailure(config);
+      result = retry;
+    }
+  }
   const tDecodeEnd = performance.now();
-  if (failure) throw failure;
+  if (result.failure) throw result.failure;
 
   const frames = track.nb_samples ?? samples.length;
   return {
@@ -278,7 +310,8 @@ export async function extractFrames(file, targets, onFrame) {
     linear: plan.linear,
     syncRepaired: repaired, // container claimed every sample was a keyframe
     keyframes: isSync.reduce((n, k) => n + (k ? 1 : 0), 0),
-    missing: [...plan.missing, ...byTimestamp.values()],
+    missing: [...plan.missing, ...result.undelivered],
+    accel, // what the probe picked, or "prefer-software" after a demotion
 
     // Where the time went (readMs..decodeMs are sequential and additive;
     // onFrameMs runs *inside* decodeMs)
@@ -290,6 +323,97 @@ export async function extractFrames(file, targets, onFrame) {
     onFrameMs: +onFrameMs.toFixed(1),
     totalMs: +(performance.now() - tStart).toFixed(1),
   };
+}
+
+// ---- Which decoder to ask for ---------------------------------------------
+// Nothing reports whether a decode actually used hardware, and hardware is not
+// reliably faster: setup latency dominates short jobs, integrated decoders can
+// be slower than an optimised software path, and some cameras write streams a
+// hardware decoder rejects but a software one accepts. So we time both on this
+// device's own files and keep the winner.
+//
+// Keyed by codec fingerprint rather than by machine: one document can hold
+// several profiles, and the answer can differ between them.
+const PROBE_FRAMES = 12;   // one GOP-ish; enough to out-measure configure() noise
+const HW_TIE_MARGIN = 1.1; // hardware wins ties: it also frees CPU for other clips
+const preferences = new Map(); // fingerprint -> { mode, hwMs, swMs, demoted }
+const probing = new Map();     // fingerprint -> in-flight probe, so clips don't race
+
+const fingerprint = (config) => `${config.codec} ${config.codedWidth}x${config.codedHeight}`;
+
+/// Decode `chunks` under one acceleration mode; ms, or null if it won't run.
+async function timeDecode(config, mode, chunks) {
+  const candidate = { ...config, hardwareAcceleration: mode };
+  let support;
+  try {
+    support = await VideoDecoder.isConfigSupported(candidate);
+  } catch { return null; }
+  if (!support.supported) return null;
+  let failed = null;
+  const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: (err) => { failed = err; } });
+  const t = performance.now();
+  try {
+    decoder.configure(candidate);
+    for (const chunk of chunks) {
+      if (failed) break;
+      decoder.decode(chunk);
+    }
+    if (!failed) await decoder.flush();
+  } catch (err) {
+    failed = err;
+  } finally {
+    if (decoder.state !== "closed") decoder.close();
+  }
+  return failed ? null : performance.now() - t;
+}
+
+async function preferredMode(config, makeChunks) {
+  const key = fingerprint(config);
+  const known = preferences.get(key);
+  if (known) return known.mode;
+  if (probing.has(key)) return probing.get(key);
+  const run = (async () => {
+    const chunks = makeChunks();
+    let mode = "no-preference", hwMs = null, swMs = null;
+    if (chunks.length) {
+      hwMs = await timeDecode(config, "prefer-hardware", chunks);
+      swMs = await timeDecode(config, "prefer-software", chunks);
+      if (hwMs !== null && swMs !== null) mode = hwMs <= swMs * HW_TIE_MARGIN ? "prefer-hardware" : "prefer-software";
+      else if (hwMs !== null) mode = "prefer-hardware";
+      else if (swMs !== null) mode = "prefer-software";
+    }
+    preferences.set(key, { mode, hwMs, swMs, demoted: false });
+    const ms = (v) => (v === null ? "unavailable" : `${Math.round(v)} ms`);
+    console.log(`[rde] decode probe ${key}: hardware ${ms(hwMs)} vs software ${ms(swMs)}` +
+      ` over ${chunks.length} frames → ${mode}`);
+    return mode;
+  })();
+  probing.set(key, run);
+  try { return await run; } finally { probing.delete(key); }
+}
+
+/// A clip that failed in hardware and then succeeded in software — evidence
+/// that the decoder, not the file, is the problem. Only that combination counts:
+/// camera files do get damaged, and a clip that fails both ways says nothing
+/// about the decoder. Demote the codec only once it keeps happening, so one bad
+/// file cannot cost every later clip its hardware path.
+const HW_FAILURE_LIMIT = 3;
+function noteHardwareFailure(config) {
+  const key = fingerprint(config);
+  const known = preferences.get(key) || { mode: "no-preference" };
+  const failures = (known.failures || 0) + 1;
+  const demoted = failures >= HW_FAILURE_LIMIT;
+  preferences.set(key, {
+    ...known, failures,
+    ...(demoted ? { mode: "prefer-software", demoted: true } : {}),
+  });
+  console.warn(`[rde] ${key}: hardware decode failed where software succeeded` +
+    ` (${failures}/${HW_FAILURE_LIMIT})` + (demoted ? " — switching this codec to software" : ""));
+}
+
+/// What the probe decided, for the benchmark dump.
+export function decodePreferences() {
+  return [...preferences].map(([codec, v]) => ({ codec, ...v }));
 }
 
 /// Wait for the decoder to work through its backlog.

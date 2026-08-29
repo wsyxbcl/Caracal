@@ -361,7 +361,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-29a";
+    const BUILD = "2026-08-29b";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -506,6 +506,9 @@
           const codecs = {};
           for (const r of video) codecs[`${r.codec} ${r.width}x${r.height} ${r.durationS}s`] = (codecs[`${r.codec} ${r.width}x${r.height} ${r.durationS}s`] || 0) + 1;
           console.log("clips:", codecs);
+          const accel = {};
+          for (const r of video) accel[r.accel || "unknown"] = (accel[r.accel || "unknown"] || 0) + 1;
+          console.log("decoder chosen per clip:", accel);
         }
         console.log("groups (wall clock):", bench.groups);
         return `${rows.length} sources`;
@@ -1760,7 +1763,10 @@
         running: true, cancelled: false, done: 0, crops: 0,
         total: sources.length, t0: performance.now(),
       });
-      renderPrecompute();
+      // The first clip of each codec carries the probe. It is the only moment
+      // the reviewer is asked to wait for something they did not ask for, so it
+      // is the only moment we say anything about it.
+      renderPrecompute(state.frameRateByImageIndex.size ? "Optimizing for this device…" : undefined);
 
       let cursor = 0, stopped = null, reclaimed = 0;
       const drain = async () => {
@@ -1787,7 +1793,7 @@
             }
           }
           precompute.done++;
-          renderPrecompute();
+          renderPrecompute();  // takes over from the "optimizing" note
         }
       };
       await Promise.all(Array.from({ length: BG_CONCURRENCY }, drain));
