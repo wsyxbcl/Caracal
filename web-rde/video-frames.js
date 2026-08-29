@@ -31,34 +31,134 @@ const LINEAR_COVERAGE = 0.7;
 // Keep the decoder fed without queueing the whole range at once.
 const QUEUE_HIGH_WATER = 24;
 
+// Header reads walk box by box; 256 KB covers ftyp plus most moov boxes.
+const HEADER_CHUNK = 256 * 1024;
+const MAX_HEADER_STEPS = 32;
+// Samples fetched per backwards verification step. One read of ~64 samples
+// beats 64 reads of one, and a GOP is rarely longer.
+const VERIFY_WINDOW = 64;
+
+/// Byte-range reader over a File. Fetches only what it is asked for, remembers
+/// what it already holds, and hands out views by absolute file offset — which is
+/// how the sample table addresses everything.
+class RangeReader {
+  constructor(file) {
+    this.file = file;
+    this.chunks = []; // sorted, non-overlapping { start, end, bytes }
+    this.bytesRead = 0;
+    this.reads = 0;
+    this.ioMs = 0; // so readMs stays "time spent on I/O" and comparable to before
+  }
+
+  /// Sub-intervals of [start, end) not already held.
+  missing(start, end) {
+    const gaps = [];
+    let cursor = start;
+    for (const chunk of this.chunks) {
+      if (chunk.end <= cursor) continue;
+      if (chunk.start >= end) break;
+      if (chunk.start > cursor) gaps.push([cursor, Math.min(chunk.start, end)]);
+      cursor = Math.max(cursor, chunk.end);
+      if (cursor >= end) break;
+    }
+    if (cursor < end) gaps.push([cursor, end]);
+    return gaps;
+  }
+
+  async ensure(start, end) {
+    const stop = Math.min(end, this.file.size);
+    const from = Math.max(0, start);
+    if (from >= stop) return;
+    for (const [a, b] of this.missing(from, stop)) {
+      const t = performance.now();
+      const buffer = await this.file.slice(a, b).arrayBuffer();
+      this.ioMs += performance.now() - t;
+      this.chunks.push({ start: a, end: b, bytes: new Uint8Array(buffer) });
+      this.chunks.sort((x, y) => x.start - y.start);
+      this.bytesRead += b - a;
+      this.reads++;
+    }
+  }
+
+  bytes(offset, size) {
+    for (const chunk of this.chunks) {
+      if (offset >= chunk.start && offset + size <= chunk.end) {
+        const at = offset - chunk.start;
+        return chunk.bytes.subarray(at, at + size); // the common case: no copy
+      }
+    }
+    // A sample can straddle two reads — `ensure` only fetches the parts it is
+    // missing, so a range half-covered by the header read arrives as neighbours.
+    // Stitch them, which is the only case that costs a copy.
+    const out = new Uint8Array(size);
+    let filled = 0;
+    for (const chunk of this.chunks) {
+      const at = offset + filled;
+      if (chunk.end <= at) continue;
+      if (chunk.start > at) break; // gap: genuinely never read
+      const take = Math.min(chunk.end - at, size - filled);
+      out.set(chunk.bytes.subarray(at - chunk.start, at - chunk.start + take), filled);
+      filled += take;
+      if (filled === size) return out;
+    }
+    throw new Error(`byte range ${offset}+${size} was never read`);
+  }
+}
+
+/// Read just enough of the container to build the sample table.
+///
+/// Most camera files put `moov` AFTER the payload — 30 of 36 clips in the bench
+/// set are `ftyp,mdat…,moov` — so streaming from the front would read the whole
+/// file to reach the tables. mp4box's `appendBuffer` returns the position it
+/// wants next, and that skips over `mdat`, so following it lands on the moov in
+/// a couple of reads wherever it lives.
+async function readHeader(reader, file) {
+  const mp4 = createFile();
+  let info = null, failure = null;
+  mp4.onReady = (parsed) => { info = parsed; };
+  mp4.onError = (error) => { failure = error; };
+  let position = 0;
+  for (let step = 0; step < MAX_HEADER_STEPS && !info && !failure; step++) {
+    const end = Math.min(file.size, position + HEADER_CHUNK);
+    if (position >= end) break;
+    await reader.ensure(position, end);
+    const window = reader.bytes(position, end - position).slice(); // mp4box keeps it
+    const next = mp4.appendBuffer(MP4BoxBuffer.fromArrayBuffer(window.buffer, position));
+    if (info || failure) break;
+    position = typeof next === "number" && next > position ? next : end;
+  }
+  return { mp4, info, failure };
+}
+
 /// Demux `file` and return its video track plus the full sample table. Samples
-/// carry absolute file offsets, so chunks are sliced straight out of the buffer
-/// we already hold — mp4box never has to copy the payload back to us.
+/// carry absolute file offsets, which the reader resolves against whatever it
+/// has fetched — mp4box never has to copy the payload back to us.
 async function demux(file) {
   const tRead = performance.now();
-  // NB (benchmark): this reads the WHOLE clip. The range-merge below cuts
-  // *decode* to a fraction, but I/O is still 100% — that asymmetry is exactly
-  // what `bytesRead` vs `bytesTotal` is here to expose.
-  const buffer = await file.arrayBuffer();
-  const tDemux = performance.now();
-  const mp4 = createFile();
-  const info = await new Promise((resolve, reject) => {
-    mp4.onReady = resolve;
-    mp4.onError = (error) => reject(new Error(`demux failed: ${error}`));
-    mp4.appendBuffer(MP4BoxBuffer.fromArrayBuffer(buffer, 0));
+  const reader = new RangeReader(file);
+  let { mp4, info, failure } = await readHeader(reader, file);
+  let wholeFile = false;
+  if (!info && !failure) {
+    // An unfamiliar layout is not worth failing over: read it all and re-parse.
+    wholeFile = true;
+    await reader.ensure(0, file.size);
+    mp4 = createFile();
+    mp4.onReady = (parsed) => { info = parsed; };
+    mp4.onError = (error) => { failure = error; };
+    mp4.appendBuffer(MP4BoxBuffer.fromArrayBuffer(reader.bytes(0, file.size).slice().buffer, 0));
     mp4.flush();
-    // onReady fires synchronously during append; if it didn't, there is no moov.
-    reject(new Error("no moov box (not a readable MP4)"));
-  });
+  }
+  if (failure) throw new Error(`demux failed: ${failure}`);
+  if (!info) throw new Error("no moov box (not a readable MP4)");
   const track = info.videoTracks?.[0];
   if (!track) throw new Error("no video track");
   const samples = mp4.getTrackById(track.id).samples;
   if (!samples?.length) throw new Error("no samples in video track");
   return {
-    buffer, mp4, track, samples,
-    readMs: tDemux - tRead,
-    demuxMs: performance.now() - tDemux,
-    bytesRead: buffer.byteLength,
+    reader, mp4, track, samples, wholeFile,
+    headerBytes: reader.bytesRead,
+    headerReads: reader.reads,
+    headerMs: performance.now() - tRead,
   };
 }
 
@@ -79,15 +179,14 @@ function codecDescription(mp4, trackId) {
 /// Does this sample contain a random-access NAL unit? Samples are stored as
 /// length-prefixed NAL units (AVCC/HVCC), so this walks the prefixes and looks
 /// for an IDR (H.264 type 5) or IRAP (HEVC types 16-23).
-function sampleIsRandomAccess(view, sample, nalLengthSize, isHevc) {
-  let p = sample.offset;
-  const end = sample.offset + sample.size;
-  while (p + nalLengthSize <= end) {
+export function sampleIsRandomAccess(bytes, nalLengthSize, isHevc) {
+  let p = 0;
+  while (p + nalLengthSize <= bytes.length) {
     let length = 0;
-    for (let i = 0; i < nalLengthSize; i++) length = length * 256 + view.getUint8(p + i);
+    for (let i = 0; i < nalLengthSize; i++) length = length * 256 + bytes[p + i];
     p += nalLengthSize;
-    if (length <= 0 || p + length > end) break;
-    const header = view.getUint8(p);
+    if (length <= 0 || p + length > bytes.length) break;
+    const header = bytes[p];
     if (isHevc ? ((header >> 1) & 0x3f) >= 16 && ((header >> 1) & 0x3f) <= 23 : (header & 0x1f) === 5) {
       return true;
     }
@@ -96,37 +195,86 @@ function sampleIsRandomAccess(view, sample, nalLengthSize, isHevc) {
   return false;
 }
 
-/// Random-access flags per sample, repaired against the bitstream when needed.
+/// Sync flags per sample, verified against the bitstream only where it matters.
 ///
 /// ISO/IEC 14496-12: when a track has no `stss` box, *every* sample is by
 /// definition a sync sample, and mp4box reports that faithfully. Plenty of
-/// camera MP4s omit `stss` while still encoding P-frames — trusting the flag
-/// there makes every "keyframe" a P-frame, and WebCodecs rejects the chunk
-/// ("marked as type key but wasn't a key frame") or silently emits nothing.
-/// So whenever every sample claims to be sync, verify against the NAL units.
-/// A genuinely all-intra clip verifies as all-sync anyway, so this is safe.
-function randomAccessFlags(buffer, samples, config) {
-  const flags = samples.map((s) => !!s.is_sync);
-  if (!flags.every(Boolean) || samples.length < 2) return { flags, repaired: false };
+/// camera MP4s omit `stss` while still encoding P-frames — 27 of the 36 clips in
+/// the bench set do — and trusting the flag there makes every "keyframe" a
+/// P-frame, which WebCodecs rejects ("marked as type key but wasn't a key
+/// frame") or silently decodes to nothing.
+///
+/// The old repair scanned every sample, which needed the whole file. Under
+/// byte-range reads we instead verify backwards from each frame we want, which
+/// touches precisely the samples we were about to decode anyway — the check is
+/// nearly free, because those bytes have to be fetched regardless.
+class SyncTable {
+  constructor(samples, config, reader) {
+    this.samples = samples;
+    this.reader = reader;
+    this.flags = samples.map((s) => !!s.is_sync);
+    this.checked = new Uint8Array(samples.length);
+    this.repaired = false;
 
-  const codec = (config.codec || "").toLowerCase();
-  const isHevc = codec.startsWith("hev") || codec.startsWith("hvc");
-  const isAvc = codec.startsWith("avc");
-  if (!isAvc && !isHevc) return { flags, repaired: false }; // unknown codec: trust the container
-
-  // Length-prefix size lives in the codec config: avcC byte 4, hvcC byte 21.
-  const desc = config.description;
-  const offset = isHevc ? 21 : 4;
-  const nalLengthSize = desc && desc.length > offset ? (desc[offset] & 0x03) + 1 : 4;
-
-  const view = new DataView(buffer);
-  let found = 0;
-  for (let i = 0; i < samples.length; i++) {
-    flags[i] = sampleIsRandomAccess(view, samples[i], nalLengthSize, isHevc);
-    if (flags[i]) found++;
+    const codec = (config.codec || "").toLowerCase();
+    this.isHevc = codec.startsWith("hev") || codec.startsWith("hvc");
+    const known = this.isHevc || codec.startsWith("avc");
+    // Only all-sync tracks are suspect; a real `stss` is trustworthy, and an
+    // unknown codec is not ours to second-guess.
+    this.suspect = known && samples.length > 1 && this.flags.every(Boolean);
+    // Length-prefix size lives in the codec config: avcC byte 4, hvcC byte 21.
+    const at = this.isHevc ? 21 : 4;
+    const desc = config.description;
+    this.nalLengthSize = desc && desc.length > at ? (desc[at] & 0x03) + 1 : 4;
   }
-  if (!found) return { flags: samples.map((s) => !!s.is_sync), repaired: false }; // no IDRs found; keep the container's word
-  return { flags, repaired: found !== samples.length };
+
+  /// One contiguous read covering samples [from, to] — they are adjacent in the
+  /// file, so this is one request rather than one per sample.
+  async fetchSamples(from, to) {
+    const first = this.samples[from], last = this.samples[to];
+    await this.reader.ensure(first.offset, last.offset + last.size);
+  }
+
+  async check(index) {
+    if (this.checked[index]) return this.flags[index];
+    const sample = this.samples[index];
+    const real = sampleIsRandomAccess(
+      this.reader.bytes(sample.offset, sample.size), this.nalLengthSize, this.isHevc,
+    );
+    if (this.flags[index] && !real) this.repaired = true;
+    this.flags[index] = real;
+    this.checked[index] = 1;
+    return real;
+  }
+
+  /// Nearest real random-access point at or before `index`, verifying every
+  /// sample in between — which is exactly the span that will be decoded.
+  async lastRandomAccessAtOrBefore(index) {
+    for (let end = index; end >= 0; end -= VERIFY_WINDOW) {
+      const start = Math.max(0, end - VERIFY_WINDOW + 1);
+      await this.fetchSamples(start, end);
+      for (let i = end; i >= start; i--) if (await this.check(i)) return i;
+    }
+    return null; // no IDR anywhere before it; caller keeps the container's word
+  }
+
+  /// Every sample in [from, to] gets a real flag. Merging two ranges can span
+  /// samples nobody walked past, and those are decoded too, so their key/delta
+  /// labels have to be right.
+  async verifyRange(from, to) {
+    for (let start = from; start <= to; start += VERIFY_WINDOW) {
+      const end = Math.min(to, start + VERIFY_WINDOW - 1);
+      let pending = false;
+      for (let i = start; i <= end; i++) if (!this.checked[i]) { pending = true; break; }
+      if (!pending) continue;
+      await this.fetchSamples(start, end);
+      for (let i = start; i <= end; i++) await this.check(i);
+    }
+  }
+
+  get keyframes() {
+    return this.flags.reduce((n, k) => n + (k ? 1 : 0), 0);
+  }
 }
 
 /// Which sample ranges must be decoded to reach `targets` (presentation-order
@@ -179,7 +327,7 @@ export async function extractFrames(file, targets, onFrame) {
   if (typeof VideoDecoder === "undefined") throw new Error("WebCodecs unavailable");
 
   const tStart = performance.now();
-  const { buffer, mp4, track, samples, readMs, demuxMs, bytesRead } = await demux(file);
+  const { reader, mp4, track, samples, wholeFile, headerMs, headerBytes, headerReads } = await demux(file);
   const tConfig = performance.now();
 
   const config = {
@@ -194,28 +342,56 @@ export async function extractFrames(file, targets, onFrame) {
   }
 
   const tPlan = performance.now();
-  const { flags: isSync, repaired } = randomAccessFlags(buffer, samples, config);
+  const sync = new SyncTable(samples, config, reader);
+  const isSync = sync.flags;
   const timescale = track.timescale;
   const stamp = (sample) => Math.round((sample.cts * 1e6) / timescale);
   const chunkFor = (index) => new EncodedVideoChunk({
     type: isSync[index] ? "key" : "delta",
     timestamp: stamp(samples[index]),
     duration: Math.round((samples[index].duration * 1e6) / timescale),
-    data: new Uint8Array(buffer, samples[index].offset, samples[index].size),
+    data: reader.bytes(samples[index].offset, samples[index].size),
   });
 
-  // Measured once per codec, on the head of this clip's own plan — real frames
-  // from the file we are about to decode, so the answer is about this footage
-  // rather than a synthetic sample.
-  const firstPlan = planRanges(samples, targets, isSync);
+  // Plan, verify, re-plan, fetch. The first pass exists only to learn WHICH
+  // samples we want: with a suspect all-sync table its ranges are wrong, because
+  // every sample claims to be a keyframe and so every range is one frame long.
+  // Walking back from each wanted sample finds the real random-access point.
+  async function preparePlan(wanted) {
+    let plan = planRanges(samples, wanted, isSync);
+    if (sync.suspect) {
+      for (const index of [...plan.wanted.keys()].sort((a, b) => a - b)) {
+        await sync.lastRandomAccessAtOrBefore(index);
+      }
+      plan = planRanges(samples, wanted, isSync);
+      // Range starts are now real random-access points and can only move earlier,
+      // never later, so this needs no further re-plan — but the samples a merge
+      // swallowed between two targets still need honest key/delta labels.
+      for (const [from, to] of plan.ranges) await sync.verifyRange(from, to);
+    }
+    // Everything the decoder will read, in as few requests as the ranges allow.
+    for (const [from, to] of plan.ranges) {
+      await reader.ensure(samples[from].offset, samples[to].offset + samples[to].size);
+    }
+    return plan;
+  }
+
+  const firstPlan = await preparePlan(targets);
+  // The probe measures from the first random-access point and may run PAST the
+  // planned range — a range can be a single sample, and one frame measures
+  // configure() rather than decode. Those samples are contiguous, so they decode
+  // cleanly, but their bytes have to be fetched like any others.
+  const probeStart = firstPlan.ranges[0]?.[0];
+  const probeEnd = probeStart === undefined
+    ? undefined
+    : Math.min(samples.length - 1, probeStart + PROBE_FRAMES - 1);
+  if (probeStart !== undefined && !preferences.has(fingerprint(config))) {
+    await reader.ensure(samples[probeStart].offset, samples[probeEnd].offset + samples[probeEnd].size);
+  }
   const mode = await preferredMode(config, () => {
-    // From the first random-access point, running PAST the planned range: a
-    // range can be a single sample, and one frame measures configure() rather
-    // than decode. The samples are contiguous, so the extra ones decode cleanly.
-    const start = firstPlan.ranges[0]?.[0];
-    if (start === undefined) return [];
+    if (probeStart === undefined) return [];
     const chunks = [];
-    for (let i = start; i < Math.min(samples.length, start + PROBE_FRAMES); i++) chunks.push(chunkFor(i));
+    for (let i = probeStart; i <= probeEnd; i++) chunks.push(chunkFor(i));
     return chunks;
   });
 
@@ -226,8 +402,8 @@ export async function extractFrames(file, targets, onFrame) {
   // One decode attempt, over whatever targets are still outstanding. Separated
   // so a hardware failure can be retried in software without re-delivering the
   // frames that already made it through.
-  async function attempt(acceleration, wanted) {
-    plan = planRanges(samples, wanted, isSync);
+  async function attempt(acceleration, wanted, prepared) {
+    plan = prepared || await preparePlan(wanted);
     const byTimestamp = new Map();
     for (const [index, frame] of plan.wanted) byTimestamp.set(stamp(samples[index]), frame);
     const cropping = [];
@@ -274,7 +450,7 @@ export async function extractFrames(file, targets, onFrame) {
   }
 
   let accel = mode;
-  let result = await attempt(accel, targets);
+  let result = await attempt(accel, targets, firstPlan);
   if (result.failure && accel !== "prefer-software") {
     // Retry only what never arrived, so partial progress is not re-cropped.
     const remaining = targets.filter((t) => !delivered.has(t));
@@ -298,7 +474,11 @@ export async function extractFrames(file, targets, onFrame) {
     height: track.video?.height,
     durationS: track.duration && track.timescale ? +(track.duration / track.timescale).toFixed(1) : null,
     bytesTotal: file.size,
-    bytesRead, // today == bytesTotal; the gap is the byte-range prize
+    bytesRead: reader.bytesRead, // header + the sample ranges actually decoded
+    reads: reader.reads,         // how many slice() requests that took
+    headerBytes,                 // of which, finding the sample table
+    headerReads,
+    wholeFile,                   // fell back to reading everything
 
     // What we asked of it
     frames,
@@ -308,15 +488,16 @@ export async function extractFrames(file, targets, onFrame) {
     coverage: +(plan.cost / frames).toFixed(3), // planned share of the clip
     ranges: plan.ranges.length,
     linear: plan.linear,
-    syncRepaired: repaired, // container claimed every sample was a keyframe
-    keyframes: isSync.reduce((n, k) => n + (k ? 1 : 0), 0),
+    syncRepaired: sync.repaired, // container claimed every sample was a keyframe
+    syncSuspect: sync.suspect,   // ...and so had to be checked against the bitstream
+    keyframes: sync.keyframes,   // among samples checked; the rest keep their flag
     missing: [...plan.missing, ...result.undelivered],
     accel, // what the probe picked, or "prefer-software" after a demotion
 
     // Where the time went (readMs..decodeMs are sequential and additive;
     // onFrameMs runs *inside* decodeMs)
-    readMs: +readMs.toFixed(1),
-    demuxMs: +demuxMs.toFixed(1),
+    readMs: +reader.ioMs.toFixed(1), // all I/O: header + sample ranges
+    headerMs: +headerMs.toFixed(1),  // of which, reaching the sample table
     configMs: +(tPlan - tConfig).toFixed(1),
     planMs: +(tDecodeStart - tPlan).toFixed(1),
     decodeMs: +(tDecodeEnd - tDecodeStart).toFixed(1),
