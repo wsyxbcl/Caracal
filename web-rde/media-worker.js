@@ -156,7 +156,7 @@ async function videoFrameBitmap(file, frameNumber, width = 0) {
 // Crop several detections out of one clip (SPEC §7). Several boxes can sit on
 // the same frame, so requests are grouped by frame and that frame is decoded
 // once. Returns the crops plus decode stats for the caller to log.
-async function cropVideo(file, items) {
+async function cropVideo(file, items, ablate) {
   const { extractFrames, DEMUXABLE } = await videoReady;
   if (!DEMUXABLE.test(file.name)) throw new Error(`container not demuxable in-browser: ${file.name.split(".").pop()}`);
   const byFrame = new Map();
@@ -179,7 +179,7 @@ async function cropVideo(file, items) {
   let failure = null;
   let stats = {};
   try {
-    stats = await extractFrames(file, [...byFrame.keys()], harvest);
+    stats = await extractFrames(file, [...byFrame.keys()], harvest, { ablate });
   } catch (err) {
     failure = String(err?.message || err);
   }
@@ -212,7 +212,7 @@ self.onmessage = async (event) => {
       const file = await sourceFile(event.data);
       // Video: one demux + decode pass yields every requested frame's crops.
       if (items.some((it) => it.frameNumber !== undefined)) {
-        self.postMessage({ id, ok: true, ...(await cropVideo(file, items)) });
+        self.postMessage({ id, ok: true, ...(await cropVideo(file, items, event.data.ablate)) });
         return;
       }
       // Stills: same phase breakdown as video, so the two are comparable.

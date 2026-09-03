@@ -360,13 +360,21 @@
     // background tier now finds its own level per device (see the tuner below),
     // and this stays only as the starting point and the interactive ceiling.
     const MANUAL_CONCURRENCY = Number(new URLSearchParams(location.search).get("concurrency")) || 0;
+    // Systems ablation: ?ablate=wholefile,linear,groupcrops,software forces a
+    // component off so its contribution can be measured instead of assumed. Each
+    // of these was added on the strength of a measurement; this is how we find
+    // out which ones still earn their keep, and which can simply be deleted.
+    // Pin ?concurrency=N alongside it — comparing runs at different concurrency
+    // is what made two of our own benchmarks incomparable.
+    const ABLATE = (new URLSearchParams(location.search).get("ablate") || "")
+      .split(",").map((s) => s.trim()).filter(Boolean);
     const DECODE_CONCURRENCY = MANUAL_CONCURRENCY || 3;
     const PAGE = 200;             // tiles rendered per group at a time (a group can have thousands)
 
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-03c";
+    const BUILD = "2026-09-03d";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -432,7 +440,7 @@
     // Returns [{ key, blob }] or null. One disk read for the whole batch.
     function mediaCropBatch(src, items) {
       const t = performance.now();
-      return cropWorker({ kind: "cropBatch", ...src, items }).then((d) => {
+      return cropWorker({ kind: "cropBatch", ...src, items, ablate: ABLATE }).then((d) => {
         if (!d.ok) return null;
         const rpcMs = performance.now() - t;
         recordDecode(rpcMs);
@@ -555,6 +563,8 @@
         return JSON.stringify({
           build: BUILD,
           concurrency: DECODE_CONCURRENCY,
+          backgroundConcurrency: bgLimit,
+          ablated: ABLATE,
           agent: navigator.userAgent,
           hardwareConcurrency: navigator.hardwareConcurrency,
           deviceMemoryGB: navigator.deviceMemory,
@@ -1660,7 +1670,12 @@
         // frames we are decoding anyway and cost ~12 ms each, against 200 ms+ to
         // re-read the file later. Tiles for other groups simply aren't on screen
         // yet — fillTile ignores them and the LRU keeps the result.
-        for (const inst of state.instancesByMedia.get(imageIndex) || []) {
+        // Ablation "groupcrops": crop only the instances asked for, so the
+        // media-complete batching below can be measured against its absence.
+        const onThisMedium = ABLATE.includes("groupcrops")
+          ? instances.filter((i) => i.det_ref.image_index === imageIndex)
+          : state.instancesByMedia.get(imageIndex) || [];
+        for (const inst of onThisMedium) {
           const k = cropKey(inst.det_ref);
           if (cropCache.has(k)) continue;
           if (VIDEO_RE.test(src.name) && !decodableVideo(src.name, inst)) continue;

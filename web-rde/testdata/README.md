@@ -19,3 +19,26 @@ would fail on YUV→RGB rounding differences that are not bugs.
 that makes every "keyframe" a P-frame and WebCodecs rejects the chunk. 27 of 36
 clips in one real camera set were like this. The fixture reproduces it without
 needing that footage.
+
+## Systems ablation
+
+`?ablate=<flags>` forces a component off so its contribution can be measured
+instead of assumed. Each of these was added on the strength of a measurement;
+this is how we find out which still earn their keep and which can be deleted.
+
+| flag | forces |
+|---|---|
+| `wholefile` | read each clip whole, as before byte-range reads |
+| `linear` | decode the whole track instead of merged RAP ranges |
+| `groupcrops` | crop only the current group's detections, not every detection on an open clip |
+| `software` | skip the hardware/software decode probe |
+
+Comma-separate them, and **always pin `?concurrency=N` alongside** — comparing
+runs at different concurrency is what made two of our own benchmarks
+incomparable. Same document, same first-N media, one variable at a time.
+`__rdeBench.dump()` records `ablated` and `backgroundConcurrency` so a dump says
+which configuration produced it.
+
+Delete a component only if it fails to help in **any** environment measured —
+storage latency differs enough between a laptop SSD and a network share that one
+machine is not evidence.

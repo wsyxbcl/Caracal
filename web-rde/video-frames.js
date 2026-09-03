@@ -186,14 +186,16 @@ async function readHeader(reader, file) {
 /// Demux `file` and return its video track plus the full sample table. Samples
 /// carry absolute file offsets, which the reader resolves against whatever it
 /// has fetched — mp4box never has to copy the payload back to us.
-async function demux(file) {
+async function demux(file, ablate) {
   const tRead = performance.now();
   const reader = new RangeReader(file);
-  let { mp4, info, failure } = await readHeader(reader, file);
-  let wholeFile = false;
+  let mp4 = null, info = null, failure = null;
+  let wholeFile = ablate.has("wholefile"); // ablation: read it all, as we used to
+  if (!wholeFile) ({ mp4, info, failure } = await readHeader(reader, file));
   if (!info && !failure) {
     // An unfamiliar layout is not worth failing over: read it all and re-parse.
     wholeFile = true;
+    mp4 = null;
     await reader.ensure(0, file.size);
     mp4 = createFile();
     mp4.onReady = (parsed) => { info = parsed; };
@@ -333,7 +335,7 @@ class SyncTable {
 /// Which sample ranges must be decoded to reach `targets` (presentation-order
 /// frame indices). Exported for testing — this is pure index arithmetic.
 /// `isSync` overrides the container's flags when they have been repaired.
-export function planRanges(samples, targets, isSync) {
+export function planRanges(samples, targets, isSync, forceLinear = false) {
   // Presentation order: sort by composition time, ties by decode order.
   const presentation = samples
     .map((_, index) => index)
@@ -365,7 +367,7 @@ export function planRanges(samples, targets, isSync) {
   }
 
   const cost = merged.reduce((sum, [start, end]) => sum + (end - start + 1), 0);
-  if (cost > samples.length * LINEAR_COVERAGE) {
+  if (forceLinear || cost > samples.length * LINEAR_COVERAGE) {
     return { ranges: [[0, samples.length - 1]], wanted, missing, linear: true, cost: samples.length };
   }
   return { ranges: merged, wanted, missing, linear: false, cost };
@@ -376,11 +378,14 @@ export function planRanges(samples, targets, isSync) {
 /// soon as `onFrame` resolves — copy anything you need out of it first. Frames
 /// decoded only to *reach* a target are closed without ever reaching `onFrame`.
 /// Returns decode statistics.
-export async function extractFrames(file, targets, onFrame) {
+export async function extractFrames(file, targets, onFrame, options = {}) {
   if (typeof VideoDecoder === "undefined") throw new Error("WebCodecs unavailable");
+  // Systems ablation: force a component off so its contribution can be measured
+  // rather than argued about. Empty in normal use.
+  const ablate = new Set(options.ablate || []);
 
   const tStart = performance.now();
-  const { reader, mp4, track, samples, wholeFile, headerMs, headerBytes, headerReads } = await demux(file);
+  const { reader, mp4, track, samples, wholeFile, headerMs, headerBytes, headerReads } = await demux(file, ablate);
   const tConfig = performance.now();
 
   const config = {
@@ -412,7 +417,7 @@ export async function extractFrames(file, targets, onFrame) {
   // every sample claims to be a keyframe and so every range is one frame long.
   // Walking back from each wanted sample finds the real random-access point.
   async function preparePlan(wanted) {
-    let plan = planRanges(samples, wanted, isSync);
+    let plan = planRanges(samples, wanted, isSync, ablate.has("linear"));
     if (sync.suspect) {
       const indices = [...plan.wanted.keys()].sort((a, b) => a - b);
       // Fetch everything the walks are about to read, in one go. Walking each
@@ -421,7 +426,7 @@ export async function extractFrames(file, targets, onFrame) {
       // close, so this is a single request that also covers the decode range.
       await fetchSpans(indices.map((i) => [Math.max(0, i - VERIFY_WINDOW), i]));
       for (const index of indices) await sync.lastRandomAccessAtOrBefore(index);
-      plan = planRanges(samples, wanted, isSync);
+      plan = planRanges(samples, wanted, isSync, ablate.has("linear"));
       // Range starts are now real random-access points and can only move earlier,
       // never later, so this needs no further re-plan — but the samples a merge
       // swallowed between two targets still need honest key/delta labels.
@@ -460,7 +465,7 @@ export async function extractFrames(file, targets, onFrame) {
   if (probeStart !== undefined && !preferences.has(fingerprint(config))) {
     await reader.ensure(samples[probeStart].offset, samples[probeEnd].offset + samples[probeEnd].size);
   }
-  const mode = await preferredMode(config, probeFrames, () => {
+  const mode = ablate.has("software") ? "prefer-software" : await preferredMode(config, probeFrames, () => {
     if (probeStart === undefined) return [];
     const chunks = [];
     for (let i = probeStart; i <= probeEnd; i++) chunks.push(chunkFor(i));
@@ -565,6 +570,7 @@ export async function extractFrames(file, targets, onFrame) {
     keyframes: sync.keyframes,   // among samples checked; the rest keep their flag
     missing: [...plan.missing, ...result.undelivered],
     accel, // what the probe picked, or "prefer-software" after a demotion
+    ablated: ablate.size ? [...ablate] : undefined,
     // What the probe actually measured, so "why software?" is answerable from a
     // dump instead of needing the console line from the right moment.
     probe: preferences.get(fingerprint(config)) || null,
