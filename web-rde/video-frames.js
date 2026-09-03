@@ -453,13 +453,14 @@ export async function extractFrames(file, targets, onFrame) {
   // configure() rather than decode. Those samples are contiguous, so they decode
   // cleanly, but their bytes have to be fetched like any others.
   const probeStart = firstPlan.ranges[0]?.[0];
+  const probeFrames = Math.max(PROBE_MIN_FRAMES, Math.min(PROBE_MAX_FRAMES, firstPlan.cost));
   const probeEnd = probeStart === undefined
     ? undefined
-    : Math.min(samples.length - 1, probeStart + PROBE_FRAMES - 1);
+    : Math.min(samples.length - 1, probeStart + probeFrames - 1);
   if (probeStart !== undefined && !preferences.has(fingerprint(config))) {
     await reader.ensure(samples[probeStart].offset, samples[probeEnd].offset + samples[probeEnd].size);
   }
-  const mode = await preferredMode(config, () => {
+  const mode = await preferredMode(config, probeFrames, () => {
     if (probeStart === undefined) return [];
     const chunks = [];
     for (let i = probeStart; i <= probeEnd; i++) chunks.push(chunkFor(i));
@@ -591,10 +592,13 @@ export async function extractFrames(file, targets, onFrame) {
 //
 // Keyed by codec fingerprint rather than by machine: one document can hold
 // several profiles, and the answer can differ between them.
-// Hardware decoders cost far more to configure than software ones, so a short
-// probe measures setup and picks software every time. The production clips decode
-// a median of 35 frames, so the probe uses a comparable run.
-const PROBE_FRAMES = 40;
+// Hardware decoders cost far more to configure than software ones, so too short
+// a probe measures setup rather than decode and picks software every time. But
+// the right length is a property of the DOCUMENT, not a number from one camera
+// set: a clip that decodes three frames is not served by a forty-frame verdict.
+// So the probe runs whatever this clip's own plan asks for, within reason.
+const PROBE_MIN_FRAMES = 8;
+const PROBE_MAX_FRAMES = 64;
 const HW_TIE_MARGIN = 1.1; // hardware wins ties: it also frees CPU for other clips
 const preferences = new Map(); // fingerprint -> { mode, hwMs, swMs, demoted }
 const probing = new Map();     // fingerprint -> in-flight probe, so clips don't race
@@ -627,7 +631,7 @@ async function timeDecode(config, mode, chunks) {
   return failed ? null : performance.now() - t;
 }
 
-async function preferredMode(config, makeChunks) {
+async function preferredMode(config, frames, makeChunks) {
   const key = fingerprint(config);
   const known = preferences.get(key);
   if (known) return known.mode;
@@ -642,7 +646,7 @@ async function preferredMode(config, makeChunks) {
       else if (hwMs !== null) mode = "prefer-hardware";
       else if (swMs !== null) mode = "prefer-software";
     }
-    preferences.set(key, { mode, hwMs, swMs, demoted: false });
+    preferences.set(key, { mode, hwMs, swMs, frames: chunks.length, demoted: false });
     const ms = (v) => (v === null ? "unavailable" : `${Math.round(v)} ms`);
     console.log(`[rde] decode probe ${key}: hardware ${ms(hwMs)} vs software ${ms(swMs)}` +
       ` over ${chunks.length} frames → ${mode}`);
@@ -674,7 +678,7 @@ function noteHardwareFailure(config) {
 /// What the probe decided and what it measured, for the benchmark dump — the
 /// numbers behind a surprising choice matter more than the choice.
 export function decodePreferences() {
-  return [...preferences].map(([codec, v]) => ({ codec, frames: PROBE_FRAMES, ...v }));
+  return [...preferences].map(([codec, v]) => ({ codec, ...v }));
 }
 
 /// Wait for the decoder to work through its backlog.

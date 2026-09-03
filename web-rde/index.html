@@ -366,7 +366,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-03a";
+    const BUILD = "2026-09-03b";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -1495,7 +1495,10 @@
     // version prefix is what invalidates them when crop *rendering* changes.
     const VIDEO_RE = /\.(mp4|avi|mov|mkv|webm|m4v)$/i;
     const RENDER_VERSION = "r2"; // bump when crop size/padding/box styling/format changes
-    const CROP_CACHE_BYTES = 256 * 1024 * 1024;
+    // Scaled to the device rather than assuming a workstation. deviceMemory is
+    // coarse and missing in some browsers, but it is the only signal there is,
+    // and a flat 256 MB is a bad bet on a 4 GB laptop.
+    const CROP_CACHE_BYTES = Math.max(64, Math.min(512, (navigator.deviceMemory || 4) * 32)) * 1024 * 1024;
     const cropKey = (ref) => RENDER_VERSION + ":" + ref.image_index + ":" + ref.detection_index;
     const tileByKey = new Map(); // key -> tile element for the current render
 
@@ -1783,16 +1786,22 @@
       12, navigator.hardwareConcurrency || 4,
       navigator.deviceMemory ? Math.max(2, navigator.deviceMemory) : 12,
     ));
-    // Measured on the production set: throughput at a FIXED setting varied 11x
-    // between windows (3.3 to 36.4 crops/s, +-38%), because a window of a dozen
-    // clips catches whatever mix of easy and hard clips it happens to land on.
-    // A single window is therefore not evidence — the first version stepped on an
-    // 8% difference, which was far inside the noise, and one bad window made it
-    // abandon a setting that was twice as fast in the median. So each setting is
-    // sampled several times and compared on medians.
+    // Two things the production run proved, both fatal to a hill-climb.
+    //
+    // Throughput at a FIXED setting varied 11x between windows (3.3 to 36.4
+    // crops/s, +-38%): a window of a dozen clips catches whatever mix of easy and
+    // hard clips it lands on, so one window is not evidence. Each rung is
+    // therefore sampled several times and judged on the median.
+    //
+    // And the curve is NOT monotonic — measured medians were 9.6, 33.8, 19.2 and
+    // 44.2 crops/s at 6, 8, 10, 12. A climb stops at the first dip and never sees
+    // the peak beyond it. Replayed against those distributions, a climb found the
+    // best setting 2-10% of the time and gave up 23% of throughput; sweeping the
+    // ladder finds it ~78% of the time and gives up 5%. A sweep also assumes
+    // nothing about the shape of the curve, which is the point — the shape is a
+    // property of someone's hardware, not something to encode here.
     const WINDOW_SOURCES = 16;   // video sources per measurement window
-    const SAMPLES_PER_LIMIT = 3; // windows to collect before judging a setting
-    const IMPROVE = 0.15;        // median gain worth another step
+    const SAMPLES_PER_LIMIT = 3; // windows per rung before it counts
     const SERVICE_TOLERANCE = 2;   // review decodes may not take twice their best
     const SERVICE_FLOOR_MS = 400;  // ...and below this nobody notices anyway
     const DEGRADED_STREAK = 2;     // one slow window is a hiccup, not a trend
@@ -1801,7 +1810,7 @@
 
     const tuner = {
       on: false, sources: 0, crops: 0, t0: 0, quietest: null, slow: 0,
-      best: null, settled: false, sinceRecheck: 0, history: [], samples: {},
+      ladder: [], rung: 0, settled: false, sinceRecheck: 0, history: [], samples: {},
 
       /// Last session's answer is a starting point, never a conclusion: storage,
       /// thermals and competing load all move between runs.
@@ -1820,11 +1829,9 @@
       start() {
         this.on = !MANUAL_CONCURRENCY;
         if (!this.on) return;
-        Object.assign(this, {
-          sources: 0, crops: 0, t0: performance.now(), best: null, settled: false,
-          sinceRecheck: 0, samples: {}, slow: 0, quietest: null,
-        });
-        this.set(this.remembered() || Math.max(1, Math.min(CONCURRENCY_CAP, Math.floor(CONCURRENCY_CAP / 2))));
+        this.quietest = null;
+        this.history = [];
+        this.startSweep();
       },
       set(limit) {
         bgLimit = Math.max(1, Math.min(CONCURRENCY_CAP, limit));
@@ -1851,43 +1858,69 @@
         (this.samples[at] ||= []).push(rate);
         Object.assign(this, { sources: 0, crops: 0, t0: performance.now() });
 
-        // A run of slow review windows, not one of them: throughput at a fixed
-        // setting swings 11x here, and a single sample sent the first version
-        // running from the setting that was twice as fast.
+        // A run of slow review windows, not one of them: throughput swings 11x
+        // here, and a single sample sent the first version running from the
+        // setting that was twice as fast.
         if (this.slow >= DEGRADED_STREAK && at > 1) {
           this.slow = 0;
           this.set(at - 1);
-          this.best = { limit: at - 1, rate: median(this.samples[at - 1] || [rate]) };
           this.settled = true;
           console.log(`[rde] background concurrency down to ${at - 1}:` +
             ` review decodes slowed to ${Math.round(service)} ms (quietest ${Math.round(this.quietest)} ms)`);
           return;
         }
         if (this.settled) {
-          if (++this.sinceRecheck >= RECHECK_WINDOWS) {
-            Object.assign(this, { settled: false, best: null, sinceRecheck: 0, samples: {} });
-          }
+          if (++this.sinceRecheck >= RECHECK_WINDOWS) this.startSweep();
           return;
         }
-        // Judge a setting only once it has been sampled enough to mean something.
+        // Stay on this rung until it has been sampled enough, then move on.
         if (this.samples[at].length < SAMPLES_PER_LIMIT) return;
-        const here = median(this.samples[at]);
-        if (!this.best || here > this.best.rate * (1 + IMPROVE)) {
-          this.best = { limit: at, rate: here };
-          // Still improving but out of room: stay rather than falling back to the
-          // second best, which is what "take the best" would have meant.
-          if (at >= CONCURRENCY_CAP) this.finish();
-          else this.set(at + 2);
-        } else {
-          this.set(this.best.limit); // the climb stopped paying; take the best
-          this.finish();
-        }
+        this.rung++;
+        if (this.rung < this.ladder.length) this.set(this.ladder[this.rung]);
+        else this.finish();
       },
+
+      /// The settings worth trying — coarse rather than exhaustive, and ordered
+      /// to begin at the one we would have picked anyway. A document can run out
+      /// before the sweep ends, so the good guess is measured first and the low
+      /// rungs, which also take the longest to measure, come last.
+      startSweep() {
+        const rungs = [];
+        for (let n = 2; n < CONCURRENCY_CAP; n *= 2) rungs.push(n);
+        rungs.push(CONCURRENCY_CAP);
+        const unique = [...new Set(rungs)];
+        const start = this.remembered() || Math.max(2, Math.round(CONCURRENCY_CAP / 2));
+        // Ties go to the higher rung: it is both likelier to win and cheaper to measure.
+        const nearest = unique.reduce((b, n) => (Math.abs(n - start) <= Math.abs(b - start) ? n : b), unique[0]);
+        const from = unique.indexOf(nearest);
+        this.ladder = [...unique.slice(from), ...unique.slice(0, from)];
+        Object.assign(this, {
+          rung: 0, samples: {}, slow: 0, settled: false, sinceRecheck: 0,
+          sources: 0, crops: 0, t0: performance.now(),
+        });
+        this.set(this.ladder[0]);
+      },
+
+      /// The pass ended — decide on the evidence collected, even if the sweep
+      /// never reached the end of the ladder. Otherwise a document that runs out
+      /// mid-sweep leaves us parked on whichever rung was being probed, and
+      /// remembers nothing for next time.
+      stop() {
+        if (this.on && !this.settled && Object.keys(this.samples).length) this.finish();
+        this.on = false;
+      },
+
       finish() {
+        // Best measured rung. Rungs the document was too short to reach simply
+        // do not compete.
+        const measured = this.ladder.filter((l) => (this.samples[l] || []).length);
+        const winner = measured.reduce((b, l) => (median(this.samples[l]) > median(this.samples[b]) ? l : b), measured[0]);
         this.settled = true;
-        this.remember(this.best.limit);
-        console.log(`[rde] background concurrency settled at ${this.best.limit}` +
-          ` (median ${this.best.rate.toFixed(1)} crops/s over ${SAMPLES_PER_LIMIT} windows)`, this.history);
+        this.sinceRecheck = 0;
+        this.set(winner);
+        this.remember(winner);
+        console.log(`[rde] background concurrency ${winner} of [${this.ladder}] — median crops/s ` +
+          measured.map((l) => `${l}:${median(this.samples[l]).toFixed(1)}`).join(" "));
       },
     };
 
@@ -1973,7 +2006,7 @@
       // One drain per possible slot; the limiter decides how many actually run,
       // so the tuner can raise bgLimit mid-pass without respawning anything.
       await Promise.all(Array.from({ length: CONCURRENCY_CAP }, drain));
-      tuner.on = false;
+      tuner.stop();
 
       const mins = (performance.now() - precompute.t0) / 60000;
       const { done, total, crops } = precompute;
