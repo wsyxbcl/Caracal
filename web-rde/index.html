@@ -366,7 +366,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-08-29e";
+    const BUILD = "2026-09-03a";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -480,7 +480,11 @@
       get rows() { return bench.rows; },
       get groups() { return bench.groups; },
       reset: () => bench.reset(),
-      get concurrency() { return { background: bgLimit, cap: CONCURRENCY_CAP, windows: tuner.history }; },
+      get concurrency() {
+        const byLimit = Object.fromEntries(Object.entries(tuner.samples)
+          .map(([limit, rates]) => [limit, { windows: rates.length, medianRate: +median(rates).toFixed(1) }]));
+        return { background: bgLimit, cap: CONCURRENCY_CAP, byLimit, windows: tuner.history };
+      },
       get cache() { return { crops: cropCache.size, mb: +(cropCache.bytes / 1e6).toFixed(1) }; },
       /** Drop cached crops down to `mb`, already-judged ones first. Returns MB freed. */
       evict: (mb = 0) => +(cropCache.evictTo(mb * 1e6) / 1e6).toFixed(1),
@@ -515,6 +519,17 @@
           const accel = {};
           for (const r of video) accel[r.accel || "unknown"] = (accel[r.accel || "unknown"] || 0) + 1;
           console.log("decoder chosen per clip:", accel);
+          // The measurement behind that choice, per codec.
+          const probes = {};
+          for (const r of video) {
+            if (!r.probe) continue;
+            const p = r.probe;
+            probes[r.codec + " " + r.width + "x" + r.height] =
+              `hardware ${p.hwMs === null ? "unavailable" : Math.round(p.hwMs) + " ms"}` +
+              ` vs software ${p.swMs === null ? "unavailable" : Math.round(p.swMs) + " ms"}` +
+              ` over ${p.frames} frames -> ${p.mode}` + (p.failures ? ` (${p.failures} hw failures)` : "");
+          }
+          console.log("decode probe:", probes);
         }
         console.log("groups (wall clock):", bench.groups);
         return `${rows.length} sources`;
@@ -1768,16 +1783,25 @@
       12, navigator.hardwareConcurrency || 4,
       navigator.deviceMemory ? Math.max(2, navigator.deviceMemory) : 12,
     ));
-    const WINDOW_SOURCES = 12;   // video sources per measurement window
-    const IMPROVE = 0.08;        // below this, two windows are the same window
+    // Measured on the production set: throughput at a FIXED setting varied 11x
+    // between windows (3.3 to 36.4 crops/s, +-38%), because a window of a dozen
+    // clips catches whatever mix of easy and hard clips it happens to land on.
+    // A single window is therefore not evidence — the first version stepped on an
+    // 8% difference, which was far inside the noise, and one bad window made it
+    // abandon a setting that was twice as fast in the median. So each setting is
+    // sampled several times and compared on medians.
+    const WINDOW_SOURCES = 16;   // video sources per measurement window
+    const SAMPLES_PER_LIMIT = 3; // windows to collect before judging a setting
+    const IMPROVE = 0.15;        // median gain worth another step
     const SERVICE_TOLERANCE = 2;   // review decodes may not take twice their best
     const SERVICE_FLOOR_MS = 400;  // ...and below this nobody notices anyway
+    const DEGRADED_STREAK = 2;     // one slow window is a hiccup, not a trend
     const RECHECK_WINDOWS = 20;  // settled is not the same as permanent
     const TUNE_KEY = "rde.bgConcurrency.v1";
 
     const tuner = {
-      on: false, sources: 0, crops: 0, t0: 0, quietest: null,
-      best: null, settled: false, sinceRecheck: 0, history: [],
+      on: false, sources: 0, crops: 0, t0: 0, quietest: null, slow: 0,
+      best: null, settled: false, sinceRecheck: 0, history: [], samples: {},
 
       /// Last session's answer is a starting point, never a conclusion: storage,
       /// thermals and competing load all move between runs.
@@ -1796,7 +1820,10 @@
       start() {
         this.on = !MANUAL_CONCURRENCY;
         if (!this.on) return;
-        Object.assign(this, { sources: 0, crops: 0, t0: performance.now(), best: null, settled: false, sinceRecheck: 0 });
+        Object.assign(this, {
+          sources: 0, crops: 0, t0: performance.now(), best: null, settled: false,
+          sinceRecheck: 0, samples: {}, slow: 0, quietest: null,
+        });
         this.set(this.remembered() || Math.max(1, Math.min(CONCURRENCY_CAP, Math.floor(CONCURRENCY_CAP / 2))));
       },
       set(limit) {
@@ -1811,42 +1838,56 @@
       closeWindow() {
         const seconds = (performance.now() - this.t0) / 1000;
         const rate = seconds > 0 ? this.crops / seconds : 0;
+        const at = bgLimit;
         // Review comes first: a faster backlog that makes the reviewer wait is
         // not a faster anything. Judged against the quietest window seen rather
         // than an absolute — clips differ far too much for a fixed budget.
         const service = interactiveServiceP90(this.t0);
         if (service) this.quietest = Math.min(this.quietest ?? service, service);
-        const degraded = service && this.quietest && service > Math.max(SERVICE_FLOOR_MS, this.quietest * SERVICE_TOLERANCE);
-        this.history.push({ limit: bgLimit, rate: +rate.toFixed(2), serviceMs: Math.round(service) });
-        const at = bgLimit;
-        if (degraded && bgLimit > 1) {
-          this.set(bgLimit - 1);
-          this.best = { limit: bgLimit, rate };
+        const degraded = service && this.quietest
+          && service > Math.max(SERVICE_FLOOR_MS, this.quietest * SERVICE_TOLERANCE);
+        this.slow = degraded ? (this.slow || 0) + 1 : 0;
+        this.history.push({ limit: at, rate: +rate.toFixed(2), serviceMs: Math.round(service) });
+        (this.samples[at] ||= []).push(rate);
+        Object.assign(this, { sources: 0, crops: 0, t0: performance.now() });
+
+        // A run of slow review windows, not one of them: throughput at a fixed
+        // setting swings 11x here, and a single sample sent the first version
+        // running from the setting that was twice as fast.
+        if (this.slow >= DEGRADED_STREAK && at > 1) {
+          this.slow = 0;
+          this.set(at - 1);
+          this.best = { limit: at - 1, rate: median(this.samples[at - 1] || [rate]) };
           this.settled = true;
-          console.log(`[rde] background concurrency down to ${bgLimit}:` +
+          console.log(`[rde] background concurrency down to ${at - 1}:` +
             ` review decodes slowed to ${Math.round(service)} ms (quietest ${Math.round(this.quietest)} ms)`);
-        } else if (this.settled) {
-          if (++this.sinceRecheck >= RECHECK_WINDOWS) { this.settled = false; this.best = null; this.sinceRecheck = 0; }
-        } else if (!this.best) {
-          this.best = { limit: at, rate };
-          this.set(at + 2);
-        } else if (rate > this.best.rate * (1 + IMPROVE)) {
-          this.best = { limit: at, rate };
-          // Still improving but out of room: stay here rather than falling back
-          // to the second-best, which is what "take the best" would have meant.
+          return;
+        }
+        if (this.settled) {
+          if (++this.sinceRecheck >= RECHECK_WINDOWS) {
+            Object.assign(this, { settled: false, best: null, sinceRecheck: 0, samples: {} });
+          }
+          return;
+        }
+        // Judge a setting only once it has been sampled enough to mean something.
+        if (this.samples[at].length < SAMPLES_PER_LIMIT) return;
+        const here = median(this.samples[at]);
+        if (!this.best || here > this.best.rate * (1 + IMPROVE)) {
+          this.best = { limit: at, rate: here };
+          // Still improving but out of room: stay rather than falling back to the
+          // second best, which is what "take the best" would have meant.
           if (at >= CONCURRENCY_CAP) this.finish();
           else this.set(at + 2);
         } else {
           this.set(this.best.limit); // the climb stopped paying; take the best
           this.finish();
         }
-        Object.assign(this, { sources: 0, crops: 0, t0: performance.now() });
       },
       finish() {
         this.settled = true;
         this.remember(this.best.limit);
         console.log(`[rde] background concurrency settled at ${this.best.limit}` +
-          ` (${this.best.rate.toFixed(1)} crops/s)`, this.history);
+          ` (median ${this.best.rate.toFixed(1)} crops/s over ${SAMPLES_PER_LIMIT} windows)`, this.history);
       },
     };
 

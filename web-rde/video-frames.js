@@ -114,13 +114,6 @@ class RangeReader {
   }
 }
 
-/// Read just enough of the container to build the sample table.
-///
-/// Most camera files put `moov` AFTER the payload — 30 of 36 clips in the bench
-/// set are `ftyp,mdat…,moov` — so streaming from the front would read the whole
-/// file to reach the tables. mp4box's `appendBuffer` returns the position it
-/// wants next, and that skips over `mdat`, so following it lands on the moov in
-/// a couple of reads wherever it lives.
 /// A `moov` box in `bytes` whose extent ends exactly at EOF, or null. Boxes are
 /// [u32 size][u32 type], and there is no trailing index in MP4, so the exact-fit
 /// check is what makes scanning backwards safe rather than a guess.
@@ -133,6 +126,13 @@ function findTrailingMoov(bytes, tailStart, fileSize) {
   return null;
 }
 
+/// Read just enough of the container to build the sample table.
+///
+/// Most camera files put `moov` AFTER the payload — 30 of 36 clips in the bench
+/// set are `ftyp,mdat…,moov` — so streaming from the front would read the whole
+/// file to reach the tables. mp4box's `appendBuffer` returns the position it
+/// wants next, and that skips over `mdat`, so following it lands on the moov
+/// wherever it lives.
 async function readHeader(reader, file) {
   const mp4 = createFile();
   let info = null, failure = null;
@@ -150,11 +150,10 @@ async function readHeader(reader, file) {
     position = typeof next === "number" && next > position ? next : end;
 
     // The parser advances one box at a time, and reaching `moov` past two `mdat`
-    // boxes costs a whole request per header — 2 MB read to learn 16 bytes. The
+    // boxes costs a whole request per header — a 2 MB read to learn 16 bytes. The
     // moov is the last box in every camera file seen here, so find it directly
-    // and bridge the gap with a synthetic `free` box, which is all the parser
-    // needs to skip payload it was never going to read. Tried once; if the moov
-    // is not at EOF the walk simply carries on.
+    // and bridge the gap with a synthetic box header. Tried once; if the moov is
+    // not at EOF the walk simply carries on.
     if (!shortcut && position < file.size) {
       shortcut = true;
       const tailStart = Math.max(position, file.size - TAIL_PROBE);
@@ -565,6 +564,9 @@ export async function extractFrames(file, targets, onFrame) {
     keyframes: sync.keyframes,   // among samples checked; the rest keep their flag
     missing: [...plan.missing, ...result.undelivered],
     accel, // what the probe picked, or "prefer-software" after a demotion
+    // What the probe actually measured, so "why software?" is answerable from a
+    // dump instead of needing the console line from the right moment.
+    probe: preferences.get(fingerprint(config)) || null,
 
     // Where the time went (readMs..decodeMs are sequential and additive;
     // onFrameMs runs *inside* decodeMs)
