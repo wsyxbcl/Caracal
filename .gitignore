@@ -8,3 +8,7 @@
 /dist/
 /data/*.csv
 /web/*.csv
+/web-rde/_test/
+/web-rde/_containers/
+/web-rde/_bench
+/web-rde/_rangetest/

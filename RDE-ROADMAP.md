@@ -155,9 +155,18 @@ authoritative at export even if the detection later stops being a candidate.
    `sourcesFor(instances)` is already the seam. ~0.4 h at concurrency 3 for all
    3,350 clips; ~0.11 GB. OPFS is origin-scoped → the offline launcher needs a
    **stable localhost port** (same constraint as persisting an FSA handle).
-5. **Manual-test the FSA picker** — Chromium/Edge only; Firefox has no File System
-   Access at all and always takes the `webkitdirectory` enumeration path, so this
-   is untested and unexercised by the current reviewer.
+5. **Write down the path contract, then manual-test the FSA picker.** Which shapes
+   of MegaDetector `file` path, against which picked folder, do we claim to
+   support? Today that answer exists only as code: `alignDirectoryHandle` probes a
+   few strip offsets against sample paths, and the `webkitdirectory` fallback
+   matches on basename. Both are inferences, neither is specified, and neither is
+   explained to the user. Real documents carry absolute Windows paths, paths
+   relative to a drive root, or a nested tree that the picked folder sits inside
+   — and getting it wrong shows up as "no image" on every tile rather than as an
+   error anyone can act on. Specify the supported shapes first, then test the
+   picker against each. FSA itself is Chromium/Edge only; Firefox has no File
+   System Access and always takes the enumeration path, so the FSA branch has
+   never been exercised at all.
 6. Move `n_dir_levels_from_leaf` into dataset setup (it is camera grouping, not RDE
    tuning; currently a read-only note showing real camera names).
 7. Optional: video-aware clustering. Clustering counts **distinct media**, so N

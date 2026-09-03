@@ -366,7 +366,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-03b";
+    const BUILD = "2026-09-03c";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -436,13 +436,27 @@
         if (!d.ok) return null;
         const rpcMs = performance.now() - t;
         recordDecode(rpcMs);
-        if (d.stats) bench.record(src.name.split(/[\\/]/).pop(), d.stats, rpcMs, items.length);
+        const name = src.name.split(/[\\/]/).pop();
+        if (d.stats) bench.record(name, d.stats, rpcMs, items.length);
         if (d.stats?.failure) {
-          console.warn(`[rde] ${src.name.split(/[\\/]/).pop()}: ${d.results.length}/${items.length} crops` +
-            ` — ${d.stats.failure} (damaged clip? ffmpeg tolerates what WebCodecs rejects)`);
+          // Two failures actually happen, and they need different advice.
+          const hint = /codec not supported/.test(d.stats.failure)
+            ? "this browser has no decoder for it — pre-extract frames with ffmpeg (SPEC §7)"
+            : "damaged clip? ffmpeg tolerates what WebCodecs rejects";
+          console.warn(`[rde] ${name}: ${d.results.length}/${items.length} crops` +
+            ` — ${d.stats.failure} (${hint})`);
         }
-        return d.results;
+        return { results: d.results, failure: d.stats?.failure || null };
       });
+    }
+
+    /// What to write on a tile that never arrived. A warning triangle on every
+    /// clip tells a reviewer with HEVC footage nothing; the codec name at least
+    /// says why, and points at the pre-extraction escape hatch.
+    function decodeFailLabel(failure) {
+      const codec = /codec not supported: ([\w.]+)/.exec(failure || "")?.[1]?.toLowerCase();
+      if (!codec) return "⚠ decode";
+      return codec.startsWith("hvc") || codec.startsWith("hev") ? "no hevc" : "no codec";
     }
     // Hand the picked directory handle to the workers; each detects the path
     // offset from sample media paths. Returns { ok, offset } / { ok:false, error }.
@@ -1717,16 +1731,18 @@
       paintBuffer(group);
       await Promise.all(sources.map(async (s) => {
         if (!group._active) return;
-        const results = await decodeSourceLimited(s.src, s.items);
+        const batch = await decodeSourceLimited(s.src, s.items);
         if (!group._active) return;
-        if (results) {
+        if (batch) {
+          const { results, failure } = batch;
           // A clip can decode partially (a damaged frame throws while the rest are
           // fine), so mark what didn't arrive rather than leaving blank tiles.
           const got = new Set(results.map((r) => r.key));
+          const label = decodeFailLabel(failure);
           for (const it of s.items) {
             if (got.has(it.key)) continue;
             const tile = tileByKey.get(it.key);
-            if (tile) markTile(tile, "failed", "⚠ decode");
+            if (tile) markTile(tile, "failed", label);
           }
           for (const r of results) {
             if (!r.blob) continue;
@@ -1988,9 +2004,9 @@
           // Review may have decoded this source in the meantime.
           const items = s.items.filter((it) => !cropCache.has(it.key));
           if (items.length) {
-            const results = await decodeSourceLimited(s.src, items, true);
+            const batch = await decodeSourceLimited(s.src, items, true);
             let made = 0;
-            for (const r of results || []) {
+            for (const r of batch?.results || []) {
               if (!r.blob) continue;
               const url = URL.createObjectURL(r.blob);
               cropCache.set(r.key, url, r.blob.size);
