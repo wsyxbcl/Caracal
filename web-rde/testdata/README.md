@@ -30,7 +30,7 @@ this is how we find out which still earn their keep and which can be deleted.
 |---|---|
 | `wholefile` | read each clip whole, as before byte-range reads |
 | `linear` | decode the whole track instead of merged RAP ranges |
-| `groupcrops` | crop only the current group's detections, not every detection on an open clip |
+| `groupcrops` | crop only the detections asked for, not every candidate on an open clip. **Only meaningful while reviewing** — during precompute the caller already passes every candidate, so this switch does nothing there. |
 | `software` | skip the hardware/software decode probe |
 
 Comma-separate them, and **always pin `?concurrency=N` alongside** — comparing

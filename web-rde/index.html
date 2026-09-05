@@ -379,7 +379,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-05a";
+    const BUILD = "2026-09-05b";
     $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
@@ -1676,8 +1676,11 @@
         // frames we are decoding anyway and cost ~12 ms each, against 200 ms+ to
         // re-read the file later. Tiles for other groups simply aren't on screen
         // yet — fillTile ignores them and the LRU keeps the result.
-        // Ablation "groupcrops": crop only the instances asked for, so the
-        // media-complete batching below can be measured against its absence.
+        // Ablation "groupcrops": crop only the instances asked for. This is a
+        // no-op during precompute, where the caller already passes every
+        // candidate — media-complete batching can only pay off while REVIEWING,
+        // when a clip opened for one group also serves the others that share it.
+        // Measuring it needs a sequential-review harness, not a precompute run.
         const onThisMedium = ABLATE.includes("groupcrops")
           ? instances.filter((i) => i.det_ref.image_index === imageIndex)
           : state.instancesByMedia.get(imageIndex) || [];
@@ -1995,10 +1998,14 @@
 
     async function runPrecompute() {
       if (precompute.running) { precompute.cancelled = true; return; } // the button is also Stop
-      // Everything clustered at MIN_THRESHOLD, not just the groups the current
-      // threshold shows: the threshold is a view, so raising it later must not
-      // strand crops that were never made.
-      const sources = sourcesFor(state.allGroups.flatMap((g) => g.instances));
+      // The candidates actually under review. Passing every group clustered at
+      // MIN_THRESHOLD looked like it precomputed more, but did not: sourcesFor
+      // takes each medium's items from `instancesByMedia`, which is built from
+      // the THRESHOLDED groups, so the extra media contributed no items and were
+      // silently skipped. The wider argument only made the intent misleading.
+      // Lowering the threshold afterwards decodes the newly-shown groups on
+      // demand, which is the ordinary path and works.
+      const sources = sourcesFor(state.groups.flatMap((g) => g.instances));
       if (!sources.length) { renderPrecompute("Every crop is already cached."); return; }
       Object.assign(precompute, {
         running: true, cancelled: false, done: 0, crops: 0,
