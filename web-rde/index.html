@@ -374,7 +374,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-03d";
+    const BUILD = "2026-09-05a";
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
@@ -630,7 +630,7 @@
       options: null,
       allGroups: [],                   // clustering at MIN_THRESHOLD; the threshold is a view over it
       groups: [],                      // allGroups filtered to state.threshold — what is reviewed
-      threshold: 20,                   // occurrence_threshold, applied client-side
+      threshold: 10,                   // occurrence_threshold, applied client-side (overwritten from the wasm default on load)
       decisions: new Map(),            // "img:det" -> { decision, at, round } — durable, authoritative
       preview: null,                   // a clustering proposed but not yet applied
       round: 1,                        // parameterization round, provenance only

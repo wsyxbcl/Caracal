@@ -45,7 +45,14 @@ impl Default for RdeOptions {
         Self {
             confidence_min: 0.1,
             confidence_max: 1.0,
-            occurrence_threshold: 20,
+            // Upstream ships 20. On three deployments that had already been
+            // through a human RDE pass, 10 agrees with ~14 points more of what
+            // that reviewer removed, for ~2 points more disagreement the other
+            // way (`examples/ablation.rs`). Those are agreement rates with one
+            // prior review, NOT accuracy against ground truth — nobody has
+            // labelled the raw detections — so this is a judgement about what a
+            // reviewer's time is worth, not a fact about the algorithm.
+            occurrence_threshold: 10,
             iou_threshold: 0.9,
             min_suspicious_size: 0.0,
             max_suspicious_size: 0.2,
