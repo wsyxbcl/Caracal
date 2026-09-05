@@ -272,22 +272,22 @@
         <div class="tune-col">
           <div class="range field" id="occ-range">
             <div class="field-head"><label>Occurrence</label><b class="range-value"></b></div>
-            <p class="field-desc">How many distinct media a box must appear in. Several frames of one clip count once.</p>
+            <p class="field-desc">How many separate files a box must appear in. Several frames of one clip count once.</p>
             <div class="range-track"><div class="range-fill"></div>
               <button class="range-thumb v" aria-label="occurrence threshold"></button></div>
             <div class="range-ticks"></div>
           </div>
-          <p class="field-desc">Instant: clustering does not depend on it.</p>
+          <p class="field-desc">Instant — this only filters groups already found.</p>
           <table class="ladder"><tbody id="ladder"></tbody></table>
         </div>
 
         <div class="tune-col">
           <h3 class="field-group">Clustering</h3>
-          <p class="field-desc">Decides which detections are candidates. Needs a re-cluster.</p>
+          <p class="field-desc">Decides which detections become candidates. Changing these regroups everything.</p>
 
           <div class="range field" id="dual-conf">
             <div class="field-head"><label>Confidence band</label><b class="range-value"></b></div>
-            <p class="field-desc">Only detections in this confidence range are considered.</p>
+            <p class="field-desc">Only detections MegaDetector scored in this range are considered.</p>
             <div class="range-track"><div class="range-fill"></div>
               <button class="range-thumb lo" aria-label="minimum confidence"></button>
               <button class="range-thumb hi" aria-label="maximum confidence"></button></div>
@@ -296,7 +296,7 @@
 
           <div class="range field" id="dual-size">
             <div class="field-head"><label>Box area band</label><b class="range-value"></b></div>
-            <p class="field-desc">Box size as a fraction of the frame. Repeats are usually small.</p>
+            <p class="field-desc">Box size as a share of the frame. A repeated rock or branch is usually small.</p>
             <div class="range-track"><div class="range-fill"></div>
               <button class="range-thumb lo" aria-label="minimum box area"></button>
               <button class="range-thumb hi" aria-label="maximum box area"></button></div>
@@ -305,7 +305,7 @@
 
           <div class="range field" id="opt-iou">
             <div class="field-head"><label>Same-box IoU</label><b class="range-value"></b></div>
-            <p class="field-desc">How much two boxes must overlap to count as one location.</p>
+            <p class="field-desc">How much two boxes must overlap to count as the same spot.</p>
             <div class="range-track"><div class="range-fill"></div>
               <button class="range-thumb v" aria-label="same-box IoU"></button></div>
             <div class="range-ticks"></div>
@@ -315,7 +315,7 @@
 
           <div class="field">
             <label class="tune-check"><input type="checkbox" id="opt-agnostic" /> Ignore category</label>
-            <p class="field-desc">Compare boxes across classes, not only within one (upstream: categoryAgnosticComparisons).</p>
+            <p class="field-desc">Compare an animal box against a person or vehicle box, not only its own class.</p>
           </div>
 
         </div>
@@ -379,7 +379,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-05d";
+    const BUILD = "2026-09-05f";
     $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
@@ -872,7 +872,7 @@
           for (const i of g.instances) if (!nowCandidate.has(detKey(i.det_ref))) dropped++;
         }
         state.preview = { options: proposed, groups };
-        status.textContent = "Previewing — apply it to the review, or discard.";
+        status.textContent = "This is a preview. Apply it to your review, or discard it.";
         return {
           before,
           after: { groups: kept.length, instances, media: media.size, cameras: cameras.size },
@@ -1177,7 +1177,7 @@
       const note = document.createElement("p");
       note.className = "hint";
       note.textContent = iouSensitivity.key !== sensitivityKey()
-        ? "Other parameters changed since this was computed — recompute for current numbers."
+        ? "These numbers are out of date — other parameters changed since. Compute again."
         : `Other parameters held constant · counted at occurrence ≥ ${state.threshold}`;
       host.appendChild(note);
     }
@@ -1250,7 +1250,7 @@
         const cell = (text, cls) => { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
         cell(`≥ ${row.threshold}`);
         cell(row.groups.toLocaleString(), "n");
-        cell(`${row.instances.toLocaleString()} crops`, "n");
+        cell(row.instances.toLocaleString(), "n");
         const bar = cell("", "bar");
         const fill = document.createElement("i");
         fill.style.width = `${Math.max(2, Math.round(100 * row.instances / most))}%`;
@@ -1360,7 +1360,7 @@
       $("opt-camlevel").value = String(DEFAULT_OPTIONS.n_dir_levels_from_leaf);
       $("opt-agnostic").checked = !!DEFAULT_OPTIONS.category_agnostic;
       setThresholdFromUi(DEFAULT_OPTIONS.occurrence_threshold);
-      $("tune-impact").textContent = "Controls reset to defaults — preview to apply them.";
+      $("tune-impact").textContent = "Back to the defaults. Preview to see what they would change.";
     });
 
     // Re-enter at the first group that still needs attention.
@@ -2418,7 +2418,7 @@
       const blank = (msg) => { previewCanvas.width = 400; previewCanvas.height = 220; ctx.fillStyle = "#efe9df"; ctx.fillRect(0, 0, 400, 220); previewMeta.textContent = msg; };
       // Distinguish "no folder yet" from "this media did not resolve" — conflating
       // them sends the reviewer looking for the wrong problem.
-      if (!state.folderLoaded) { blank("Load the image folder to see the full frame."); return; }
+      if (!state.folderLoaded) { blank("Load the image folder to see the whole picture this crop came from."); return; }
       if (!src) {
         blank(`Not found in the picked folder:\n${path || "(no path in the json)"}`);
         return;
@@ -2427,7 +2427,7 @@
       if (isVideo && !decodableVideo(path, instance)) {
         blank(hasWebCodecs
           ? `Can't decode ${path.split(".").pop().toLowerCase()} in the browser — pre-extract frames with ffmpeg.`
-          : "This browser has no WebCodecs, so video frames can't be decoded.");
+          : "This browser cannot decode video frames. Video crops will stay blank; images are unaffected.");
         return;
       }
       // For video, decode a frame of this clip (SPEC §7) — frame 0 unless the
@@ -2438,7 +2438,7 @@
       if (!bitmap) {
         const res = await mediaDecode("frame", src, isVideo ? { frameNumber } : null);
         if (!res || !res.bitmap) {
-          if (token === previewToken) blank("Could not read this image.");
+          if (token === previewToken) blank("This file could not be read.");
           return;
         }
         // Cache even if a newer hover won the race: the decode is already paid
@@ -2589,12 +2589,15 @@
     function updateExportBar() {
       const n = removalRefs().length;
       const p = reviewProgress();
+      // Says what leaves the file and what state the review is in. The old
+      // wording put two different counts of "detections" and "candidates" beside
+      // each other, which read as one number contradicting itself.
       $("export-summary").textContent = state.fileName
-        ? `Will remove ${n.toLocaleString()} detection(s) from ${state.fileName}` +
+        ? `Export drops ${n.toLocaleString()} detection(s) from ${state.fileName}` +
           (p.pending
-            ? ` — ${p.pending.toLocaleString()} candidate(s) not yet reviewed` +
-              ($("export-unreviewed").checked ? ", included." : ", excluded.")
-            : ".")
+            ? `, ${$("export-unreviewed").checked ? "including" : "excluding"} the ` +
+              `${p.pending.toLocaleString()} you have not reviewed yet.`
+            : ` — every candidate reviewed.`)
         : "No document loaded.";
       $("export-btn").disabled = !state.fileName;
       $("session-save").disabled = !state.fileName;
@@ -2737,7 +2740,7 @@
       // A pass over the previous document's media is worse than useless now.
       if (precompute.running) precompute.cancelled = true;
       $("precompute").hidden = true;
-      renderPrecompute("Decode every crop now, in the background, so review never waits.");
+      renderPrecompute("Make every crop up front so review never waits for one.");
       currentIndex = 0;
       focusIndex = 0;
       currentGrid = null;
