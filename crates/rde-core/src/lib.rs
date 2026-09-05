@@ -27,9 +27,23 @@ pub struct RdeOptions {
     /// Confidence band considered (inclusive).
     pub confidence_min: f32,
     pub confidence_max: f32,
-    /// Distinct-image repeats before a location is "suspicious".
+    /// Distinct **media** a location must recur across before it is suspicious.
+    ///
+    /// **This deliberately differs from upstream.** MegaDetector compares
+    /// `occurrenceThreshold` against `len(candidate_location.instances)` — every
+    /// detection, so a single clip with 30 detected frames counts as 30. We count
+    /// the clip once, because a rock seen in one clip is one observation, not
+    /// thirty. For still-only datasets the two agree; for video ours is much
+    /// stricter, so upstream's 20 and ours are not the same number.
     pub occurrence_threshold: usize,
     /// How identical two boxes must be to count as the same location.
+    ///
+    /// Upstream ships 0.9 and notes why slack is needed: rocks do not move but
+    /// cameras do, and branches do. Under group-first review looser matching is
+    /// close to free — it mostly makes existing groups bigger rather than making
+    /// new ones (as: 0.90 -> 0.80 is +7% groups for +40% detections; on diq it
+    /// *reduces* group count) — so 0.8 buys recall the occurrence threshold
+    /// cannot buy as cheaply.
     pub iou_threshold: f32,
     /// Ignore boxes whose area (w·h) is outside this band.
     pub min_suspicious_size: f32,
@@ -45,15 +59,15 @@ impl Default for RdeOptions {
         Self {
             confidence_min: 0.1,
             confidence_max: 1.0,
-            // Upstream ships 20. On three deployments that had already been
-            // through a human RDE pass, 10 agrees with ~14 points more of what
-            // that reviewer removed, for ~2 points more disagreement the other
-            // way (`examples/ablation.rs`). Those are agreement rates with one
-            // prior review, NOT accuracy against ground truth — nobody has
-            // labelled the raw detections — so this is a judgement about what a
-            // reviewer's time is worth, not a fact about the algorithm.
-            occurrence_threshold: 10,
-            iou_threshold: 0.9,
+            // Back to upstream's 20, after the review model changed under it.
+            // Lowering it to 10 was argued from CANDIDATE counts, which is the
+            // cost of reviewing every crop. Review is now group-first — one
+            // handful of exemplars per group — so the human cost is the number of
+            // GROUPS, and by that measure 10 more than doubles the work
+            // (as: 309 -> 697 groups) to catch 28% more detections. Loosening IoU
+            // buys the same recall far cheaper: +13% groups for +53% detections.
+            occurrence_threshold: 20,
+            iou_threshold: 0.8,
             min_suspicious_size: 0.0,
             max_suspicious_size: 0.2,
             n_dir_levels_from_leaf: 0,

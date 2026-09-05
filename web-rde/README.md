@@ -36,6 +36,19 @@ and every group needs a human to look at it. Upstream's advice is to confirm
 **one exemplar per group** rather than every crop, which is what makes the review
 fast — reviewing a thousand exemplars is minutes of work.
 
+## Two places this differs from upstream on purpose
+
+**`occurrence` counts distinct files, not detections.** MegaDetector compares its
+occurrence threshold against every detection, so one clip with 30 detected frames
+counts as 30. We count that clip once, because a rock seen in one clip is one
+observation. For still-only data the two agree; for video ours is much stricter,
+so **upstream's `20` and ours are not the same number**.
+
+**The IoU default is 0.8, not 0.9.** Upstream notes why slack is needed — rocks
+do not move, but cameras and branches do. Because review here is group-first,
+looser matching mostly makes existing groups *bigger* rather than making more of
+them, so it costs the reviewer little and catches noticeably more.
+
 ## Getting a results file
 
 Produce `combined_md.json` with MegaDetector as usual; nothing here is specific
