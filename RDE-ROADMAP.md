@@ -10,7 +10,7 @@ offline; no data leaves the device (camera-trap GPS privacy).
   `verify_rde.py`).
 - Lives on branch **`experiment/rde`** (not on `master`).
 
-## Decision: RDE becomes its own repo (later)
+## Decision: RDE becomes its own repo, named **RocksBeGone** (later)
 It shares **~zero code** with Caracal — only the repo, deploy pipeline, and the
 offline-wasm delivery model. It's a *detection-review* tool (serde_json + image
 decode, upstream of analysis), distinct from Caracal's data-panel direction
@@ -18,7 +18,11 @@ decode, upstream of analysis), distinct from Caracal's data-panel direction
 - `crates/rde-core` — deps: `serde`, `serde_json` only.
 - `web-rde` — deps: `rde-core`, `wasm-bindgen`, `getrandom`, `console_error_panic_hook`, `serde_json`.
 - Frontend: `web-rde/{index.html, rde-worker.js, media-worker.js}` + this doc.
-Then give it its own domain/service + release cadence.
+Then give it its own domain/service + release cadence, under the name
+**RocksBeGone** (chosen 2026-09-05 from DeRocker / Unrepeater / RepeatsBeGone /
+RockRemover). It carries the joke upstream already makes — the thing you are
+removing is rocks — while staying honest that the tool removes *repeats*, and a
+reviewer decides which of those are rocks.
 
 ## Architecture (current)
 - **`crates/rde-core`** (browser/IO-independent, native-testable): `RdeOptions`,
