@@ -27,6 +27,10 @@
     .file { display: inline-block; border: 1px dashed var(--accent); color: var(--accent); background: none; font: inherit; border-radius: 8px; padding: 11px 16px; cursor: pointer; font-weight: 600; }
     .file.disabled, .file:disabled { opacity: 0.4; pointer-events: none; }
     label.file input { display: none; }
+    /* Small, but there is no way to tell a stale cached worker from a real bug
+       without it — and "hard-reload and check the build" needs something to check. */
+    .build { float: right; font-size: 0.72rem; font-weight: 400; color: var(--muted);
+      letter-spacing: 0.02em; font-variant-numeric: tabular-nums; }
     .metrics { display: flex; gap: 22px; margin-top: 14px; flex-wrap: wrap; }
     /* Which folder is a camera is a property of the dataset, settled once — so it
        sits with loading, not with the parameters you keep revisiting. */
@@ -218,7 +222,8 @@
 </head>
 <body>
   <main>
-    <h1>Caracal RDE <span style="color:var(--muted);font-weight:400;font-size:1rem">· experimental</span></h1>
+    <h1>Caracal RDE <span style="color:var(--muted);font-weight:400;font-size:1rem">· experimental</span>
+      <span class="build" id="build" title="Build. Quote this in any bug report — and check it after a reload, since a stale cached worker looks exactly like a bug that will not go away."></span></h1>
     <p class="lede">Client-side repeat-detection review. Everything runs in your browser — the json and images never leave your device.</p>
 
     <div class="card loadcard">
@@ -375,6 +380,7 @@
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
     const BUILD = "2026-09-05a";
+    $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
     const pending = new Map();
