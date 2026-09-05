@@ -155,7 +155,12 @@ authoritative at export even if the detection later stops being a candidate.
    `sourcesFor(instances)` is already the seam. ~0.4 h at concurrency 3 for all
    3,350 clips; ~0.11 GB. OPFS is origin-scoped → the offline launcher needs a
    **stable localhost port** (same constraint as persisting an FSA handle).
-5. **Write down the path contract, then manual-test the FSA picker.** Which shapes
+5. ~~**Write down the path contract, then manual-test the FSA picker.**~~ DONE
+   2026-09-05 — see `web-rde/PATHS.md`. Contract adopted from upstream's
+   `--imageBase` rule; FSA verified by hand against absolute Windows paths
+   (strip 2, 8/8 probes, 94 crops). Firefox's enumeration path still has no
+   human test.
+   *Original note:* Which shapes
    of MegaDetector `file` path, against which picked folder, do we claim to
    support? Today that answer exists only as code: `alignDirectoryHandle` probes a
    few strip offsets against sample paths, and the `webkitdirectory` fallback

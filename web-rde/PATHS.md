@@ -64,21 +64,30 @@ Given `J:/AS_trapper/as202601-202604_aligned/as202601-202604/a217_gps1/IMAG0001.
 | a folder more than 8 levels above the media | ❌ | offset search stops at 7 |
 | two deployments merged under one folder | ⚠️ | fine if the sub-paths still differ; ambiguous basenames are refused, not guessed |
 
-## Known gaps
+## Verified
 
-These are not hypothetical; they are what the code does today.
+The FSA branch was exercised by hand for the first time on 2026-09-05, against a
+real deployment with absolute Windows paths:
 
-1. **The FSA offset is validated on one sample and then trusted for everything.**
-   `detectOffset` resolves `samplePaths[0]` only. A document that mixes path
-   shapes — images written one way and videos another, which `run_md_video.py`
-   makes possible — can pass that check and then fail for everything else.
-2. **The FSA branch reports success without measuring it.** It says
-   "Linked <folder> — N media" where N is simply the candidate count, not a count
-   of media it actually found. The enumeration branch does the honest thing and
-   reports `matched/total` plus a sample of what missed. So a wrong offset looks
-   like a working load with blank crops, which is the single most confusing
-   failure this tool can produce.
-3. **No feedback on what was inferred.** Nothing shows the user that
-   `J:/AS_trapper/…/IMAG0001.JPG` is being looked for at `<picked>/a217_gps1/IMAG0001.JPG`.
-   Upstream's version of this is a path you typed and can check; ours is a guess
-   we keep to ourselves.
+```
+[rde] FSA root "DIQ_trapper": dropping 2 leading path component(s), so
+"diq202601-202604_aligned/diq…/6001_diq…-Ere 0024.JPG" is looked for under it
+— 8/8 probes resolved
+[rde] buffered "6001_diq202601-202604": 50 sources, 1446 ms → all 94 tiles on screen
+```
+
+`J:/DIQ_trapper/…` with `DIQ_trapper` picked gives strip 2, which is right, and
+the crops rendered. The offset is now scored over up to 8 samples rather than
+accepted on the first one, and a partial match says so in the status line instead
+of reporting a candidate count as though it were a count of media found — a wrong
+offset used to look like a successful load with every crop blank.
+
+## Still unverified
+
+- **Firefox**, which has no File System Access and therefore always takes the
+  enumeration path. That path is covered by automated tests, but not by a human.
+- **A document that mixes path shapes** — stills written one way, videos another,
+  which `run_md_video.py` permits. The multi-sample scoring is what should catch
+  it, and nothing has produced such a document to try.
+- **Picking a folder more than 8 levels above the media**, which the offset search
+  gives up on. No error distinguishes it from a wrong folder.
