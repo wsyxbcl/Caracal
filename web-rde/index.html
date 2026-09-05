@@ -122,8 +122,14 @@
     .tune-head .mini { margin-left: auto; }
     .tune-body { display: flex; gap: 28px; margin-top: 12px; flex-wrap: wrap; }
     .tune-body[hidden] { display: none; }
+    /* Pinned to the bottom of the panel's own scroll area. The panel is taller
+       than the viewport on any laptop screen, and "Preview changes" — the button
+       that actually applies a tuning — was below the fold at every window size
+       tested, reachable only by scrolling the panel to find it. */
     .tune-foot { display: flex; align-items: center; gap: 10px; margin-top: 14px;
-      padding-top: 12px; border-top: 1px solid var(--line); }
+      padding: 12px 18px 14px; border-top: 1px solid var(--line);
+      position: sticky; bottom: -14px; margin-left: -18px; margin-right: -18px;
+      background: var(--card); }
     .tune-foot[hidden] { display: none; }
     .tune-foot .hint { flex: 1; }
     .tune-col { flex: 1 1 320px; min-width: 280px; }
@@ -379,7 +385,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-05f";
+    const BUILD = "2026-09-05g";
     $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
