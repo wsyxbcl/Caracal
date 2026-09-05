@@ -204,11 +204,11 @@ async function demux(file, ablate) {
     mp4.flush();
   }
   if (failure) throw new Error(`demux failed: ${failure}`);
-  if (!info) throw new Error("no moov box (not a readable MP4)");
+  if (!info) throw new Error("no moov box — this file is not a readable MP4");
   const track = info.videoTracks?.[0];
-  if (!track) throw new Error("no video track");
+  if (!track) throw new Error("this file has no video track");
   const samples = mp4.getTrackById(track.id).samples;
-  if (!samples?.length) throw new Error("no samples in video track");
+  if (!samples?.length) throw new Error("this file's video track is empty");
   return {
     reader, mp4, track, samples, wholeFile,
     headerBytes: reader.bytesRead,
@@ -379,7 +379,7 @@ export function planRanges(samples, targets, isSync, forceLinear = false) {
 /// decoded only to *reach* a target are closed without ever reaching `onFrame`.
 /// Returns decode statistics.
 export async function extractFrames(file, targets, onFrame, options = {}) {
-  if (typeof VideoDecoder === "undefined") throw new Error("WebCodecs unavailable");
+  if (typeof VideoDecoder === "undefined") throw new Error("this browser has no WebCodecs, so video frames cannot be decoded");
   // Systems ablation: force a component off so its contribution can be measured
   // rather than argued about. Empty in normal use.
   const ablate = new Set(options.ablate || []);

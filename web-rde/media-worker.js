@@ -59,7 +59,7 @@ async function childFile(parent, name) {
 
 // Resolve a media path (its json path) to a File, via the retained handle.
 async function resolveFile(path, strip = stripComponents) {
-  if (!rootHandle) throw new Error("no directory handle");
+  if (!rootHandle) throw new Error("no folder has been picked yet");
   const parts = splitPath(path).slice(strip);
   const filename = parts.pop();
   let handle = rootHandle, key = "";
@@ -162,7 +162,7 @@ function decodeSource(file, width = DECODE_W) {
 // taken while the VideoFrame is still open, since extractFrames closes it.
 async function videoFrameBitmap(file, frameNumber, width = 0) {
   const { extractFrames, DEMUXABLE } = await videoReady;
-  if (!DEMUXABLE.test(file.name)) throw new Error(`container not demuxable in-browser: ${file.name.split(".").pop()}`);
+  if (!DEMUXABLE.test(file.name)) throw new Error(`no in-browser demuxer for .${file.name.split(".").pop().toLowerCase()} files`);
   let bitmap = null;
   await extractFrames(file, [frameNumber], async (_number, frame) => {
     const shrink = width && frame.displayWidth > width; // never upscale
@@ -177,7 +177,7 @@ async function videoFrameBitmap(file, frameNumber, width = 0) {
 // once. Returns the crops plus decode stats for the caller to log.
 async function cropVideo(file, items, ablate) {
   const { extractFrames, DEMUXABLE } = await videoReady;
-  if (!DEMUXABLE.test(file.name)) throw new Error(`container not demuxable in-browser: ${file.name.split(".").pop()}`);
+  if (!DEMUXABLE.test(file.name)) throw new Error(`no in-browser demuxer for .${file.name.split(".").pop().toLowerCase()} files`);
   const byFrame = new Map();
   for (const it of items) {
     const frame = it.frameNumber;

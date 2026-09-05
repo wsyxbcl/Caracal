@@ -379,7 +379,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-05c";
+    const BUILD = "2026-09-05d";
     $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
@@ -469,8 +469,10 @@
     /// says why, and points at the pre-extraction escape hatch.
     function decodeFailLabel(failure) {
       const codec = /codec not supported: ([\w.]+)/.exec(failure || "")?.[1]?.toLowerCase();
-      if (!codec) return "⚠ decode";
-      return codec.startsWith("hvc") || codec.startsWith("hev") ? "no hevc" : "no codec";
+      // A bare warning triangle told the reviewer nothing. "unreadable" at least
+      // separates a broken file from a codec this browser simply does not have.
+      if (!codec) return "unreadable";
+      return codec.startsWith("hvc") || codec.startsWith("hev") ? "no hevc" : "no decoder";
     }
     // Hand the picked directory handle to the workers; each detects the path
     // offset from sample media paths. Returns { ok, offset } / { ok:false, error }.
@@ -1473,9 +1475,17 @@
       // Any suspicious media works as an alignment probe — a video-only document
       // has no stills to offer.
       const samples = suspicious.map((i) => state.imageFiles[i]).filter(Boolean).slice(0, 8);
-      if (!samples.length) throw new Error("no suspicious media to align");
+      if (!samples.length) throw new Error("this document has no candidate media to locate");
       const res = await mediaSetRoot(rootHandle, samples);
-      if (!res.ok) throw new Error(res.error || "could not align the folder to the json paths");
+      if (!res.ok) {
+        // The one error most likely to be seen by someone who has done nothing
+        // wrong, so it names the fix and shows the path we were looking for.
+        const want = samples[0] || "";
+        throw new Error(
+          `“${rootHandle.name}” doesn't seem to contain the media this .json describes. ` +
+          `It lists files like “${want}” — pick the folder that contains them ` +
+          `(any level above works).`);
+      }
       collapseTuning();
       state.folderMode = "fsa";
       state.folderLoaded = true;
@@ -1715,11 +1725,14 @@
     }
     // Why this video can't be decoded, or null if it can. Each reason gets its own
     // tile label — "it's a video" is not a useful thing to stare at.
+    //
+    // These are the words a reviewer reads when a crop is missing, so they name
+    // the situation rather than the mechanism: "not https" was our diagnosis of a
+    // secure-context failure, but their problem is that video crops need an https
+    // address, and their fix is to use one.
     function videoBlocker(name, instance) {
-      // WebCodecs is a secure-context API: over plain http on a LAN IP it simply
-      // doesn't exist, which is by far the easiest way to be confused here.
-      if (!hasWebCodecs) return isSecureContext ? "no codec" : "not https";
-      if (instance.frame_number === undefined) return "no frame#";
+      if (!hasWebCodecs) return isSecureContext ? "no decoder" : "needs https";
+      if (instance.frame_number === undefined) return "no frame number";
       if (!DEMUXABLE_RE.test(name)) return name.split(".").pop().toLowerCase();
       return null;
     }
@@ -1790,7 +1803,9 @@
         } else {
           // FSA: a failed source is almost always a path that didn't resolve
           // (moved/renamed/case) — mark "no image"; fallback mode: a decode error.
-          const [cls, label] = state.folderMode === "fsa" ? ["unmatched", "no image"] : ["failed", "⚠"];
+          const [cls, label] = state.folderMode === "fsa"
+            ? ["unmatched", "not found"]   // the path did not resolve under the picked folder
+            : ["failed", "unreadable"];
           for (const it of s.items) { const t = tileByKey.get(it.key); if (t) markTile(t, cls, label); }
         }
         group._progress = { done: ++done, total };
@@ -2313,7 +2328,7 @@
       else if (path && VIDEO_RE.test(path) && videoBlocker(path, instance))
         markTile(tile, "video", "▶ " + videoBlocker(path, instance));
       else if (state.folderLoaded && state.folderMode === "files" && !state.fileByImageIndex.has(instance.det_ref.image_index))
-        markTile(tile, "unmatched", "no image");
+        markTile(tile, "unmatched", "not found");
       return tile;
     }
 
