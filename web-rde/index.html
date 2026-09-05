@@ -379,7 +379,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-05b";
+    const BUILD = "2026-09-05c";
     $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
@@ -1481,12 +1481,21 @@
       state.folderLoaded = true;
       const nImg = suspicious.filter((i) => !VIDEO_RE.test(state.imageFiles[i] || "")).length;
       const nVid = suspicious.length - nImg;
+      // What we INFERRED, shown as what it is. This branch used to report the
+      // candidate count as if it were a count of media found, so a wrong offset
+      // looked like a successful load with blank crops everywhere — the most
+      // confusing failure this tool can produce (PATHS.md).
+      const shown = `${state.imageFiles[suspicious[0]] || ""}`.split(/[\\/]/).filter(Boolean).slice(res.offset).join("/");
+      console.log(`[rde] FSA root “${rootHandle.name}”: dropping ${res.offset} leading path ` +
+        `component(s), so “${shown}” is looked for under it — ${res.hits}/${res.probes} probes resolved`);
       $("m-matched").textContent = `${suspicious.length}`;
-      console.log(`[rde] FSA root “${rootHandle.name}” aligned (strip ${res.offset}) — ${suspicious.length} suspicious media (image ${nImg}, video ${nVid})`);
+      const shaky = res.hits < res.probes;
       status.textContent =
-        `Linked ${rootHandle.name} — ${suspicious.length.toLocaleString()} media` +
+        `Linked ${rootHandle.name} — ${suspicious.length.toLocaleString()} candidate media` +
         (nVid ? ` (${nImg.toLocaleString()} image, ${nVid.toLocaleString()} video)` : "") +
-        `. ← → to move, Space to keep, f for the exact frame, [ ] for prev/next group, Enter when done with one.`;
+        (shaky
+          ? `. Only ${res.hits} of ${res.probes} sample paths were found under it — if crops come up blank, pick a different folder.`
+          : `. ← → to move, Space to keep, f for the exact frame, [ ] for prev/next group, Enter when done with one.`);
       $("precompute").hidden = false;
       goToGroup(currentIndex);
     }

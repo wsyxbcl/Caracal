@@ -76,6 +76,16 @@ async function resolveFile(path, strip = stripComponents) {
 // Find how many leading path components map to the picked folder, by probing
 // sample paths (match the folder's own name first, then brute-force small
 // offsets), so the user can pick any ancestor folder.
+/// How many leading components of a json path the picked folder already covers.
+///
+/// This is the inference upstream does not have to make: its scripts are TOLD
+/// the base directory (`--imageBase`), while a browser only hands us a folder
+/// handle and its name. See PATHS.md.
+///
+/// Scored over several samples rather than accepted on the first one. A document
+/// can mix path shapes — stills written one way, videos another — and an offset
+/// that happens to resolve one sample and nothing else used to be accepted
+/// silently, which surfaces as blank crops everywhere rather than as an error.
 async function detectOffset(samplePaths) {
   const candidates = [];
   for (const p of samplePaths) {
@@ -84,13 +94,22 @@ async function detectOffset(samplePaths) {
     if (idx >= 0 && idx < comps.length - 1) candidates.push(idx + 1);
   }
   for (let o = 0; o < 8; o++) candidates.push(o); // fallback: shallow offsets
+  const probes = samplePaths.slice(0, 8);
+  let best = null;
   const seen = new Set();
   for (const off of candidates) {
     if (seen.has(off)) continue; seen.add(off);
-    dirCache.clear();
-    try { await resolveFile(samplePaths[0], off); return off; } catch { /* wrong offset */ }
+    let hits = 0;
+    for (const probe of probes) {
+      dirCache.clear();
+      try { await resolveFile(probe, off); hits++; } catch { /* not this one */ }
+    }
+    if (hits > (best?.hits ?? 0)) best = { off, hits };
+    if (hits === probes.length) break; // nothing can beat all of them
   }
-  throw new Error("could not align the folder to the json paths");
+  dirCache.clear();
+  if (!best || best.hits === 0) throw new Error("could not align the folder to the json paths");
+  return { offset: best.off, hits: best.hits, probes: probes.length };
 }
 
 async function sourceFile(data) {
@@ -192,8 +211,9 @@ self.onmessage = async (event) => {
     if (kind === "setRoot") {
       rootHandle = event.data.rootHandle;
       dirCache.clear();
-      stripComponents = await detectOffset(event.data.samplePaths);
-      self.postMessage({ id, ok: true, offset: stripComponents });
+      const aligned = await detectOffset(event.data.samplePaths);
+      stripComponents = aligned.offset;
+      self.postMessage({ id, ok: true, ...aligned });
       return;
     }
     if (kind === "frame") {
