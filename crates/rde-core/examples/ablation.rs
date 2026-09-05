@@ -96,9 +96,16 @@ fn main() {
     let pre_path = args.next().expect("usage: ablation <pre.json> <post.json> [--levels N]");
     let post_path = args.next().expect("usage: ablation <pre.json> <post.json> [--levels N]");
     let mut levels = 1usize;
+    // The occurrence threshold the LABELS were produced at, which is what defines
+    // the reviewed universe. Deduced, not assumed: if the human had only seen an
+    // occurrence-20 run, every detection they marked would lie inside it and
+    // `missed` at 20 would be ~0. It is thousands, while at 2 it is ~100 — so the
+    // review covered essentially the whole clustering.
+    let mut universe_occ = 2usize;
     let rest: Vec<String> = args.collect();
     for pair in rest.windows(2) {
         if pair[0] == "--levels" { levels = pair[1].parse().expect("--levels N"); }
+        if pair[0] == "--universe" { universe_occ = pair[1].parse().expect("--universe N"); }
     }
 
     let doc = MdDocument::from_slice(&std::fs::read(&pre_path).expect("read pre"))
@@ -109,25 +116,32 @@ fn main() {
 
     // The configuration the human actually reviewed under.
     let reference = RdeOptions { n_dir_levels_from_leaf: levels, ..Default::default() };
-    let universe = proposed(&doc, &reference);
+    // Everything the reviewer could have been shown — the only detections whose
+    // absence from the removed set means "a human looked and kept it".
+    let universe = proposed(&doc, &RdeOptions {
+        occurrence_threshold: universe_occ,
+        ..reference.clone()
+    });
+    let default_set = proposed(&doc, &reference);
     let labelled_repeats = removed.intersection(&universe).count();
 
     println!("{}", pre_path);
     println!("  {} media, {} detections", doc.images().len(), doc.total_detections());
     println!("  human confirmed {} repeats", removed.len());
-    println!("  reference config proposes {} candidates, {} of which are confirmed repeats",
-             universe.len(), labelled_repeats);
+    println!("  reviewed universe (occurrence >= {}): {} candidates, {} confirmed repeats, \
+              {} kept",
+             universe_occ, universe.len(), labelled_repeats, universe.len() - labelled_repeats);
+    println!("  default config (occurrence >= {}) proposes {}",
+             reference.occurrence_threshold, default_set.len());
     let outside_universe = removed.difference(&universe).count();
-    if outside_universe > 0 {
-        println!("  !! {} confirmed repeats are NOT proposed by our reference config — \
-                  our clustering differs from the one that produced these labels",
-                 outside_universe);
-    }
+    println!("  {} confirmed repeats fall outside even that universe — the residual \
+              disagreement between our clustering and the one that made these labels ({:.2}%)",
+             outside_universe, outside_universe as f64 / removed.len() as f64 * 100.0);
     println!();
 
     // Each ablation turns ONE thing off relative to the reference.
     let wide = RdeOptions { confidence_min: 0.0, confidence_max: 1.0, ..reference.clone() };
-    let mut rows = vec![score("reference", &universe, &universe, &removed)];
+    let mut rows = vec![score("default", &default_set, &universe, &removed)];
     let ablations: Vec<(String, RdeOptions)> = vec![
         ("no camera grouping".into(), RdeOptions { n_dir_levels_from_leaf: 0, ..reference.clone() }),
         ("category-agnostic".into(), RdeOptions { category_agnostic: true, ..reference.clone() }),
