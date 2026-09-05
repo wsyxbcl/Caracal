@@ -132,6 +132,7 @@
       background: var(--card); }
     .tune-foot[hidden] { display: none; }
     .tune-foot .hint { flex: 1; }
+    .expand { margin-top: 10px; }
     .tune-col { flex: 1 1 320px; min-width: 280px; }
     /* Name, then one line saying what it does, then the control. Descriptions are
        always visible: a control whose meaning is hidden behind an icon gets guessed at. */
@@ -256,7 +257,7 @@
         <details id="camera-all"><summary>show all</summary><div id="camera-list"></div></details>
       </div>
       <div class="precompute" id="precompute" hidden>
-        <button class="mini" id="precompute-run">Precompute all crops</button>
+        <button class="mini" id="precompute-run">Precompute the rest</button>
         <span class="hint" id="precompute-status">Decode every crop now, in the background, so review never waits.</span>
       </div>
       <p id="error"></p>
@@ -385,7 +386,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-05g";
+    const BUILD = "2026-09-05h";
     $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
@@ -1688,7 +1689,7 @@
     // Takes instances rather than a group on purpose — which media to open is not
     // a group concept. Reviewing passes one group's instances; a precompute pass
     // would hand it the whole document's, and nothing else would need to change.
-    function sourcesFor(instances) {
+    function sourcesFor(instances, { exact = false } = {}) {
       const bySource = new Map();
       const media = new Set(instances.map((i) => i.det_ref.image_index));
       for (const imageIndex of media) {
@@ -1706,7 +1707,7 @@
         // candidate — media-complete batching can only pay off while REVIEWING,
         // when a clip opened for one group also serves the others that share it.
         // Measuring it needs a sequential-review harness, not a precompute run.
-        const onThisMedium = ABLATE.includes("groupcrops")
+        const onThisMedium = exact || ABLATE.includes("groupcrops")
           ? instances.filter((i) => i.det_ref.image_index === imageIndex)
           : state.instancesByMedia.get(imageIndex) || [];
         for (const inst of onThisMedium) {
@@ -1774,7 +1775,10 @@
       // cached, so asking it every time is both cheap and the only honest answer.
       if (group._prefetching) { paintBuffer(group); return; }
       group._prefetching = true;
-      const sources = sourcesFor(group.instances);
+      // Only what is on screen. Media-complete batching would crop every
+      // candidate on an opened clip, which is the right trade when all members
+      // are shown and exactly the wrong one when six of two hundred are.
+      const sources = sourcesFor(visibleInstances(group), { exact: !group._expanded });
       const total = sources.length;
       let done = 0;
       const t0 = performance.now();
@@ -2015,7 +2019,7 @@
     function renderPrecompute(note) {
       const btn = $("precompute-run"), out = $("precompute-status");
       if (!btn) return;
-      btn.textContent = precompute.running ? "Stop" : "Precompute all crops";
+      btn.textContent = precompute.running ? "Stop" : "Precompute the rest";
       if (note !== undefined) { out.textContent = note; return; }
       if (!precompute.running) return;
       const { done, total, crops, t0 } = precompute;
@@ -2035,7 +2039,15 @@
       // silently skipped. The wider argument only made the intent misleading.
       // Lowering the threshold afterwards decodes the newly-shown groups on
       // demand, which is the ordinary path and works.
-      const sources = sourcesFor(state.groups.flatMap((g) => g.instances));
+      // Exemplars first. Review no longer waits on this — each group decodes the
+      // handful it shows as you reach it — so this is now a background nicety
+      // rather than the main path, and its ordering should reflect that: a run
+      // stopped a third of the way through still leaves every group openable.
+      const exemplarKeys = new Set(
+        state.groups.flatMap((g) => exemplarsOf(g)).map((i) => cropKey(i.det_ref)));
+      const all = sourcesFor(state.groups.flatMap((g) => g.instances));
+      const carriesExemplar = (src) => src.items.some((it) => exemplarKeys.has(it.key));
+      const sources = [...all.filter(carriesExemplar), ...all.filter((s) => !carriesExemplar(s))];
       if (!sources.length) { renderPrecompute("Every crop is already cached."); return; }
       Object.assign(precompute, {
         running: true, cancelled: false, done: 0, crops: 0,
@@ -2093,12 +2105,70 @@
             + `Review more groups and run it again: judged crops are dropped first.`
           : precompute.cancelled
             ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media · ${cached}.`
-            : `All ${total.toLocaleString()} media done in ${mins.toFixed(1)} min · ${cached}. Review will not wait for decoding.`);
+            : `All ${total.toLocaleString()} media done in ${mins.toFixed(1)} min · ${cached}.`);
       console.log(`[rde] precompute: bg concurrency ${bgLimit}/${CONCURRENCY_CAP}, ` +
         `${done}/${total} media, ${crops} crops, ` +
         `${(cropCache.bytes / 1e6).toFixed(1)} MB in ${mins.toFixed(2)} min` +
         (reclaimed ? `, reclaimed ${(reclaimed / 1e6).toFixed(1)} MB` : "") +
         (stopped ? ` (stopped: ${stopped})` : precompute.cancelled ? " (cancelled)" : ""));
+    }
+
+    // ---- Exemplars: what a reviewer actually needs to see -------------------
+    // Upstream reviews ONE exemplar per repeated detection and confirms it is a
+    // rock. That is fast, but it is also where the method's own warning bites:
+    // animals sleep in front of cameras, and a camera facing a narrow trail sees
+    // real animals enter at the same spot again and again. One crop cannot tell
+    // those apart from a rock.
+    //
+    // So we show a handful chosen to disagree with each other if they can. Most
+    // groups are settled at a glance; the ambiguous ones get expanded. The group
+    // header's confidence range is the cue for which is which — a group whose top
+    // detection scores high is the one worth opening.
+    const EXEMPLARS = 6;
+
+    function exemplarsOf(group) {
+      const all = group.instances;
+      if (all.length <= EXEMPLARS) return all;
+
+      // One per source medium first: six frames of one clip describe one moment.
+      const byMedium = new Map();
+      for (const inst of all) {
+        const key = inst.det_ref.image_index;
+        const best = byMedium.get(key);
+        if (!best || inst.conf > best.conf) byMedium.set(key, inst);
+      }
+      // Document order stands in for time — the json carries no timestamps, but
+      // camera files are named in sequence, so index order is usually
+      // chronological. Spread across the whole run rather than taking the first
+      // few: a rock's first six appearances look identical; its first, middle and
+      // last do not, because the camera may have shifted and the light changed.
+      const media = [...byMedium.keys()].sort((a, b) => a - b);
+      const want = Math.min(EXEMPLARS, media.length);
+      const picked = [];
+      const seen = new Set();
+      for (let i = 0; i < want; i++) {
+        const at = want === 1 ? 0 : Math.round((i * (media.length - 1)) / (want - 1));
+        if (seen.has(at)) continue;
+        seen.add(at);
+        picked.push(byMedium.get(media[at]));
+      }
+      // If one medium holds everything (a single long clip), spread within it.
+      if (picked.length < EXEMPLARS) {
+        const rest = all.filter((i) => !picked.includes(i));
+        const step = Math.max(1, Math.floor(rest.length / (EXEMPLARS - picked.length)));
+        for (let i = 0; i < rest.length && picked.length < EXEMPLARS; i += step) picked.push(rest[i]);
+      }
+      // Upstream's exemplar, and the one that matters most: the highest-confidence
+      // instance is what MegaDetector was most sure was an animal. If even that is
+      // a rock, the rest are too.
+      const top = all.reduce((a, b) => (b.conf > a.conf ? b : a));
+      if (!picked.includes(top)) picked[picked.length - 1] = top;
+      return picked;
+    }
+
+    /// What this group is currently showing — exemplars, or everything.
+    function visibleInstances(group) {
+      return group && !group._expanded ? exemplarsOf(group) : (group ? group.instances : []);
     }
 
     // Mark which groups may still decode. Crops are NOT dropped here — the LRU
@@ -2230,8 +2300,21 @@
       const grid = document.createElement("div");
       grid.className = "tiles";
       currentGrid = grid;
-      for (const inst of g.instances) grid.appendChild(makeTile(inst));
+      const shown = visibleInstances(g);
+      for (const inst of shown) grid.appendChild(makeTile(inst));
       card.appendChild(grid);
+      if (shown.length < g.instances.length) {
+        const more = document.createElement("button");
+        more.className = "mini expand";
+        more.textContent = `Show all ${g.instances.length.toLocaleString()} members`;
+        more.title = "These six are spread across the whole run. Open the rest if this group looks like it could be a real animal.";
+        more.addEventListener("click", () => {
+          g._expanded = true;
+          renderCurrent();
+          prefetchGroup(g);
+        });
+        card.appendChild(more);
+      }
       results.appendChild(card);
       refreshGroupHeader();
       $("results").parentElement.scrollTop = 0; // top of the list on each group
@@ -2746,7 +2829,7 @@
       // A pass over the previous document's media is worse than useless now.
       if (precompute.running) precompute.cancelled = true;
       $("precompute").hidden = true;
-      renderPrecompute("Make every crop up front so review never waits for one.");
+      renderPrecompute("Optional: decode the remaining member crops ahead of time, so expanding a group is instant too.");
       currentIndex = 0;
       focusIndex = 0;
       currentGrid = null;
