@@ -257,8 +257,9 @@
         <details id="camera-all"><summary>show all</summary><div id="camera-list"></div></details>
       </div>
       <div class="precompute" id="precompute" hidden>
-        <button class="mini" id="precompute-run">Precompute the rest</button>
-        <span class="hint" id="precompute-status">Decode every crop now, in the background, so review never waits.</span>
+        <button class="mini" id="precompute-exemplars">Precompute exemplars</button>
+        <button class="mini" id="precompute-all">Precompute every member</button>
+        <span class="hint" id="precompute-status">Exemplars is the handful each group shows — enough to review it. Every member also decodes the crops you would only see by expanding a group.</span>
       </div>
       <p id="error"></p>
       </div>
@@ -386,7 +387,7 @@
     // ---- Worker RPC (SPEC §5.1): all wasm work runs off the UI thread. --------
     // Module workers cache hard; bump BUILD on any *-worker.js change so a plain
     // reload picks it up (no need to purge cache manually while iterating).
-    const BUILD = "2026-09-05i";
+    const BUILD = "2026-09-05j";
     $("build").textContent = BUILD;
     const worker = new Worker(`./rde-worker.js?v=${BUILD}`, { type: "module" });
     let nextId = 0;
@@ -1288,7 +1289,8 @@
       syncTuneToggle();
     }
 
-    $("precompute-run").addEventListener("click", () => { runPrecompute().catch(showError); });
+    $("precompute-exemplars").addEventListener("click", () => { runPrecompute("exemplars").catch(showError); });
+    $("precompute-all").addEventListener("click", () => { runPrecompute("all").catch(showError); });
     $("tune-collapse").addEventListener("click", collapseTuning);
     $("opt-camlevel").addEventListener("change", async () => {
       renderCameraCheck();
@@ -1883,7 +1885,7 @@
     const TUNE_KEY = "rde.bgConcurrency.v1";
 
     const tuner = {
-      on: false, sources: 0, crops: 0, t0: 0, quietest: null, slow: 0,
+      on: false, scope: null, sources: 0, crops: 0, t0: 0, quietest: null, slow: 0,
       ladder: [], rung: 0, settled: false, sinceRecheck: 0, history: [], samples: {},
 
       /// Last session's answer is a starting point, never a conclusion: storage,
@@ -2017,21 +2019,28 @@
     }
 
     function renderPrecompute(note) {
-      const btn = $("precompute-run"), out = $("precompute-status");
-      if (!btn) return;
-      btn.textContent = precompute.running ? "Stop" : "Precompute the rest";
+      const out = $("precompute-status");
+      const buttons = { exemplars: $("precompute-exemplars"), all: $("precompute-all") };
+      if (!buttons.exemplars) return;
+      const labels = { exemplars: "Precompute exemplars", all: "Precompute every member" };
+      for (const [scope, btn] of Object.entries(buttons)) {
+        const active = precompute.running && precompute.scope === scope;
+        btn.textContent = active ? "Stop" : labels[scope];
+        btn.disabled = precompute.running && !active;
+      }
       if (note !== undefined) { out.textContent = note; return; }
       if (!precompute.running) return;
       const { done, total, crops, t0 } = precompute;
       const elapsed = (performance.now() - t0) / 1000;
       const left = done ? fmtLeft((total - done) * (elapsed / done)) : "";
-      out.textContent = `${done.toLocaleString()}/${total.toLocaleString()} media · `
+      out.textContent = `${done.toLocaleString()}/${total.toLocaleString()} ${precompute.scope === "exemplars" ? "exemplar" : "media"} · `
         + `${crops.toLocaleString()} crops · ${fmtMB(cropCache.bytes)} MB`
         + (left ? ` · ${left}` : "");
     }
 
-    async function runPrecompute() {
+    async function runPrecompute(scope) {
       if (precompute.running) { precompute.cancelled = true; return; } // the button is also Stop
+      precompute.scope = scope;
       // The candidates actually under review. Passing every group clustered at
       // MIN_THRESHOLD looked like it precomputed more, but did not: sourcesFor
       // takes each medium's items from `instancesByMedia`, which is built from
@@ -2039,15 +2048,22 @@
       // silently skipped. The wider argument only made the intent misleading.
       // Lowering the threshold afterwards decodes the newly-shown groups on
       // demand, which is the ordinary path and works.
-      // Exemplars first. Review no longer waits on this — each group decodes the
-      // handful it shows as you reach it — so this is now a background nicety
-      // rather than the main path, and its ordering should reflect that: a run
-      // stopped a third of the way through still leaves every group openable.
-      const exemplarKeys = new Set(
-        state.groups.flatMap((g) => exemplarsOf(g)).map((i) => cropKey(i.det_ref)));
-      const all = sourcesFor(state.groups.flatMap((g) => g.instances));
-      const carriesExemplar = (src) => src.items.some((it) => exemplarKeys.has(it.key));
-      const sources = [...all.filter(carriesExemplar), ...all.filter((s) => !carriesExemplar(s))];
+      // Two scopes, named for what they get you rather than for how much work
+      // they are. Exemplars is what review actually needs — every group becomes
+      // openable without waiting. Every member only pays off if you expect to
+      // expand many groups, which most reviews will not.
+      let sources;
+      if (scope === "exemplars") {
+        sources = sourcesFor(state.groups.flatMap((g) => exemplarsOf(g)), { exact: true });
+      } else {
+        // Still exemplars-first, so a run stopped part-way leaves every group
+        // openable rather than a prefix of them fully done.
+        const exemplarKeys = new Set(
+          state.groups.flatMap((g) => exemplarsOf(g)).map((i) => cropKey(i.det_ref)));
+        const all = sourcesFor(state.groups.flatMap((g) => g.instances));
+        const carriesExemplar = (src) => src.items.some((it) => exemplarKeys.has(it.key));
+        sources = [...all.filter(carriesExemplar), ...all.filter((s) => !carriesExemplar(s))];
+      }
       if (!sources.length) { renderPrecompute("Every crop is already cached."); return; }
       Object.assign(precompute, {
         running: true, cancelled: false, done: 0, crops: 0,
@@ -2097,15 +2113,16 @@
       const mins = (performance.now() - precompute.t0) / 60000;
       const { done, total, crops } = precompute;
       precompute.running = false;
+      const what = precompute.scope === "exemplars" ? "exemplar" : "media";
       const cached = `${crops.toLocaleString()} crops · ${fmtMB(cropCache.bytes)} MB`
         + (reclaimed ? `, ${fmtMB(reclaimed)} MB of reviewed crops reclaimed` : "");
       renderPrecompute(
         stopped === "cache"
-          ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media — the crop cache is full (${cached}). `
+          ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} ${what} — the crop cache is full (${cached}). `
             + `Review more groups and run it again: judged crops are dropped first.`
           : precompute.cancelled
-            ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} media · ${cached}.`
-            : `All ${total.toLocaleString()} media done in ${mins.toFixed(1)} min · ${cached}.`);
+            ? `Stopped at ${done.toLocaleString()}/${total.toLocaleString()} ${what} · ${cached}.`
+            : `All ${total.toLocaleString()} ${what} done in ${mins.toFixed(1)} min · ${cached}.`);
       console.log(`[rde] precompute: bg concurrency ${bgLimit}/${CONCURRENCY_CAP}, ` +
         `${done}/${total} media, ${crops} crops, ` +
         `${(cropCache.bytes / 1e6).toFixed(1)} MB in ${mins.toFixed(2)} min` +
@@ -2284,8 +2301,12 @@
       const next = mini("Next ▶", () => goToGroup(currentIndex + 1));
       next.disabled = currentIndex >= state.groups.length - 1;
       actions.append(prev, next);
-      actions.appendChild(mini("Keep all", () => setGroupDecision(g, "Keep")));
-      actions.appendChild(mini("Remove all", () => setGroupDecision(g, "Remove")));
+      // Named with the count, because one click here decides for members the
+      // reviewer has not seen — that is the point of group-first review, and it
+      // should be stated rather than implied.
+      const n = g.instances.length;
+      actions.appendChild(mini(`Keep all ${n}`, () => setGroupDecision(g, "Keep")));
+      actions.appendChild(mini(`Remove all ${n}`, () => setGroupDecision(g, "Remove")));
       const loop = mini("Done · next unreviewed ▶", markReviewedAndNext, "primary");
       loop.title = "Commit the standing decision for every crop still unjudged here, "
         + "then go to the next group that needs review (Enter)";
@@ -2331,15 +2352,20 @@
       const meta = document.querySelector("#results .group-head .meta");
       if (!g || !meta) return;
       const progress = groupProgress(g);
-      const overall = reviewProgress();
-      // What a reviewer needs on re-entry is not "group 7 of 181" but how much of
-      // THIS group is inherited and how much is actually new.
+      // How big this group is, and how much of it you are looking at. The tile
+      // grid shows exemplars, so without this the six on screen read as the whole
+      // group — and a "Remove all" would be a decision about a number the
+      // reviewer never saw. The across-groups tally that used to sit here is the
+      // REVIEWED metric above, and repeating it crowded out the size.
+      const shown = visibleInstances(g).length;
+      const size = `${progress.total.toLocaleString()} member${progress.total === 1 ? "" : "s"}` +
+        (shown < progress.total ? `, showing ${shown}` : "");
       const stateText = progress.state === "reviewed" ? "reviewed"
-        : progress.state === "partial" ? `${progress.decided}/${progress.total} reviewed · ${progress.pending} new`
+        : progress.state === "partial" ? `${progress.decided}/${progress.total} judged`
         : "unreviewed";
       meta.textContent =
-        `${REVIEW_MARK[progress.state]} Group ${currentIndex + 1}/${state.groups.length} · ${stateText}` +
-        ` · ${overall.reviewed} done, ${overall.partial} partial, ${overall.unreviewed} to go` +
+        `${REVIEW_MARK[progress.state]} Group ${currentIndex + 1}/${state.groups.length}` +
+        ` · ${size} · ${stateText}` +
         ` · conf ${g.stats.conf_min.toFixed(2)}–${g.stats.conf_max.toFixed(2)}` +
         ` · box [${g.rep_bbox.map((v) => v.toFixed(3)).join(", ")}]`;
       const card = meta.closest(".group");
@@ -2829,7 +2855,7 @@
       // A pass over the previous document's media is worse than useless now.
       if (precompute.running) precompute.cancelled = true;
       $("precompute").hidden = true;
-      renderPrecompute("Optional: decode the remaining member crops ahead of time, so expanding a group is instant too.");
+      renderPrecompute("Exemplars is the handful each group shows — enough to review it. Every member also decodes the crops you would only see by expanding a group.");
       currentIndex = 0;
       focusIndex = 0;
       currentGrid = null;

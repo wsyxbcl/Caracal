@@ -36,6 +36,22 @@ and every group needs a human to look at it. Upstream's advice is to confirm
 **one exemplar per group** rather than every crop, which is what makes the review
 fast — reviewing a thousand exemplars is minutes of work.
 
+## How the review works
+
+One group at a time. Each group shows **six members**, chosen to differ from each
+other — one per source file where possible, spread across the whole run, and
+always including the highest-confidence detection, which is the one most likely
+to actually be an animal.
+
+For most groups that is enough to decide, and `Remove all` / `Keep all` applies to
+every member, including the ones not shown — the buttons say how many. When a
+group looks like it could be real, **Show all N members** loads the rest.
+
+Two optional buttons decode crops ahead of time. *Precompute exemplars* makes
+every group instantly openable; *Precompute every member* also does the crops you
+would only see by expanding. Neither is required — a group decodes what it needs
+as you reach it.
+
 ## Two places this differs from upstream on purpose
 
 **`occurrence` counts distinct files, not detections.** MegaDetector compares its
